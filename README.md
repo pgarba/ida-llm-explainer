@@ -20,8 +20,13 @@ non-modal review dialog. Nothing is written to your database until you explicitl
 - **String/global context**: referenced string literals and named globals are included in the
   prompt, since they're often the strongest clue to a function's purpose.
 - **Rename & retype suggestions**: the model can propose a better function name, a full C
-  signature (return type + argument types/names, Hex-Rays only), and local variable renames —
+  signature (return type + argument types/names, Hex-Rays only), local variable renames, and
+  renames for *called* functions it actually examined and are still under a default name —
   each shown as an editable, opt-in checkbox before you accept.
+- **Struct detection**: when the pseudocode accesses a pointer at multiple constant offsets in a
+  way that suggests an undefined structure, the model can define a proper struct type and apply
+  it — to a function argument via the signature, or to a local variable directly — again as an
+  editable, opt-in suggestion.
 - **Batch mode**: pick a set of functions (filterable checklist), process them sequentially, then
   review and apply the results in bulk — same human-in-the-loop guarantee as the single-function
   flow.
@@ -110,6 +115,14 @@ suggestions out of an otherwise free-form answer:
   (Hex-Rays pseudocode only).
 - `SUGGESTED_VAR: <old> -> <new>` — a proposed local variable rename (Hex-Rays pseudocode only,
   one per line).
+- `SUGGESTED_CALLEE_NAME: <name-or-address> -> <new name>` — a proposed rename for a *called*
+  function, only accepted if its code was actually shown to the model this conversation and its
+  current name still looks auto-generated (`sub_`/`loc_`/`j_...`).
+- `SUGGESTED_STRUCT: <C struct declaration>` — a proposed structure type (Hex-Rays pseudocode
+  only), registered into the local types library on Accept.
+- `SUGGESTED_VAR_TYPE: <var> <type expression>` — applies a type (e.g. a newly suggested struct
+  pointer) to a local variable; for function arguments, the type is folded directly into
+  `SUGGESTED_SIGNATURE` instead.
 
 The final answer itself is kept to one short sentence, since it's written verbatim into the
 function's comment.

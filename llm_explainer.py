@@ -59,6 +59,7 @@ import ida_kernwin
 import ida_funcs
 import ida_lines
 import ida_name
+import ida_typeinf
 
 try:
     import ida_hexrays
@@ -163,7 +164,31 @@ DEFAULT_SYSTEM_PROMPT = (
     "SUGGESTED_CALLEE_NAME: <its current name or address> -> <new name>\n"
     "using the same valid-C-identifier rules as SUGGESTED_NAME. Do not use "
     "this for the target function itself (use SUGGESTED_NAME for that), "
-    "and do not use it for a called function whose code you never saw."
+    "and do not use it for a called function whose code you never saw.\n\n"
+    "If the pseudocode accesses memory through a pointer at multiple "
+    "constant offsets in a way that suggests an undefined or "
+    "generic-looking structure (e.g. *(a1 + 8), *(_DWORD *)(a1 + 0x10), or "
+    "Hex-Rays already shows an anonymous/placeholder struct), you may "
+    "define a proper structure type and apply it, but only when you are "
+    "reasonably confident about the field layout from the code itself:\n"
+    "1. Add one line of the exact form\n"
+    "SUGGESTED_STRUCT: <full struct declaration, all on this one line>\n"
+    "e.g. SUGGESTED_STRUCT: struct tagPOINT { int x; int y; };\n"
+    "Field offsets follow from declaration order and each member's size - "
+    "add explicit padding members (e.g. char gap_4[4];) if you are "
+    "confident there is a gap. Pick a short, descriptive struct name; "
+    "avoid reusing a name already used for something unrelated.\n"
+    "2. Then apply it to whichever variable actually holds the pointer. "
+    "If that variable is one of the target function's own arguments, just "
+    "reference the new struct type directly in SUGGESTED_SIGNATURE (e.g. "
+    "\"tagPOINT *p\") instead of a separate line. If it is a local "
+    "variable (not an argument), add one line per variable of the exact "
+    "form\n"
+    "SUGGESTED_VAR_TYPE: <current_variable_name> <type expression>\n"
+    "e.g. SUGGESTED_VAR_TYPE: v3 tagPOINT *\n"
+    "Omit both SUGGESTED_STRUCT and SUGGESTED_VAR_TYPE entirely when you "
+    "were given plain disassembly instead of pseudocode, or when there is "
+    "no clear evidence of a structure."
 )
 
 DEFAULT_CONFIG = {
@@ -201,6 +226,8 @@ _SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s
 _SUGGESTED_CALLEE_NAME_RE = re.compile(
     r"(?im)^\s*SUGGESTED_CALLEE_NAME:\s*(.+?)\s*->\s*([A-Za-z_]\w*)\s*$"
 )
+_SUGGESTED_STRUCT_RE = re.compile(r"(?im)^\s*SUGGESTED_STRUCT:\s*(.+?)\s*$")
+_SUGGESTED_VAR_TYPE_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR_TYPE:\s*([A-Za-z_]\w*)\s+(.+?)\s*$")
 _VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
 
@@ -503,9 +530,90 @@ def _rename_lvars(func_ea, var_renames):
             )
 
 
+def _create_struct_type(decl_text):
+    """Register a struct (or other UDT) declaration into the local types
+    library via IDA's C declaration parser, e.g.
+    "struct tagPOINT { int x; int y; };". Returns True on success. Must run
+    before anything that might reference the new type (signature, variable
+    types), since those are resolved against the local types library too.
+    """
+    try:
+        decl = decl_text.strip()
+        if not decl.endswith(";"):
+            decl += ";"
+        errors = idc.parse_decls(decl, 0)
+        if errors:
+            ida_kernwin.msg(
+                "[%s] Failed to parse struct declaration (%d error(s)): %s\n"
+                % (PLUGIN_NAME, errors, decl_text)
+            )
+            return False
+        return True
+    except Exception as exc:
+        ida_kernwin.msg("[%s] Failed to parse struct declaration: %s\n" % (PLUGIN_NAME, exc))
+        return False
+
+
+def _set_lvar_type(func_ea, var_name, type_str):
+    """Apply a C type expression (e.g. "tagPOINT *") to a Hex-Rays local
+    variable. Parses the type via a throwaway variable declaration so
+    arbitrary expressions (pointers, struct names, etc.) are accepted, then
+    applies it through the lvar_saved_info_t / MLI_TYPE mechanism (the
+    same mechanism the Hex-Rays UI itself uses for "Set lvar type").
+    """
+    decl = type_str.strip()
+    if not decl:
+        return False
+    if not decl.endswith(";"):
+        decl = decl + " __llm_dummy__;"
+    tif = ida_typeinf.tinfo_t()
+    parsed_name = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL | ida_typeinf.PT_VAR)
+    if parsed_name is None or tif.empty():
+        return False
+    locator = ida_hexrays.lvar_locator_t()
+    if not ida_hexrays.locate_lvar(locator, func_ea, var_name):
+        return False
+    info = ida_hexrays.lvar_saved_info_t()
+    info.ll = locator
+    info.type = tif
+    return ida_hexrays.modify_user_lvar_info(func_ea, ida_hexrays.MLI_TYPE, info)
+
+
+def _apply_var_types(func_ea, var_types):
+    if not var_types or ida_hexrays is None:
+        return
+    try:
+        hexrays_ready = ida_hexrays.init_hexrays_plugin()
+    except Exception:
+        hexrays_ready = False
+    if not hexrays_ready:
+        return
+    for var_name, type_str in var_types:
+        try:
+            ok = _set_lvar_type(func_ea, var_name, type_str)
+        except Exception as exc:
+            ok = False
+            ida_kernwin.msg("[%s] Failed to set type of variable '%s': %s\n" % (PLUGIN_NAME, var_name, exc))
+        if not ok:
+            ida_kernwin.msg(
+                "[%s] Failed to apply type '%s' to variable '%s'.\n" % (PLUGIN_NAME, type_str, var_name)
+            )
+
+
 def _apply_suggestions_and_refresh(
-    func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None
+    func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None,
+    struct_decl=None, var_types=None,
 ):
+    # Struct creation must happen first: the signature and/or variable
+    # types below may reference the new type by name, and need it to
+    # already exist in the local types library to resolve correctly.
+    if struct_decl:
+        _create_struct_type(struct_decl)
+
+    # Variable types/renames operate on the CURRENT decompilation, before
+    # the signature changes it (retyping a function can change how
+    # Hex-Rays decomposes its locals and make old names/lookups stale).
+    _apply_var_types(func_ea, var_types)
     _rename_lvars(func_ea, var_renames)
 
     try:
@@ -814,7 +922,8 @@ class LlamaStreamWorker(threading.Thread):
 
 ConversationResult = namedtuple("ConversationResult", [
     "text", "reasoning_text", "suggested_name", "suggested_signature",
-    "suggested_vars", "suggested_callee_renames", "root_is_pseudocode", "error",
+    "suggested_vars", "suggested_callee_renames", "suggested_struct",
+    "suggested_var_types", "root_is_pseudocode", "error",
 ])
 
 
@@ -922,6 +1031,7 @@ class ConversationRunner(object):
             self._on_result_cb(ConversationResult(
                 text="", reasoning_text=reasoning_text, suggested_name=None,
                 suggested_signature=None, suggested_vars=[], suggested_callee_renames=[],
+                suggested_struct=None, suggested_var_types=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
             ))
             return 0
@@ -1001,12 +1111,34 @@ class ConversationRunner(object):
                 seen_callee_eas.add(callee_ea)
                 suggested_callee_renames.append((callee_ea, callee_new_name))
 
+        suggested_struct = None
+        struct_matches = _SUGGESTED_STRUCT_RE.findall(text)
+        if struct_matches:
+            text = _SUGGESTED_STRUCT_RE.sub("", text).strip()
+            if self._root_is_pseudocode:
+                candidate = struct_matches[-1].strip()
+                if candidate:
+                    suggested_struct = candidate
+
+        suggested_var_types = []
+        vartype_matches = _SUGGESTED_VAR_TYPE_RE.findall(text)
+        if vartype_matches:
+            text = _SUGGESTED_VAR_TYPE_RE.sub("", text).strip()
+            if self._root_is_pseudocode:
+                seen_vartype_names = set()
+                for var_name, type_expr in vartype_matches:
+                    type_expr = type_expr.strip()
+                    if var_name and type_expr and var_name not in seen_vartype_names:
+                        seen_vartype_names.add(var_name)
+                        suggested_var_types.append((var_name, type_expr))
+
         text = strip_markdown_fences(_REQUEST_CODE_RE.sub("", text).strip())
 
         self._on_result_cb(ConversationResult(
             text=text, reasoning_text=reasoning_text,
             suggested_name=suggested_name, suggested_signature=suggested_signature,
             suggested_vars=suggested_vars, suggested_callee_renames=suggested_callee_renames,
+            suggested_struct=suggested_struct, suggested_var_types=suggested_var_types,
             root_is_pseudocode=self._root_is_pseudocode,
             error=None,
         ))
@@ -1060,9 +1192,10 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._closed = False
         self._suggested_vars = []
         self._suggested_callee_renames = []
+        self._suggested_var_types = []
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
-        self.resize(560, 560)
+        self.resize(560, 620)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -1124,6 +1257,25 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.calleerename_label.setEnabled(False)
         calleerename_layout.addWidget(self.calleerename_label, 1)
         layout.addLayout(calleerename_layout)
+
+        struct_layout = QtWidgets.QHBoxLayout()
+        self.struct_check = QtWidgets.QCheckBox("Create struct type:")
+        self.struct_check.setEnabled(False)
+        struct_layout.addWidget(self.struct_check)
+        self.struct_edit = QtWidgets.QLineEdit()
+        self.struct_edit.setEnabled(False)
+        struct_layout.addWidget(self.struct_edit, 1)
+        layout.addLayout(struct_layout)
+
+        vartype_layout = QtWidgets.QHBoxLayout()
+        self.vartype_check = QtWidgets.QCheckBox("Apply suggested variable types:")
+        self.vartype_check.setEnabled(False)
+        vartype_layout.addWidget(self.vartype_check)
+        self.vartype_label = QtWidgets.QLineEdit()
+        self.vartype_label.setReadOnly(True)
+        self.vartype_label.setEnabled(False)
+        vartype_layout.addWidget(self.vartype_label, 1)
+        layout.addLayout(vartype_layout)
 
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch(1)
@@ -1243,6 +1395,19 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.calleerename_label.setEnabled(True)
             self.calleerename_check.setChecked(True)
 
+        if result.suggested_struct:
+            self.struct_edit.setText(result.suggested_struct)
+            self.struct_check.setEnabled(True)
+            self.struct_edit.setEnabled(True)
+            self.struct_check.setChecked(True)
+
+        if result.suggested_var_types:
+            self._suggested_var_types = result.suggested_var_types
+            self.vartype_label.setText(", ".join("%s -> %s" % p for p in result.suggested_var_types))
+            self.vartype_check.setEnabled(True)
+            self.vartype_label.setEnabled(True)
+            self.vartype_check.setChecked(True)
+
         self._last_answer_text = result.text
         self.status_label.setText("Done.")
         self.reason_button.setEnabled(True)
@@ -1289,7 +1454,9 @@ class ExplainResultDialog(QtWidgets.QDialog):
         comment = _SUGGESTED_NAME_RE.sub("", comment)
         comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
         comment = _SUGGESTED_VAR_RE.sub("", comment)
-        comment = _SUGGESTED_CALLEE_NAME_RE.sub("", comment).strip()
+        comment = _SUGGESTED_CALLEE_NAME_RE.sub("", comment)
+        comment = _SUGGESTED_STRUCT_RE.sub("", comment)
+        comment = _SUGGESTED_VAR_TYPE_RE.sub("", comment).strip()
 
         new_name = None
         if self.rename_check.isChecked():
@@ -1309,10 +1476,19 @@ class ExplainResultDialog(QtWidgets.QDialog):
             if (self.calleerename_check.isChecked() and self._suggested_callee_renames) else None
         )
 
+        struct_decl = None
+        if self.struct_check.isChecked() and self.struct_edit.text().strip():
+            struct_decl = self.struct_edit.text().strip()
+
+        var_types = (
+            list(self._suggested_var_types)
+            if (self.vartype_check.isChecked() and self._suggested_var_types) else None
+        )
+
         ida_kernwin.execute_sync(
             functools.partial(
                 _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature,
-                var_renames, callee_renames,
+                var_renames, callee_renames, struct_decl, var_types,
             ),
             ida_kernwin.MFF_WRITE,
         )
@@ -1604,7 +1780,8 @@ class BatchPickerDialog(QtWidgets.QDialog):
 BatchItemResult = namedtuple("BatchItemResult", [
     "func_ea", "orig_name", "ok", "message", "comment",
     "suggested_name", "suggested_signature", "suggested_vars",
-    "suggested_callee_renames", "root_is_pseudocode",
+    "suggested_callee_renames", "suggested_struct", "suggested_var_types",
+    "root_is_pseudocode",
 ])
 
 
@@ -1681,12 +1858,13 @@ class BatchController(object):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
-                                    None, None, None, [], [], result.root_is_pseudocode)
+                                    None, None, None, [], [], None, [], result.root_is_pseudocode)
             self._on_row_update(index, "Error", result.error)
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
                                     result.suggested_name, result.suggested_signature,
                                     result.suggested_vars, result.suggested_callee_renames,
+                                    result.suggested_struct, result.suggested_var_types,
                                     result.root_is_pseudocode)
             self._on_row_update(index, "Done", result.text[:120])
         self._record_and_advance(item)
@@ -1694,18 +1872,20 @@ class BatchController(object):
     def _on_error(self, index, func, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
-                                None, None, None, [], [], False)
+                                None, None, None, [], [], None, [], False)
         self._on_row_update(index, "Error", message)
         self._record_and_advance(item)
 
 
 def _apply_batch_and_refresh(items):
     """items: list of (func_ea, comment, new_name, signature, var_renames,
-    callee_renames). One execute_sync/MFF_WRITE round-trip for the whole
-    batch instead of N.
+    callee_renames, struct_decl, var_types). One execute_sync/MFF_WRITE
+    round-trip for the whole batch instead of N.
     """
-    for func_ea, comment, new_name, signature, var_renames, callee_renames in items:
-        _apply_suggestions_and_refresh(func_ea, comment, new_name, signature, var_renames, callee_renames)
+    for func_ea, comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types in items:
+        _apply_suggestions_and_refresh(
+            func_ea, comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types
+        )
     return 1
 
 
@@ -1795,8 +1975,11 @@ class BatchProgressDialog(QtWidgets.QDialog):
             signature = item.suggested_signature if item.root_is_pseudocode else None
             var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
             callee_renames = item.suggested_callee_renames or None
+            struct_decl = item.suggested_struct if item.root_is_pseudocode else None
+            var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
             items_to_apply.append(
-                (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames)
+                (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames,
+                 struct_decl, var_types)
             )
         if not items_to_apply:
             return
