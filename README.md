@@ -36,21 +36,25 @@ checkbox, editable before anything is written.
   way that suggests an undefined structure, the model can define a proper struct type and apply
   it — to a function argument via the signature, or to a local variable directly — again as an
   editable, opt-in suggestion.
-- **Batch mode**: pick a set of functions (filterable checklist), process them sequentially, then
-  review and apply the results in bulk — same human-in-the-loop guarantee as the single-function
-  flow.
+- **Batch mode**: pick a set of functions (filterable checklist), process them, then review and
+  apply the results in bulk — same human-in-the-loop guarantee as the single-function flow.
 - **Recursive auto-accept mode**: `Explain function with LLM (recursively)` also explains the
   target function's direct callees (depth 1 only) and applies every result automatically, with
   no review step — the one exception to the human-in-the-loop rule above. Still uses the same
   conservative apply defaults as a manual Accept, is capped by its own "Max recursive callees"
   setting, and shows a live, cancellable progress dialog. Use with care since it writes to the
   database unattended.
+- **Multi-server parallelism**: configure more than one `llama-server` instance and batch/recursive
+  explain will run up to one function per server concurrently — N servers gives roughly an Nx
+  speedup over a single server. The interactive single-function explain always uses the first
+  configured server.
 
 ## Requirements
 
 - IDA Pro 9.3 or later (PySide6 is bundled with IDA — no extra Python packages to install).
-- A running `llama-server` reachable over HTTP, reachable at the configured base URL
-  (default `http://127.0.0.1:8080`).
+- One or more running `llama-server` instances reachable over HTTP (default
+  `http://127.0.0.1:8080`). Configuring more than one lets batch/recursive explain run in
+  parallel across all of them.
 - The Hex-Rays decompiler is optional. If it isn't available for the current architecture, the
   plugin automatically falls back to a plain disassembly listing.
 
@@ -113,8 +117,9 @@ doesn't publish the full list of accepted category values, so double-check that 
 1. Right-click in the **Functions** window → **LLM Explainer → Batch Explain Functions...**
    (or Edit → Plugins → Batch Explain Functions...).
 2. Filter and check the functions you want processed. Nothing is pre-selected.
-3. The progress dialog processes them one at a time (sequential by design — a typical local
-   `llama-server` only has one inference slot anyway) and shows live status per function.
+3. The progress dialog processes up to one function per configured server concurrently (see
+   "Server base URL(s)" below) and shows live status per function, including which server is
+   handling it.
 4. Once finished, check/uncheck rows (successful ones are checked by default) and click
    **Apply Selected** to write all of them in one batch. There is no follow-up chat in batch
    mode — reopen the single-function flow on a specific function if you want to refine it further.
@@ -134,7 +139,7 @@ Open **Edit → Plugins → LLM Explainer** to configure:
 
 | Setting | Default | Notes |
 |---|---|---|
-| Server base URL | `http://127.0.0.1:8080` | Your `llama-server` endpoint |
+| Server base URL(s) | `http://127.0.0.1:8080` | One `llama-server` endpoint per line; batch/recursive explain distributes work across all of them, one function per server at a time |
 | Model name | *(blank)* | Only needed if your server hosts multiple models |
 | API key | *(blank)* | Optional bearer token |
 | Temperature | `0.2` | |

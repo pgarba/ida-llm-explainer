@@ -25,22 +25,26 @@ Install by copying this single file into one of:
         <IDA install dir>\\plugins\\llm_explainer.py
 
 Requires: IDA Pro 9.3+ (PySide6 is bundled with IDA, no extra install
-needed), and a running llama.cpp `llama-server` reachable at the configured
-base URL (default http://127.0.0.1:8080). The Hex-Rays decompiler is
-optional - if it is not available for the current architecture the plugin
-falls back to a plain disassembly listing automatically.
+needed), and one or more running llama.cpp `llama-server` instances
+reachable at the configured base URL(s) (default http://127.0.0.1:8080).
+The Hex-Rays decompiler is optional - if it is not available for the
+current architecture the plugin falls back to a plain disassembly listing
+automatically.
 
-Configure the server URL, model, and other options via
-Edit > Plugins > LLM Explainer.
-
-Note: if llama-server is run with a single inference slot, opening several
-"explain" dialogs at once will simply queue their requests on the server -
-that is a server/deployment concern, not a bug in this plugin.
+Configure the server URL(s), model, and other options via
+Edit > Plugins > LLM Explainer. The interactive single-function explain
+always talks to the first configured server. If llama-server is run with a
+single inference slot, opening several "explain" dialogs at once will
+simply queue their requests on that server - that is a server/deployment
+concern, not a bug in this plugin.
 
 To process many functions at once, right-click in the Functions window (or
 use Edit > Plugins > Batch Explain Functions...) to pick a set of functions,
-process them sequentially, and review/apply the results in one batch -
-still nothing is written to the database until you explicitly apply.
+process them, and review/apply the results in one batch - still nothing is
+written to the database until you explicitly apply. If more than one
+server is configured, batch explain (and the recursive auto-accept action
+below) runs up to one function per server concurrently, so listing N
+llama-server instances gives roughly an Nx speedup over a single server.
 
 "Explain function with LLM (recursively)" (same right-click menu as the
 regular explain action) explains the target function plus its direct
@@ -216,7 +220,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 DEFAULT_CONFIG = {
-    "base_url": "http://127.0.0.1:8080",
+    "server_urls": ["http://127.0.0.1:8080"],
     "model": "",
     "api_key": "",
     "temperature": 0.2,
@@ -725,6 +729,10 @@ class PluginConfig(object):
             pass
         except Exception as exc:
             ida_kernwin.msg("[%s] Failed to read config (%s); using defaults.\n" % (PLUGIN_NAME, exc))
+        # Migrate old single-server configs (pre multi-server support) that
+        # still have a "base_url" string but no "server_urls" list.
+        if "server_urls" not in data and isinstance(data.get("base_url"), str) and data["base_url"].strip():
+            data["server_urls"] = [data["base_url"].strip()]
         return cls(**data)
 
     def save(self):
@@ -746,9 +754,18 @@ class PluginConfig(object):
         return PluginConfig(**self.to_dict())
 
     def _validate(self):
-        self.base_url = (self.base_url or DEFAULT_CONFIG["base_url"]).strip().rstrip("/")
-        if not (self.base_url.startswith("http://") or self.base_url.startswith("https://")):
-            self.base_url = DEFAULT_CONFIG["base_url"]
+        cleaned_urls = []
+        seen_urls = set()
+        for url in (self.server_urls or []):
+            if not isinstance(url, str):
+                continue
+            url = url.strip().rstrip("/")
+            if not url or not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            if url not in seen_urls:
+                seen_urls.add(url)
+                cleaned_urls.append(url)
+        self.server_urls = cleaned_urls or list(DEFAULT_CONFIG["server_urls"])
         try:
             self.temperature = max(0.0, min(2.0, float(self.temperature)))
         except (TypeError, ValueError):
@@ -812,9 +829,10 @@ class LlamaStreamWorker(threading.Thread):
     directly.
     """
 
-    def __init__(self, config, messages, on_delta, on_reasoning_delta, on_done, on_error):
+    def __init__(self, config, server_url, messages, on_delta, on_reasoning_delta, on_done, on_error):
         super().__init__(daemon=True)
         self._config = config
+        self._server_url = server_url
         self._messages = messages
         self._on_delta = on_delta
         self._on_reasoning_delta = on_reasoning_delta
@@ -842,7 +860,7 @@ class LlamaStreamWorker(threading.Thread):
                 )
 
     def _stream(self):
-        url = self._config.base_url + "/v1/chat/completions"
+        url = self._server_url + "/v1/chat/completions"
         payload = {
             "messages": self._messages,
             "temperature": self._config.temperature,
@@ -967,10 +985,11 @@ class ConversationRunner(object):
     headless batch controller (call start(), wait for on_result).
     """
 
-    def __init__(self, config, func, on_delta=None, on_reasoning_delta=None, on_status=None):
+    def __init__(self, config, func, server_url=None, on_delta=None, on_reasoning_delta=None, on_status=None):
         self.config = config
         self.func = func
         self.func_ea = func.start_ea
+        self.server_url = server_url or config.server_urls[0]
         self.messages = None
         self._on_delta = on_delta or (lambda piece: None)
         self._on_reasoning_delta = on_reasoning_delta or (lambda piece: None)
@@ -1031,7 +1050,7 @@ class ConversationRunner(object):
 
     def _issue_request(self):
         self.worker = LlamaStreamWorker(
-            self.config, list(self.messages),
+            self.config, self.server_url, list(self.messages),
             self._on_delta, self._on_reasoning_delta,
             self._on_worker_done, self._on_worker_error,
         )
@@ -1570,8 +1589,19 @@ class SettingsDialog(QtWidgets.QDialog):
 
         form = QtWidgets.QFormLayout()
 
-        self.base_url_edit = QtWidgets.QLineEdit()
-        form.addRow("Server base URL:", self.base_url_edit)
+        self.server_urls_edit = QtWidgets.QPlainTextEdit()
+        self.server_urls_edit.setPlaceholderText(
+            "One llama-server base URL per line, e.g.\nhttp://127.0.0.1:8080\nhttp://127.0.0.1:8081"
+        )
+        self.server_urls_edit.setMaximumHeight(80)
+        self.server_urls_edit.setToolTip(
+            "List multiple llama-server instances (one per line) to have "
+            "Batch Explain and the recursive auto-accept action distribute "
+            "work across all of them at once - up to one function in "
+            "flight per server. The interactive single-function explain "
+            "always uses the first URL listed."
+        )
+        form.addRow("Server base URL(s):", self.server_urls_edit)
 
         self.model_edit = QtWidgets.QLineEdit()
         self.model_edit.setPlaceholderText("(optional - leave blank to use server default)")
@@ -1692,7 +1722,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self._populate(config)
 
     def _populate(self, config):
-        self.base_url_edit.setText(config.base_url)
+        self.server_urls_edit.setPlainText("\n".join(config.server_urls))
         self.model_edit.setText(config.model)
         self.api_key_edit.setText(config.api_key)
         self.temperature_spin.setValue(config.temperature)
@@ -1723,7 +1753,9 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _on_ok(self):
         cfg = self._base_config.clone()
-        cfg.base_url = self.base_url_edit.text()
+        cfg.server_urls = [
+            line.strip() for line in self.server_urls_edit.toPlainText().splitlines() if line.strip()
+        ]
         cfg.model = self.model_edit.text()
         cfg.api_key = self.api_key_edit.text()
         cfg.temperature = self.temperature_spin.value()
@@ -1874,13 +1906,15 @@ def _compute_apply_args(item):
 
 
 class BatchController(object):
-    """Drives a sequence of ConversationRunners, one function at a time, on
-    IDA's main thread. No separate background thread is needed:
-    ConversationRunner.start()/send_followup() already return immediately
-    (spawning a LlamaStreamWorker thread), and that worker's completion
-    callbacks already arrive on the main thread via execute_sync. So the
-    batch driver is just a plain object whose on_result/on_error callback,
-    once invoked, starts the next function.
+    """Drives functions through ConversationRunners on IDA's main thread,
+    as a worker pool over config.server_urls: up to one function in flight
+    per configured server, so N servers process up to N functions at once.
+    No separate background thread is needed for the pool itself:
+    ConversationRunner.start() already returns immediately (spawning a
+    LlamaStreamWorker thread per request), and that worker's completion
+    callbacks already arrive on the main thread via execute_sync. As soon
+    as a server's function finishes, the next queued function (if any) is
+    immediately dispatched to that now-free server.
     """
 
     def __init__(self, config, funcs, on_row_update, on_finished, on_item_result=None):
@@ -1889,62 +1923,75 @@ class BatchController(object):
         self._on_row_update = on_row_update
         self._on_finished = on_finished
         self._on_item_result = on_item_result or (lambda item: None)
-        self._index = 0
+        self._servers = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
+        self._next_index = 0
         self._cancelled = False
-        self._runner = None
+        self._finished = False
+        # server_url -> (index, ConversationRunner) for in-flight requests -
+        # at most one per server, so this also caps concurrency at len(servers).
+        self._active = {}
         self.results = {}
 
     def start(self):
-        self._process_next()
+        for server_url in self._servers:
+            self._dispatch_next(server_url)
 
     def cancel(self):
         """Cancelling an in-flight LlamaStreamWorker suppresses BOTH its
         on_done and on_error callbacks (both gated by the worker's own
         cancel_event check), so no completion callback will ever arrive
-        for the in-flight function. This must therefore mark the current
-        and all remaining rows as Cancelled synchronously, rather than
-        waiting for a callback that will never come.
+        for any in-flight function. This must therefore mark every active
+        and remaining row as Cancelled synchronously, rather than waiting
+        for callbacks that will never come.
         """
         if self._cancelled:
             return
         self._cancelled = True
-        if self._runner is not None:
-            self._runner.cancel()
-            self._on_row_update(self._index, "Cancelled", "")
-            self._runner = None
-            start_remaining = self._index + 1
-        else:
-            start_remaining = self._index
-        for i in range(start_remaining, len(self.funcs)):
+        for index, runner in self._active.values():
+            runner.cancel()
+            self._on_row_update(index, "Cancelled", "")
+        self._active = {}
+        for i in range(self._next_index, len(self.funcs)):
             self._on_row_update(i, "Cancelled", "")
-        self._on_finished()
+        self._maybe_finish()
 
-    def _process_next(self):
-        if self._cancelled or self._index >= len(self.funcs):
-            self._on_finished()
+    def _dispatch_next(self, server_url):
+        if self._cancelled:
             return
-        func = self.funcs[self._index]
-        self._on_row_update(self._index, "Running", "")
-        self._runner = ConversationRunner(
-            self.config, func,
-            on_status=functools.partial(self._on_status, self._index),
+        if self._next_index >= len(self.funcs):
+            self._maybe_finish()
+            return
+        index = self._next_index
+        self._next_index += 1
+        func = self.funcs[index]
+        self._on_row_update(index, "Running", "(%s)" % server_url)
+        runner = ConversationRunner(
+            self.config, func, server_url=server_url,
+            on_status=functools.partial(self._on_status, index),
         )
-        self._runner.start(
-            on_result=functools.partial(self._on_result, self._index, func),
-            on_error=functools.partial(self._on_error, self._index, func),
+        self._active[server_url] = (index, runner)
+        runner.start(
+            on_result=functools.partial(self._on_result, index, func, server_url),
+            on_error=functools.partial(self._on_error, index, func, server_url),
         )
 
     def _on_status(self, index, text):
         self._on_row_update(index, "Running", text)
 
-    def _record_and_advance(self, item):
+    def _maybe_finish(self):
+        if self._finished:
+            return
+        if not self._active and (self._cancelled or self._next_index >= len(self.funcs)):
+            self._finished = True
+            self._on_finished()
+
+    def _record_and_advance(self, item, server_url):
         self.results[item.func_ea] = item
         self._on_item_result(item)
-        self._runner = None
-        self._index += 1
-        self._process_next()
+        self._active.pop(server_url, None)
+        self._dispatch_next(server_url)
 
-    def _on_result(self, index, func, result):
+    def _on_result(self, index, func, server_url, result):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
@@ -1957,14 +2004,14 @@ class BatchController(object):
                                     result.suggested_struct, result.suggested_var_types,
                                     result.root_is_pseudocode)
             self._on_row_update(index, "Done", result.text[:120])
-        self._record_and_advance(item)
+        self._record_and_advance(item, server_url)
 
-    def _on_error(self, index, func, message):
+    def _on_error(self, index, func, server_url, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
                                 None, None, None, [], [], None, [], False)
         self._on_row_update(index, "Error", message)
-        self._record_and_advance(item)
+        self._record_and_advance(item, server_url)
 
 
 def _apply_batch_and_refresh(items):
@@ -2264,7 +2311,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._popup_hooks = PopupHooks()
         self._popup_hooks.hook()
 
-        ida_kernwin.msg("[%s] v%s loaded. Server: %s\n" % (PLUGIN_NAME, PLUGIN_VERSION, self.config.base_url))
+        ida_kernwin.msg(
+            "[%s] v%s loaded. Server(s): %s\n"
+            % (PLUGIN_NAME, PLUGIN_VERSION, ", ".join(self.config.server_urls))
+        )
         return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
