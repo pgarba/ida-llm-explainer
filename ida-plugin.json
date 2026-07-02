@@ -5,7 +5,7 @@
     "name": "llm-explainer",
     "entryPoint": "llm_explainer.py",
     "version": "1.0.0",
-    "idaVersions": ["9.2"],
+    "idaVersions": ["9.3"],
     "description": "Explains functions using a local llama.cpp LLM - proposes renames, types, and structs, all human-reviewed before anything is written.",
     "license": "MIT",
     "categories": [

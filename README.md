@@ -2,7 +2,7 @@
 
 # LLM Explainer
 
-An IDA Pro 9.2 plugin that asks a locally-running [llama.cpp](https://github.com/ggml-org/llama.cpp)
+An IDA Pro 9.3 plugin that asks a locally-running [llama.cpp](https://github.com/ggml-org/llama.cpp)
 server (`llama-server`) to explain the function you're looking at — in either the Hex-Rays
 pseudocode view or the plain disassembly view — and streams the answer into a small,
 non-modal review dialog. Nothing is written to your database until you explicitly click Accept.
@@ -48,7 +48,7 @@ checkbox, editable before anything is written.
 
 ## Requirements
 
-- IDA Pro 9.2 or later (PySide6 is bundled with IDA — no extra Python packages to install).
+- IDA Pro 9.3 or later (PySide6 is bundled with IDA — no extra Python packages to install).
 - A running `llama-server` reachable over HTTP, reachable at the configured base URL
   (default `http://127.0.0.1:8080`).
 - The Hex-Rays decompiler is optional. If it isn't available for the current architecture, the

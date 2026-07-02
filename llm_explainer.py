@@ -1,4 +1,4 @@
-"""LLM Explainer - IDA Pro 9.2 plugin.
+"""LLM Explainer - IDA Pro 9.3 plugin.
 
 Asks a locally-running llama.cpp server (llama-server, OpenAI-compatible API)
 to explain the function currently under the cursor, in either the Hex-Rays
@@ -24,7 +24,7 @@ Install by copying this single file into one of:
   - Global (all users of this IDA install):
         <IDA install dir>\\plugins\\llm_explainer.py
 
-Requires: IDA Pro 9.2+ (PySide6 is bundled with IDA, no extra install
+Requires: IDA Pro 9.3+ (PySide6 is bundled with IDA, no extra install
 needed), and a running llama.cpp `llama-server` reachable at the configured
 base URL (default http://127.0.0.1:8080). The Hex-Rays decompiler is
 optional - if it is not available for the current architecture the plugin
