@@ -5,6 +5,13 @@ server (`llama-server`) to explain the function you're looking at — in either 
 pseudocode view or the plain disassembly view — and streams the answer into a small,
 non-modal review dialog. Nothing is written to your database until you explicitly click Accept.
 
+![LLM Explainer result dialog with proposed name, signature, variable renames, and called-function renames](example.png)
+
+The dialog above shows a real run against a license-check function: the model explained what it
+does, proposed a clearer name and signature, renamed every local variable, and — after fetching
+the code of the functions it calls — proposed names for those too. Each suggestion is its own
+checkbox, editable before anything is written.
+
 ## Features
 
 - **Right-click, explain**: works from the pseudocode view, the disassembly view, or a
@@ -145,8 +152,7 @@ function's comment.
 
 ## License
 
-No explicit license has been chosen yet — treat as all rights reserved unless the author
-specifies otherwise.
+MIT — see [LICENSE](LICENSE).
 
 ## Copyright
 
