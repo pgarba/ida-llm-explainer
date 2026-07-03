@@ -231,6 +231,17 @@ pass: it only ever resolves a branch when it's actually confident (a concrete va
 or a value it can positively attribute to runtime/caller data) — anything it isn't sure about
 still falls back to the LLM rather than guessing.
 
+**Loops and re-entered dispatchers** are handled specially, since a flattening dispatcher is
+typically revisited every loop iteration with a *different* state value — a snapshot that
+confidently resolves one case as real and the rest as dead on the first pass can be wrong for
+every other pass. The trace detects both directions of this: a candidate that loops back to an
+earlier block in the same trace is flagged for the LLM instead of being auto-resolved by the
+constant-propagation pass (a value that looks fixed on this one pass through a loop isn't
+necessarily fixed on every pass), and if a dispatcher block already fully decided gets reached
+again from a *different* real block later in the trace — the loop-revisit pattern — any of its
+successors previously marked dead are automatically un-marked and moved to UNRESOLVED for
+review, rather than staying permanently (and possibly wrongly) dead.
+
 **Constant-propagation pass limitations** (falls back to the LLM for these, same as if the
 feature were off): x86/x64 only; indexed/scaled memory addressing (`[rcx+rdx*4]`,
 `[rax*8+table]`) is supported for reads but never round-trip-tracked through writes; a `call`'s

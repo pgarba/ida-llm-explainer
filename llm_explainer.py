@@ -81,7 +81,15 @@ failure modes for whatever still reaches it: a candidate the model never
 addresses is flagged for manual review rather than silently assumed dead,
 an address outside the block's actual candidates is discarded, and
 conflicting REAL/DEAD verdicts for the same address from different paths
-keep the first verdict and surface the conflict. As it walks, it also
+keep the first verdict and surface the conflict. A dispatcher re-entered
+from a different real block later in the trace - the classic loop/
+flattening-dispatcher revisit pattern, where a single-snapshot verdict
+from the first pass would otherwise leave every other pass's real blocks
+wrongly stuck as dead - is detected and automatically un-marks those
+successors back to unresolved for review, and a candidate that loops
+back to an earlier block in the trace is deferred to the LLM rather than
+auto-resolved, since a value that looks fixed on one pass through a loop
+is not necessarily fixed on every pass. As it walks, it also
 corrects any instruction boundaries IDA's original analysis got wrong -
 undefining and recreating instructions one at a time (never touching a
 byte), the same "U then C" fixup a human would do manually - since
@@ -329,7 +337,22 @@ CFG_TRACE_SYSTEM_PROMPT = (
     "5. Never invent an address that is not one of the listed candidates. "
     "The only exception is an indirect jump explicitly marked as having no "
     "enumerable candidates - only then may you name a specific address you "
-    "can justify from the trace.\n\n"
+    "can justify from the trace.\n"
+    "6. LOOP BACK EDGES: a candidate marked '*** LOOP BACK EDGE ***' below is "
+    "an address you have already visited earlier in this exact trace - "
+    "looping back to it is completely normal control flow (a for/while "
+    "loop, or a flattening dispatcher re-entered every iteration with a "
+    "different state value), not evidence that anything is fake. Because "
+    "such a dispatcher is revisited many times with DIFFERENT state each "
+    "time, a comparison that looks like a fixed, one-sided opaque "
+    "predicate on THIS ONE pass through the loop may not actually be "
+    "fixed across every iteration - it can take the other path on a "
+    "different pass through the very same code. If you cannot be "
+    "confident the outcome is the same on every iteration, not just this "
+    "one, prefer UNRESOLVED_TARGET over DEAD_TARGET for the affected "
+    "candidate(s); only declare a loop-adjacent branch a genuine opaque "
+    "predicate when you can see the deciding state is set once before "
+    "the loop and never touched again anywhere reachable from it.\n\n"
     "Reply using exactly one line per candidate, in one of these three "
     "forms:\n"
     "REAL_TARGET: <address> - <short reason>\n"
@@ -365,6 +388,20 @@ CFG_TRACE_SYSTEM_PROMPT = (
     "obfuscator predicate, so both outcomes are real\n"
     "REAL_TARGET: <loc_140A7D045 address> - same reasoning; taken when the "
     "caller-supplied value is out of range\n\n"
+    "Worked example 3 (loop back edge, NOT a one-sided opaque predicate) - a "
+    "dispatcher block's indirect jump target depends on a state variable, and "
+    "one enumerated case is marked '*** LOOP BACK EDGE: this address is an "
+    "earlier block in this same trace ***'. The state variable currently "
+    "selects only one case, but this dispatcher is reached again on every "
+    "loop iteration with a different state value set by whichever block ran "
+    "before it - so the matching case is real for THIS pass, but the other "
+    "cases are not necessarily dead, since they are the real targets on "
+    "OTHER passes through this same dispatcher:\n"
+    "REAL_TARGET: <matching case address> - state variable currently selects "
+    "this case\n"
+    "UNRESOLVED_TARGET: <another case address> - this dispatcher is a loop "
+    "back-edge target, revisited every iteration with different state; "
+    "cannot confirm this case is unreachable on every pass, only on this one\n\n"
     "WRONG example (do not do this) - replying with only\n"
     "REAL_TARGET: 0x140001050 - looks like the normal path\n"
     "and leaving 0x140001058 unaddressed. Every candidate must get its own "
@@ -3657,6 +3694,11 @@ class CfgTraceRunner(object):
         self.trace_log = []
         self.blocks_processed = 0
         self.symbolic_resolved_count = 0  # blocks resolved without an LLM call, for the summary banner
+        # eas of decision-point blocks (conditional_branch/indirect_jump)
+        # already corrected once for being re-entered from a different
+        # real predecessor than the one that originally decided them -
+        # see _enqueue's dispatcher-revisit handling.
+        self._corrected_dispatchers = set()
 
         # ea -> SymState as of the end of that block's predecessor (i.e.
         # the state to run THIS block's own instructions against). Seeded
@@ -3761,6 +3803,9 @@ class CfgTraceRunner(object):
         """
         if not self.config.cfg_trace_use_symbolic:
             return False
+        has_back_edge = any(
+            s.ea is not None and self._is_ancestor(s.ea, block.start_ea) for s in block.successors
+        )
         if block.kind == "conditional_branch":
             if len(block.successors) != 2 or not block.sym_insns:
                 return False
@@ -3776,6 +3821,24 @@ class CfgTraceRunner(object):
         else:
             return False
         if kind == "unknown":
+            return False
+        if kind == "opaque" and has_back_edge:
+            # The engine computed a single-snapshot "some real, some dead"
+            # verdict, but one candidate is a loop back edge - a value
+            # that looks fixed on THIS pass through the loop can still
+            # differ on other iterations (the classic OLLVM dispatcher
+            # pattern: re-entered every iteration with different state).
+            # The engine has no notion of loop iterations, so this shape
+            # of result can't be trusted here - defer to the LLM, which
+            # will see the back edge explicitly annotated in the prompt.
+            # (A "data_dependent" result, marking every side real, is
+            # always safe regardless of back edges and is NOT blocked
+            # here - only "opaque", which marks some candidates dead.)
+            self._log(
+                "Block %#010x: symbolic engine would mark some candidates dead, but "
+                "one is a loop back edge - deferring to the LLM instead of trusting "
+                "a single-iteration snapshot." % block.start_ea
+            )
             return False
         self.symbolic_resolved_count += 1
         self._log(
@@ -3794,13 +3857,64 @@ class CfgTraceRunner(object):
         return True
 
     def _enqueue(self, ea, predecessor_ea, summary, sym_state=None):
-        if ea in self.visited or ea in self.queued or ea in self.dead:
+        if ea in self.visited:
+            self._note_dispatcher_revisit(ea, predecessor_ea)
+            return
+        if ea in self.queued or ea in self.dead:
             return
         self.queued.add(ea)
         self.predecessors[ea] = predecessor_ea
         self.decision_summary[ea] = summary
         self.sym_states[ea] = sym_state.copy() if sym_state is not None else SymState()
         self.worklist.append(ea)
+
+    def _note_dispatcher_revisit(self, ea, predecessor_ea):
+        """A REAL edge just targeted a block that's already fully decided -
+        normal for an ordinary CFG merge point. But if that block is
+        itself a decision point (conditional_branch/indirect_jump) and
+        this edge comes from a DIFFERENT predecessor than the one that
+        originally resolved it, this is the classic loop/dispatcher
+        revisit pattern - e.g. an OLLVM flattening dispatcher re-entered
+        on every loop iteration with a different state value. Whatever
+        that block's own DEAD verdicts were (from resolving it against
+        the FIRST entry's snapshot only) may not hold for this entry -
+        retroactively re-flag them for manual review rather than
+        continuing to silently trust a verdict that only ever considered
+        one specific path through the dispatcher. This is exactly the
+        failure mode where a genuinely reachable block ends up
+        permanently mismarked dead.
+        """
+        if ea in self._corrected_dispatchers:
+            return
+        block = self.visited.get(ea)
+        if block is None or block.kind not in ("conditional_branch", "indirect_jump"):
+            return
+        original_predecessor = self.predecessors.get(ea)
+        if original_predecessor is None or original_predecessor == predecessor_ea:
+            return  # same entry point (or no recorded predecessor) - not a revisit
+        self._corrected_dispatchers.add(ea)
+        self._log(
+            "Block %#010x (a decision point) reached again from block %#010x - a "
+            "DIFFERENT path than block %#010x, which originally decided it. This "
+            "looks like a loop/dispatcher re-entered with different state each "
+            "time; re-flagging its DEAD successors for manual review rather than "
+            "trusting a verdict that may only hold for the first path through it."
+            % (ea, predecessor_ea, original_predecessor)
+        )
+        for succ in block.successors:
+            if succ.ea is None or succ.ea not in self.dead:
+                continue
+            reason = self.dead_reason.pop(succ.ea, "")
+            old_block = self.dead_blocks.pop(succ.ea, None)
+            self.dead.discard(succ.ea)
+            self._flag_unresolved(
+                succ.ea,
+                "Re-flagged: block %#010x (which decided this) was reached again via "
+                "a different path (%#010x) - the original DEAD verdict (%s) may only "
+                "hold for one specific entry into that dispatcher, not every path "
+                "through it." % (ea, predecessor_ea, reason or "no reason given"),
+                predecessor_ea, block=old_block,
+            )
 
     def _finish(self, partial):
         unexplored = list(self.worklist) if partial else []
@@ -3913,6 +4027,24 @@ class CfgTraceRunner(object):
         chain.reverse()
         return chain
 
+    def _is_ancestor(self, candidate_ea, current_ea):
+        """True if candidate_ea appears in current_ea's predecessor chain -
+        i.e. this candidate is a genuine loop back edge (reaching it again
+        would mean execution looped around), not just an unrelated
+        already-visited merge point elsewhere in the graph. Same
+        cycle-safe walk as _breadcrumb.
+        """
+        cur = current_ea
+        seen = {current_ea}
+        while cur in self.predecessors:
+            cur = self.predecessors[cur]
+            if cur == candidate_ea:
+                return True
+            if cur in seen:
+                return False
+            seen.add(cur)
+        return False
+
     def _build_hop_prompt(self, block):
         lines = [
             "Trace stats: %d block(s) processed so far, %d confirmed real, %d confirmed "
@@ -3946,7 +4078,15 @@ class CfgTraceRunner(object):
                 lines.append("  %d. indirect target, not resolved by IDA%s" % (idx + 1, note))
             else:
                 note = (" - %s" % succ.note) if succ.note else ""
-                lines.append("  %d. %#010x (%s)%s" % (idx + 1, succ.ea, succ.role, note))
+                back_edge = (
+                    "  *** LOOP BACK EDGE: this address is an earlier block in this "
+                    "same trace - taking it means looping back, not a one-way opaque "
+                    "predicate. A comparison that looks fixed on THIS pass through the "
+                    "loop can still be genuinely reachable on other iterations - do not "
+                    "mark it dead just because this snapshot doesn't take it. ***"
+                    if self._is_ancestor(succ.ea, block.start_ea) else ""
+                )
+                lines.append("  %d. %#010x (%s)%s%s" % (idx + 1, succ.ea, succ.role, note, back_edge))
         return "\n".join(lines)
 
     def _issue_decision_request(self, block):
