@@ -208,8 +208,13 @@ additionally:
   (one byte shorter, padded with a trailing NOP) with a freshly-computed displacement — never
   reused/guessed from the original bytes. Genuine data-dependent branches (both sides real) are
   never touched, since there's nothing to redirect — both paths are legitimately reachable.
+- **Ensures a function is actually defined at the trace's start address**, since IDA sometimes
+  never recognized it as one in the first place — the whole reason obfuscated dispatcher entry
+  points need this feature at all. Only creates a function where none exists; if the address
+  turns out to already be inside a *different* function, it's left alone rather than forcing a
+  new boundary into existing analysis.
 
-Both operations re-decode and verify the actual bytes at each address immediately before
+Both byte-patching operations re-decode and verify the actual bytes at each address immediately before
 patching (never trust stale/cached data), and refuse to patch — logging why, leaving the
 original bytes untouched — for anything they don't fully recognize: an unusual `Jcc` encoding,
 a claimed target that doesn't match what the instruction actually encodes, or a dead-code

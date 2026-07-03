@@ -4289,13 +4289,52 @@ def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
     return True, None
 
 
-def _apply_cfg_trace_and_refresh(config, items, jump_patches=None):
+def _ensure_function_at(start_ea):
+    """Best-effort: makes sure a proper function begins at start_ea. The
+    whole premise of CFG tracing is that IDA's original analysis may
+    never have recognized this address as a function at all - a common
+    symptom of flattening/dispatcher-style obfuscation, where the real
+    entry point is only reachable through control flow IDA couldn't
+    follow - so once the recovered control flow has actually been
+    patched in, this gives Hex-Rays something to decompile without the
+    user needing to press P manually. Returns a short log message, or
+    None if nothing needed doing. Never touches an address that's
+    already inside a DIFFERENT function - that would mean start_ea
+    turned out to belong to existing, unrelated code, and forcing a new
+    function boundary there could break that function's own analysis.
+    """
+    try:
+        existing = ida_funcs.get_func(start_ea)
+    except Exception:
+        existing = None
+    if existing is not None:
+        if existing.start_ea == start_ea:
+            return None
+        return (
+            "%#010x is already inside another function (starting at %#010x) - "
+            "not forcing a new function boundary there." % (start_ea, existing.start_ea)
+        )
+    try:
+        ok = ida_funcs.add_func(start_ea)
+    except Exception as exc:
+        return "Failed to create a function at %#010x: %s" % (start_ea, exc)
+    if not ok:
+        return "IDA could not create a function at %#010x (add_func failed)." % start_ea
+    return "Created a function at %#010x so it can be decompiled." % start_ea
+
+
+def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None):
     """One execute_sync/MFF_WRITE round-trip for the whole accepted set.
     Always marks/comments (color + comment only, per the confirmed v1
-    scope). If jump_patches is given (only when the user explicitly
-    opted in via "Also patch bytes"), ALSO NOPs every checked dead
-    instruction's bytes and redirects each listed conditional jump to
-    its real target - see _patch_nop_instruction/_patch_jcc_to_real_target.
+    scope). If jump_patches is not None (only when the user explicitly
+    opted in via "Also patch bytes" - it may still be an empty list),
+    ALSO NOPs every checked dead instruction's bytes, redirects each
+    listed conditional jump to its real target (see
+    _patch_nop_instruction/_patch_jcc_to_real_target), and enforces that
+    a proper function exists at start_ea (see _ensure_function_at) -
+    only in patch mode, since forcing a function boundary is itself a
+    database change beyond plain color/comment marking, consistent with
+    everything else this option gates.
     Colors are idc.set_color's native 0xBBGGRR (BGR, not RGB) packed ints;
     applied across every instruction in the block's range so the whole
     marked region is visually distinct, while the comment itself is only
@@ -4318,7 +4357,7 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None):
                 pass
 
     patch_log = []
-    if jump_patches:
+    if jump_patches is not None:
         dead_insn_eas = set()
         for item in items:
             if item.verdict == "dead":
@@ -4335,6 +4374,13 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None):
                     patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, reason))
             except Exception as exc:
                 patch_log.append("Failed to patch jump at %#010x: %s" % (jp.jcc_ea, exc))
+        if start_ea is not None:
+            try:
+                msg = _ensure_function_at(start_ea)
+                if msg:
+                    patch_log.append(msg)
+            except Exception as exc:
+                patch_log.append("Failed to ensure a function at %#010x: %s" % (start_ea, exc))
     if patch_log:
         ida_kernwin.msg(
             "".join("[%s] %s\n" % (PLUGIN_NAME, line) for line in patch_log)
@@ -4783,15 +4829,17 @@ class CfgTraceDialog(QtWidgets.QDialog):
                 self, "Patch Bytes - %s" % PLUGIN_NAME,
                 "This will modify the loaded binary image, not just IDB colors/comments:\n\n"
                 "  - NOP out %d dead instruction address(es)\n"
-                "  - Redirect %d conditional jump(s) to their confirmed real target\n\n"
+                "  - Redirect %d conditional jump(s) to their confirmed real target\n"
+                "  - Ensure a function is defined at %#010x (IDA sometimes never\n"
+                "    recognized it as one), so it can be decompiled\n\n"
                 "This is revertible via Edit > Patches > ... in IDA if needed. Continue?"
-                % (dead_n, len(jump_patches)),
+                % (dead_n, len(jump_patches), self.start_ea),
             )
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
 
         ida_kernwin.execute_sync(
-            functools.partial(_apply_cfg_trace_and_refresh, self.config, items, jump_patches),
+            functools.partial(_apply_cfg_trace_and_refresh, self.config, items, jump_patches, self.start_ea),
             ida_kernwin.MFF_WRITE,
         )
         self.accept_button.setEnabled(False)
