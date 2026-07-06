@@ -1133,12 +1133,31 @@ class SymState(object):
     operands with the same (base, disp) key are only trusted to be the
     same slot as long as the base hasn't been reassigned in between.
     """
-    __slots__ = ("regs", "mem", "last_cmp", "last_flags")
+    __slots__ = ("regs", "mem", "last_cmp", "last_flags", "last_branch")
 
     def __init__(self):
         self.regs = {}          # family -> int | EXTERNAL
         self.mem = {}           # (base_family, raw_disp) -> (int|EXTERNAL, width)
         self.last_cmp = None    # (left, right, width) from cmp/sub - left/right may be EXTERNAL
+        self.last_branch = None  # (condition_class, taken_bool, last_cmp_snapshot,
+                                  # last_flags_snapshot) - set ONLY by
+                                  # _compute_edge_refinements, for the specific edge
+                                  # of a just-resolved conditional branch. Records
+                                  # that THIS branch's own condition tautologically
+                                  # evaluated to taken_bool to get here, alongside a
+                                  # snapshot of last_cmp/last_flags AT THAT POINT -
+                                  # sym_evaluate_branch_condition compares the LIVE
+                                  # last_cmp/last_flags against this snapshot before
+                                  # trusting it, so the tag is silently ignored (not
+                                  # proactively cleared) the moment anything changes
+                                  # the flags. See _compute_edge_refinements and
+                                  # _sym_retest_from_last_branch for why: testing the
+                                  # SAME flag twice with opposite senses through a
+                                  # no-op in between (e.g. `js target; nop; jns
+                                  # target`) is a common obfuscation trick that is
+                                  # tautologically always-taken one way or the other,
+                                  # yet each half looks independently
+                                  # "data-dependent"/"unknown" without this context.
         self.last_flags = None  # (value, width, cf_zero, of_zero, refine_info) from test/
                                  # and/or/xor/other arith result. cf_zero/of_zero are True
                                  # only when THAT SPECIFIC flag is architecturally
@@ -1172,9 +1191,15 @@ class SymState(object):
         s.mem = dict(self.mem)
         s.last_cmp = self.last_cmp
         s.last_flags = self.last_flags
+        s.last_branch = self.last_branch
         return s
 
     def reset(self):
+        # last_branch is cleared here too, not just last_cmp/last_flags:
+        # if it weren't, a coincidental (None, None) snapshot match after
+        # a reset could make a now-meaningless last_branch tag look
+        # "still valid" to _sym_retest_from_last_branch's comparison.
+        self.last_branch = None
         self.regs = {}
         self.mem = {}
         self.last_cmp = None
@@ -1836,7 +1861,20 @@ def sym_evaluate_branch_condition(state, mnem, rcx_family):
     evaluator = _SYM_CONDITION_EVALUATORS.get(mnem)
     if evaluator is None:
         return "unknown", None
-    return evaluator(state)
+    kind, taken = evaluator(state)
+    if kind == "taken":
+        return kind, taken
+    # The context-free evaluator couldn't resolve this (or could only
+    # say "data_dependent") on the flags alone - see if a just-resolved
+    # prior branch on THIS same edge tautologically determines it anyway
+    # (see _sym_retest_from_last_branch). Checked as a fallback, not
+    # first: this should never disagree with a "taken" the plain
+    # evaluator already gave, so there's nothing to gain by checking it
+    # earlier, only extra work.
+    retest = _sym_retest_from_last_branch(state, mnem)
+    if retest is not None:
+        return "taken", retest
+    return kind, taken
 
 
 def sym_resolve_conditional_branch(state, mnem, successors, rcx_family):
@@ -1906,6 +1944,116 @@ def _compute_and_mask_refinement(state, mnem, successors):
         s1.write_reg(family, mask)
         s1.last_flags = (mask, width, cf_zero, of_zero, None)
         refined[nonzero_succ.ea] = s1
+    return refined
+
+
+# Groups every Jcc mnemonic (and its aliases) by the EFLAGS condition it
+# actually tests, for _compute_edge_refinements/_sym_retest_from_last_branch
+# below. jcxz/jecxz/jrcxz deliberately have no entry - they test a
+# register (RCX), not a flag, so they never participate in this
+# mechanism either as a source or a target.
+_JCC_CONDITION_CLASS = {
+    "jz": "z", "je": "z",
+    "jnz": "nz", "jne": "nz",
+    "js": "s", "jns": "ns",
+    "jp": "p", "jpe": "p",
+    "jnp": "np", "jpo": "np",
+    "ja": "a", "jnbe": "a",
+    "jbe": "be", "jna": "be",
+    "jae": "ae", "jnb": "ae", "jnc": "ae",
+    "jb": "b", "jc": "b", "jnae": "b",
+    "jg": "g", "jnle": "g",
+    "jle": "le", "jng": "le",
+    "jge": "ge", "jnl": "ge",
+    "jl": "l", "jnge": "l",
+    "jo": "o", "jno": "no",
+}
+
+# The exact logical negation of each condition class above (z<->nz,
+# s<->ns, a<->be, etc.) - two Jccs whose classes are this pair test the
+# SAME underlying flag(s) with opposite senses, so if one's truth value
+# is known the other's is too, with nothing else needed.
+_JCC_CLASS_NEGATION = {
+    "z": "nz", "nz": "z",
+    "s": "ns", "ns": "s",
+    "p": "np", "np": "p",
+    "a": "be", "be": "a",
+    "ae": "b", "b": "ae",
+    "g": "le", "le": "g",
+    "ge": "l", "l": "ge",
+    "o": "no", "no": "o",
+}
+
+
+def _sym_retest_from_last_branch(state, mnem):
+    """If state.last_branch records a prior conditional branch's own
+    edge-specific truth value, and NOTHING has touched last_cmp/
+    last_flags since (verified by comparing the LIVE values against the
+    stored snapshot - a plain equality check, not proactive
+    invalidation, so this needs no changes to any instruction handler),
+    and mnem tests the SAME or the exact logical NEGATION of that prior
+    branch's condition, returns the tautologically-determined outcome
+    for mnem here. Returns None otherwise (caller falls back to the
+    normal, context-free per-mnem evaluator).
+
+    This is what resolves the classic "test one flag twice with opposite
+    senses through a no-op in between" obfuscation trick (e.g. `js
+    target; <no-op>; jns target`) - each half looks independently
+    unresolvable/data-dependent on its own (the flag's actual value may
+    be genuinely unknown), yet the PAIR is tautologically always taken
+    one way or the other, regardless of what determines the flag.
+    """
+    if state.last_branch is None:
+        return None
+    prior_class, prior_taken, cmp_snapshot, flags_snapshot = state.last_branch
+    if state.last_cmp != cmp_snapshot or state.last_flags != flags_snapshot:
+        return None  # something changed the flags since - the tag is stale
+    this_class = _JCC_CONDITION_CLASS.get(mnem)
+    if this_class is None:
+        return None
+    if this_class == prior_class:
+        return prior_taken
+    if _JCC_CLASS_NEGATION.get(prior_class) == this_class:
+        return not prior_taken
+    return None
+
+
+def _compute_edge_refinements(state, mnem, successors):
+    """Combines every per-edge state-narrowing refinement this trace
+    knows about into one {successor_ea: refined_state} map:
+
+    - AND-single-bit-mask + jz/je/jnz/jne (_compute_and_mask_refinement).
+    - Same-flag retest (_sym_retest_from_last_branch): ANY conditional
+      branch tautologically reveals its OWN condition's truth value on
+      each of its two edges - jump-taken means the condition was true,
+      fallthrough means it was false - regardless of what data
+      determined it or how its overall REAL/DEAD verdict was decided
+      (symbolic engine or LLM). Tagging this unconditionally (not just
+      when this block's own verdict came from the engine) is what lets
+      it help even when an LLM had to resolve THIS branch but a LATER
+      one testing the same/negated condition can still be resolved for
+      free. See SymState.last_branch and sym_evaluate_branch_condition.
+
+    successors are assumed in gather_block's fixed [jump_target,
+    fallthrough] order, matching sym_resolve_conditional_branch and
+    _compute_and_mask_refinement above.
+    """
+    if len(successors) != 2:
+        return {}
+    jump_target, fallthrough = successors[0], successors[1]
+    refined = _compute_and_mask_refinement(state, mnem, successors)
+    mnem_class = _JCC_CONDITION_CLASS.get(mnem.lower())
+    if mnem_class is not None:
+        snapshot = (state.last_cmp, state.last_flags)
+        for succ, taken in ((jump_target, True), (fallthrough, False)):
+            if succ.ea is None:
+                continue
+            # Build on top of the AND-mask refinement's result if it
+            # already narrowed this same edge, rather than discarding it.
+            base = refined.get(succ.ea, state)
+            merged = base.copy()
+            merged.last_branch = (mnem_class, taken, snapshot[0], snapshot[1])
+            refined[succ.ea] = merged
     return refined
 
 
@@ -4231,11 +4379,11 @@ class CfgTraceRunner(object):
             kind, verdicts = sym_resolve_conditional_branch(
                 sym_state, last_mnem, block.successors, _family_of("rcx")
             )
-            # Per-edge state narrowing (see _compute_and_mask_refinement):
-            # a genuinely correct no-op for anything not the specific
-            # AND-single-bit-mask + jz/je/jnz/jne pattern it targets, so
-            # always safe to compute here regardless of "kind".
-            refined_states = _compute_and_mask_refinement(sym_state, last_mnem, block.successors)
+            # Per-edge state narrowing (see _compute_edge_refinements): a
+            # genuinely correct no-op for anything neither of its two
+            # refinements targets, so always safe to compute here
+            # regardless of "kind".
+            refined_states = _compute_edge_refinements(sym_state, last_mnem, block.successors)
         elif block.kind == "indirect_jump":
             if not block.sym_insns or not block.sym_insns[-1].operands:
                 return False
@@ -4607,6 +4755,22 @@ class CfgTraceRunner(object):
             and block.successors[0].ea is None
             and block.successors[0].role == "unresolved"
         )
+        # Same per-edge narrowing _try_symbolic_resolve applies when IT
+        # resolves a conditional_branch - computed here too since a
+        # decision reaching the LLM (this function) still tautologically
+        # reveals its own condition's truth value per edge, regardless of
+        # who/what determined the overall REAL/DEAD verdict. See
+        # _compute_edge_refinements.
+        refined_states = {}
+        if (
+            block.kind == "conditional_branch"
+            and len(block.successors) == 2
+            and block.sym_insns
+            and self._current_block_sym_state is not None
+        ):
+            refined_states = _compute_edge_refinements(
+                self._current_block_sym_state, block.sym_insns[-1].mnem, block.successors,
+            )
 
         def resolve_and_validate(token):
             addr = _parse_trace_address(token)
@@ -4663,7 +4827,9 @@ class CfgTraceRunner(object):
             addressed.add(addr)
 
         for addr, verdict, reason in verdicts:
-            self._apply_target_verdict(addr, verdict, reason, block.start_ea)
+            self._apply_target_verdict(
+                addr, verdict, reason, block.start_ea, sym_state_override=refined_states.get(addr),
+            )
 
         # Omission defense: every candidate the block actually presented
         # must have been addressed - anything left over is flagged for

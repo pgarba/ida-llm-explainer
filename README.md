@@ -356,6 +356,18 @@ relational jump reached via flag-preserving instructions only, with no interveni
 resolves against that narrowed concrete value instead of continuing to treat it as external. This
 is deliberately narrow (one bit, `and` specifically, only through `jz`/`je`/`jnz`/`jne`) rather
 than a general value-range/constraint solver — anything wider still falls back to the LLM.
+
+A second, more general per-edge narrowing covers a different, equally common trick: testing the
+*same* flag twice with opposite senses through flag-preserving junk in between, both sides landing
+on the same target — e.g. `js target; nop; jns target`. Neither half looks resolvable in isolation
+if the underlying flag is genuinely data-dependent, but the pair is a tautology: reaching the
+second test at all already proves what its own condition's outcome must be (SF was 0 to fall
+through the first, so the second — testing SF=0 — is unconditionally taken), regardless of what
+determined the flag or how the first branch's own verdict was reached (constant propagation or the
+LLM). This applies to any of the standard condition-code pairs (`jz`/`jnz`, `ja`/`jbe`, `jg`/`jle`,
+`jo`/`jno`, etc.), not just `js`/`jns`, and is invalidated automatically the moment anything between
+the two actually changes the flags — no separate bookkeeping needed to "remember" that.
+
 Disable "Resolve CFG trace branches via constant propagation" in Settings to force every
 decision point through the LLM as before.
 
