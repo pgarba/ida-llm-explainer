@@ -4540,7 +4540,18 @@ class BatchPickerDialog(QtWidgets.QDialog):
 
         self.filter_edit = QtWidgets.QLineEdit()
         self.filter_edit.setPlaceholderText("Filter by name...")
-        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.filter_edit.textChanged.connect(self._refresh_visibility)
+
+        # Toggle: show only undiscovered functions (auto-generated names
+        # like sub_XXXX), hiding everything already given a real name.
+        # Hides rather than removes, like the text filter, so checked
+        # state survives toggling it off again.
+        self.undiscovered_button = QtWidgets.QPushButton("Undiscovered Only (sub_...)")
+        self.undiscovered_button.setCheckable(True)
+        self.undiscovered_button.setToolTip(
+            "Show only functions whose name is still auto-generated "
+            "(sub_/loc_/nullsub_...), hiding already-named ones.")
+        self.undiscovered_button.toggled.connect(self._refresh_visibility)
 
         self.list_widget = QtWidgets.QListWidget()
         self.list_widget.setUniformItemSizes(True)
@@ -4562,7 +4573,10 @@ class BatchPickerDialog(QtWidgets.QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self.filter_edit)
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(self.filter_edit, 1)
+        filter_row.addWidget(self.undiscovered_button)
+        layout.addLayout(filter_row)
         layout.addWidget(self.list_widget, 1)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(select_all_btn)
@@ -4581,14 +4595,19 @@ class BatchPickerDialog(QtWidgets.QDialog):
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, ea)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, is_auto_generated_name(name))
             self.list_widget.addItem(item)
         self.list_widget.setUpdatesEnabled(True)
 
-    def _apply_filter(self, text):
-        needle = text.strip().lower()
+    def _refresh_visibility(self, _=None):
+        needle = self.filter_edit.text().strip().lower()
+        undiscovered_only = self.undiscovered_button.isChecked()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
-            item.setHidden(bool(needle) and needle not in item.text().lower())
+            hidden = bool(needle) and needle not in item.text().lower()
+            if undiscovered_only and not item.data(QtCore.Qt.ItemDataRole.UserRole + 1):
+                hidden = True
+            item.setHidden(hidden)
 
     def _set_checked_filtered(self, checked):
         state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
