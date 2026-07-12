@@ -4521,9 +4521,11 @@ class SettingsDialog(QtWidgets.QDialog):
 # ---------------------------------------------------------------------------
 
 class BatchPickerDialog(QtWidgets.QDialog):
-    """Checkable list of every function in the database, with a live text
-    filter (hides/shows rows, never rebuilds the list - checked state
-    survives filtering). Nothing is pre-checked; the user picks explicitly.
+    """Checkable table of every function in the database (name / address /
+    size, sortable by clicking a column header), with a live text filter
+    (hides/shows rows, never rebuilds the table - checked state survives
+    filtering and sorting). Nothing is pre-checked; the user picks
+    explicitly.
 
     Deliberately does NOT try to read the native Functions-window's current
     multi-selection (ida_kernwin.get_chooser_selection) to pre-populate
@@ -4533,10 +4535,12 @@ class BatchPickerDialog(QtWidgets.QDialog):
     A fully self-contained picker avoids that risk entirely.
     """
 
+    COL_NAME, COL_ADDR, COL_SIZE = range(3)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("%s - Batch Explain: Select Functions" % PLUGIN_NAME)
-        self.resize(520, 640)
+        self.resize(620, 640)
 
         self.filter_edit = QtWidgets.QLineEdit()
         self.filter_edit.setPlaceholderText("Filter by name...")
@@ -4553,9 +4557,31 @@ class BatchPickerDialog(QtWidgets.QDialog):
             "(sub_/loc_/nullsub_...), hiding already-named ones.")
         self.undiscovered_button.toggled.connect(self._refresh_visibility)
 
-        self.list_widget = QtWidgets.QListWidget()
-        self.list_widget.setUniformItemSizes(True)
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Function", "Address", "Size"])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_NAME, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(self.COL_ADDR, 110)
+        self.table.setColumnWidth(self.COL_SIZE, 80)
+        self._num_undiscovered = 0
+        self._num_named = 0
         self._populate()
+        # Enable AFTER populate (sorting mid-insert reorders rows under the
+        # loop); clicking a header sorts - Size sorts numerically because
+        # its items carry an int DisplayRole, not text.
+        self.table.setSortingEnabled(True)
+        # Sorting moves items between rows but row-hidden state stays with
+        # the row INDEX, so re-apply the filter once the sort has finished
+        # (queued, since this signal fires before the view re-sorts).
+        header.sortIndicatorChanged.connect(
+            lambda *_: QtCore.QTimer.singleShot(0, self._refresh_visibility))
+        self.stats_label = QtWidgets.QLabel(
+            "%d undiscovered / %d named (%d total)"
+            % (self._num_undiscovered, self._num_named,
+               self._num_undiscovered + self._num_named))
 
         select_all_btn = QtWidgets.QPushButton("Select All Filtered")
         select_all_btn.clicked.connect(lambda: self._set_checked_filtered(True))
@@ -4563,7 +4589,7 @@ class BatchPickerDialog(QtWidgets.QDialog):
         deselect_all_btn.clicked.connect(lambda: self._set_checked_filtered(False))
 
         self.count_label = QtWidgets.QLabel("0 selected")
-        self.list_widget.itemChanged.connect(self._update_count)
+        self.table.itemChanged.connect(self._update_count)
 
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
@@ -4577,56 +4603,79 @@ class BatchPickerDialog(QtWidgets.QDialog):
         filter_row.addWidget(self.filter_edit, 1)
         filter_row.addWidget(self.undiscovered_button)
         layout.addLayout(filter_row)
-        layout.addWidget(self.list_widget, 1)
+        layout.addWidget(self.table, 1)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(select_all_btn)
         row.addWidget(deselect_all_btn)
         row.addStretch(1)
+        row.addWidget(self.stats_label)
+        row.addWidget(QtWidgets.QLabel("|"))
         row.addWidget(self.count_label)
         layout.addLayout(row)
         layout.addWidget(buttons)
         _add_copyright_footer(layout)
 
     def _populate(self):
-        self.list_widget.setUpdatesEnabled(False)
+        self.table.setUpdatesEnabled(False)
         for ea in idautils.Functions():
             name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
-            item = QtWidgets.QListWidgetItem("%s @ %#010x" % (name, ea))
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, ea)
-            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, is_auto_generated_name(name))
-            self.list_widget.addItem(item)
-        self.list_widget.setUpdatesEnabled(True)
+            func = ida_funcs.get_func(ea)
+            size = (func.end_ea - func.start_ea) if func is not None else 0
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            name_item = QtWidgets.QTableWidgetItem(name)
+            name_item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                | QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+            )
+            name_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            name_item.setData(QtCore.Qt.ItemDataRole.UserRole, ea)
+            undiscovered = is_auto_generated_name(name)
+            name_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, undiscovered)
+            if undiscovered:
+                self._num_undiscovered += 1
+            else:
+                self._num_named += 1
+            # Fixed-width hex sorts correctly even as text.
+            addr_item = QtWidgets.QTableWidgetItem("%#010x" % ea)
+            size_item = QtWidgets.QTableWidgetItem()
+            # int DisplayRole (not text) so the Size column sorts numerically.
+            size_item.setData(QtCore.Qt.ItemDataRole.DisplayRole, int(size))
+            self.table.setItem(row, self.COL_NAME, name_item)
+            self.table.setItem(row, self.COL_ADDR, addr_item)
+            self.table.setItem(row, self.COL_SIZE, size_item)
+        self.table.setUpdatesEnabled(True)
 
     def _refresh_visibility(self, _=None):
         needle = self.filter_edit.text().strip().lower()
         undiscovered_only = self.undiscovered_button.isChecked()
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            hidden = bool(needle) and needle not in item.text().lower()
-            if undiscovered_only and not item.data(QtCore.Qt.ItemDataRole.UserRole + 1):
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, self.COL_NAME)
+            haystack = "%s %s" % (name_item.text().lower(),
+                                  self.table.item(row, self.COL_ADDR).text().lower())
+            hidden = bool(needle) and needle not in haystack
+            if undiscovered_only and not name_item.data(QtCore.Qt.ItemDataRole.UserRole + 1):
                 hidden = True
-            item.setHidden(hidden)
+            self.table.setRowHidden(row, hidden)
 
     def _set_checked_filtered(self, checked):
         state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if not item.isHidden():
-                item.setCheckState(state)
+        for row in range(self.table.rowCount()):
+            if not self.table.isRowHidden(row):
+                self.table.item(row, self.COL_NAME).setCheckState(state)
 
     def _update_count(self, _item=None):
         n = sum(
-            1 for i in range(self.list_widget.count())
-            if self.list_widget.item(i).checkState() == QtCore.Qt.CheckState.Checked
+            1 for row in range(self.table.rowCount())
+            if self.table.item(row, self.COL_NAME).checkState() == QtCore.Qt.CheckState.Checked
         )
         self.count_label.setText("%d selected" % n)
 
     def get_selected_functions(self):
         result = []
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, self.COL_NAME)
             if item.checkState() == QtCore.Qt.CheckState.Checked:
                 ea = item.data(QtCore.Qt.ItemDataRole.UserRole)
                 func = ida_funcs.get_func(ea)
