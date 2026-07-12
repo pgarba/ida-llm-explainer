@@ -132,6 +132,7 @@ at anything it doesn't fully recognize.
 """
 
 import functools
+import hashlib
 import json
 import os
 import re
@@ -172,7 +173,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.6.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -226,7 +227,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "would not change your answer, such as a bare logging call) - not "
     "merely because you have a plausible guess. Never request the same "
     "function twice.\n\n"
-    "Once you have enough information, work through ALL FOUR of the "
+    "Once you have enough information, work through ALL FIVE of the "
     "following steps before writing your final answer. These are a "
     "required part of a thorough analysis, not optional extras to drop "
     "once you feel you already have enough to say - a lazy answer that "
@@ -252,21 +253,54 @@ DEFAULT_SYSTEM_PROMPT = (
     "SUGGESTED_VAR: <current_name> -> <new_name>\n"
     "3. If you actually examined the code of a CALLED function this "
     "conversation (because it was included up front, or you requested it "
-    "with REQUEST_CODE) and its current name still looks auto-generated "
-    "(e.g. sub_1402346D0, sub_401000, loc_403010), propose a rename for "
-    "it - only that function, and only if you are confident about what it "
-    "does from the code you actually saw, never from its name alone or a "
-    "guess - as one line per function of the exact form\n"
+    "with REQUEST_CODE), propose a rename for it - only that function, and "
+    "only if you are confident about what it does from the code you "
+    "actually saw, never from its name alone or a guess - as one line per "
+    "function of the exact form\n"
     "SUGGESTED_CALLEE_NAME: <its current name or address> -> <new name>\n"
-    "using the same identifier rules as SUGGESTED_NAME. Never for the "
-    "target function itself, and never for a function whose code you "
-    "never saw: this is enforced automatically, and any "
+    "using the same identifier rules as SUGGESTED_NAME. This applies "
+    "whether the callee currently has a default auto-generated name (e.g. "
+    "sub_1402346D0, loc_403010) or an existing non-default name (including "
+    "one from an earlier round of this same analysis) - if, having now "
+    "seen its code, you can give it a materially more accurate or specific "
+    "name than what it currently has, propose the rename; only skip it "
+    "when the current name is already just as good. Never for the target "
+    "function itself, and never for a function whose code you never saw: "
+    "this is enforced automatically, and any "
     "SUGGESTED_CALLEE_NAME for a function whose code was not actually "
     "shown to you earlier in this same conversation will be silently "
     "discarded, so do not bother emitting it in that case - request the "
     "function's code with REQUEST_CODE first if you want to propose a "
     "rename for it.\n"
-    "4. If the pseudocode accesses memory through a pointer at multiple "
+    "Separately, if a called function ALREADY has a non-default name but, "
+    "from how the target function uses it, you believe that existing name "
+    "is likely wrong, stale, or misleading and it deserves a fresh look, "
+    "you may flag it (do NOT rename it yourself from usage alone) with one "
+    "line of the exact form\n"
+    "SUGGESTED_REANALYZE: <its current name or address> - <brief why>\n"
+    "e.g. SUGGESTED_REANALYZE: validate_user - it actually parses a TLV "
+    "header, not credential validation. Use this sparingly and only when "
+    "you are genuinely unsure the current name is correct; it asks the "
+    "tool to re-analyze that function on its own code (only the recursive "
+    "scan acts on it).\n"
+    "4. Propose better names for GLOBAL/data variables the target "
+    "function references whose current name is still a default auto-"
+    "generated one (e.g. byte_18002C6C3, dword_18002C178, qword_180011A20, "
+    "off_BA6E0, unk_140030120) and whose purpose you can determine with "
+    "confidence from how the function uses it - a one-shot init/'already "
+    "hooked' flag, a saved original function pointer for a hook, a "
+    "configuration or state word, a global handle/count, etc. Give one "
+    "line per global of the exact form\n"
+    "SUGGESTED_GLOBAL_NAME: <its current name or address> -> <new name>\n"
+    "using the same identifier rules as SUGGESTED_NAME (e.g. "
+    "SUGGESTED_GLOBAL_NAME: byte_18002C6C3 -> g_crypt_hook_installed, or "
+    "SUGGESTED_GLOBAL_NAME: qword_18002C170 -> orig_CryptAcquireContextA). "
+    "This applies whether the target function was given as pseudocode or "
+    "plain disassembly. Only rename a global you are genuinely confident "
+    "about from its usage, never from a guess; skip any whose role is "
+    "unclear, and never propose a name for a global that already has a "
+    "meaningful non-default name.\n"
+    "5. If the pseudocode accesses memory through a pointer at multiple "
     "constant offsets in a way that suggests an undefined or "
     "generic-looking structure - e.g. *(a1 + 8), *(_DWORD *)(a1 + 0x10), a "
     "fixed-size header followed by a variable-length trailing buffer, or "
@@ -286,11 +320,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "line per local variable of the exact form\n"
     "SUGGESTED_VAR_TYPE: <current_variable_name> <type expression>\n"
     "e.g. SUGGESTED_VAR_TYPE: v3 tagPOINT *\n\n"
-    "For steps 2-4, only propose something you are reasonably confident "
-    "about from the code itself, and skip these three steps entirely when "
-    "you were given plain disassembly instead of pseudocode; step 1 "
-    "(SUGGESTED_NAME) still applies to disassembly. Otherwise, do not "
-    "leave a step out merely to save effort or keep the response short.\n\n"
+    "Only propose something you are reasonably confident about from the "
+    "code itself, never a guess. Steps 2 and 5 (SUGGESTED_SIGNATURE, "
+    "SUGGESTED_VAR, SUGGESTED_STRUCT, SUGGESTED_VAR_TYPE) require the "
+    "target function's own code to have been given as Hex-Rays "
+    "pseudocode - skip them entirely when you were given plain "
+    "disassembly instead. Steps 1, 3 and 4 (SUGGESTED_NAME, "
+    "SUGGESTED_CALLEE_NAME, SUGGESTED_GLOBAL_NAME) apply to disassembly "
+    "too. Otherwise, do not leave a step out merely to save effort or "
+    "keep the response short.\n\n"
     "Finally, give your final answer as exactly ONE short sentence (no "
     "more than ~20 words) stating precisely what the target function does "
     "- its core purpose only, not a step-by-step walkthrough. Do not "
@@ -298,7 +336,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "or bullet points. This sentence will be written verbatim into an IDA "
     "function comment, so keep it self-contained and free of REQUEST_CODE "
     "lines. Keeping this sentence short does NOT mean doing less of steps "
-    "1-4 above - list every SUGGESTED_* line that applies below your "
+    "1-5 above - list every SUGGESTED_* line that applies below your "
     "one-sentence answer; only the prose explanation itself needs to be "
     "brief. If asked for more detail in a follow-up, you may then answer "
     "at greater length."
@@ -481,7 +519,53 @@ DEFAULT_CONFIG = {
     "cfg_trace_color_unresolved": 0x99E0FF,
     "cfg_trace_system_prompt": CFG_TRACE_SYSTEM_PROMPT,
     "cfg_trace_use_symbolic": True,
+    # Opt-in, experimental: statically enumerate the targets of a computed
+    # ARM64 table dispatch (BR/BLR through *(base + index*stride + field))
+    # by walking the table in the loaded image. Off by default because the
+    # index range can't be bounded statically, so it walks until the first
+    # entry that doesn't point at loaded executable code - which may under-
+    # or over-shoot. Every enumerated target is still shown for review
+    # before anything is written/patched. See _try_enumerate_arm64_table_dispatch.
+    "cfg_trace_enumerate_computed_jumps": False,
+    # sha256 of DEFAULT_SYSTEM_PROMPT / CFG_TRACE_SYSTEM_PROMPT as they were
+    # when this config was last saved (set in save()). Lets a later load
+    # tell "the stored prompt was that version's UNMODIFIED default" (hash
+    # matches -> silently adopt the new default) apart from "the user
+    # customized it" (hash differs -> keep). Empty for configs written
+    # before this mechanism existed - those fall back to the frozen
+    # historical registry below. See PluginConfig._upgrade_stale_default_prompts.
+    "system_prompt_default_hash": "",
+    "cfg_trace_prompt_default_hash": "",
 }
+
+
+def _prompt_hash(text):
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+# sha256 of EVERY default prompt this plugin has ever shipped (extracted
+# from git history). Used only to recognize a stored prompt in a config
+# saved BEFORE the save-time hash above existed as a still-unmodified
+# default of its era, so it can be auto-upgraded to the current default
+# without clobbering a genuine user customization (whose hash is in
+# neither this set nor the config's own stored default hash). This set is
+# FROZEN: every config written from now on carries its own default hash,
+# so it never needs another entry for future prompt revisions.
+_KNOWN_DEFAULT_SYSTEM_PROMPT_HASHES = frozenset({
+    "f551f29c65a516563273ac5bf40f3a44e3b22939cde5b5e85ff6ee5a0e67545b",
+    "879f0df0bf6fe896ccf11daca50ffa1a61871bfe954cba0b7bf5f3431aa78b69",
+    "c30b07204c8fbf1a8de9546d4a9a240e6971e409997c2f928733a9e0539ef4f0",
+    "d3ee19b88ed3c98716c96f6d195761650603cb11ce9300e3e932596646da137e",
+    "ca1e66af4cc2d8b18cf078ddddf865a3da2d950e6f9865d5ebe3b56d2592ca32",
+    "d6bd189f212df5a6f262267c53897378fec8020626eab33f98b876eb463009ac",
+    "b5a977a800269783751a13857451ec21e64089f04a986e03f1bc147f1fb3c363",
+    "53621569a435f8a55340526a7efd1781591637dfeb23023bc6a64f773574fa40",
+})
+_KNOWN_CFG_TRACE_PROMPT_HASHES = frozenset({
+    "f17ac4a347ed00271730bf66af960f656399c52b5366dd41f6eb09c4c4611f74",
+    "647d49a3f20832c369f164617e20e906852c172ef7b7662419fb52a494576f05",
+    "48c637e12b804769465a1e8f3f305e9144be722fcdbd502308806ffe2ceba94c",
+})
 
 ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
 
@@ -498,8 +582,18 @@ _SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s
 _SUGGESTED_CALLEE_NAME_RE = re.compile(
     r"(?im)^\s*SUGGESTED_CALLEE_NAME:\s*(.+?)\s*->\s*([A-Za-z_]\w*)\s*$"
 )
+_SUGGESTED_GLOBAL_NAME_RE = re.compile(
+    r"(?im)^\s*SUGGESTED_GLOBAL_NAME:\s*(.+?)\s*->\s*([A-Za-z_]\w*)\s*$"
+)
 _SUGGESTED_STRUCT_RE = re.compile(r"(?im)^\s*SUGGESTED_STRUCT:\s*(.+?)\s*$")
 _SUGGESTED_VAR_TYPE_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR_TYPE:\s*([A-Za-z_]\w*)\s+(.+?)\s*$")
+# SUGGESTED_REANALYZE: <callee name or address> [- <why>] - the model
+# believes an already-named callee's current name is likely wrong/stale
+# and wants it re-examined. Only acted on by the recursive scan (it queues
+# that callee for a fresh analysis, allowing its name to be replaced);
+# harmless/ignored elsewhere. Target is a single token; optional reason
+# after a dash.
+_SUGGESTED_REANALYZE_RE = re.compile(r"(?im)^\s*SUGGESTED_REANALYZE:\s*(\S+)(?:\s*-\s*(.*?))?\s*$")
 _VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
 
@@ -544,6 +638,28 @@ def get_procname():
         return "unknown"
 
 
+def _is_arm64_target():
+    """True when the current database's target architecture is AArch64 -
+    gates every ARM64-specific encoding/pattern in this file (fixed-width
+    branch/NOP instructions, the fixed-pointer-load indirect jump match
+    in _resolve_indirect_jump_successors) so none of it is ever
+    mistakenly applied to AArch32 (which shares the "ARM" procname but
+    has different, and for Thumb variable-width, encodings this hasn't
+    been taught)."""
+    procname = (get_procname() or "").upper()
+    if "ARM" not in procname:
+        return False
+    try:
+        if ida_ida is not None:
+            return bool(ida_ida.inf_is_64bit())
+    except Exception:
+        pass
+    try:
+        return bool(idc.get_inf_attr(idc.INF_LFLAGS) & idc.LFLG_64BIT)
+    except Exception:
+        return False
+
+
 def gather_function_context(func):
     """Prefer Hex-Rays pseudocode; fall back to a plain disassembly listing."""
     cfunc = None
@@ -572,8 +688,12 @@ def gather_function_context(func):
     return ContextBundle(kind="disassembly", text="\n".join(lines))
 
 
-def gather_callee_funcs(func, max_callees):
-    """Direct callees of func, as func_t objects, in first-seen order."""
+def gather_callee_funcs(func, max_callees, include=None):
+    """Direct callees of func, as func_t objects, in first-seen order.
+    If `include` is given, only callees for which include(callee) returns
+    True are kept, and the max_callees cap applies to that filtered set
+    (so e.g. the recursive walk can ask for "up to N still-undiscovered
+    callees" rather than N callees of which some are skipped)."""
     if max_callees <= 0:
         return []
     result = []
@@ -583,7 +703,8 @@ def gather_callee_funcs(func, max_callees):
             callee = ida_funcs.get_func(ref)
             if callee and callee.start_ea == ref and ref != func.start_ea and ref not in seen:
                 seen.add(ref)
-                result.append(callee)
+                if include is None or include(callee):
+                    result.append(callee)
         if len(result) >= max_callees:
             break
     return result[:max_callees]
@@ -705,11 +826,13 @@ def gather_recursive_context(root_func, config):
     return blocks
 
 
-def resolve_function_query(query):
-    """Resolve a model-supplied identifier (name or address) to a func_t."""
+def _resolve_name_or_address(query):
+    """Resolve a model-supplied identifier (a symbol name or a hex/decimal
+    address) to a linear address, or idaapi.BADADDR if it resolves to
+    neither. Shared by resolve_function_query and resolve_global_query."""
     query = (query or "").strip().strip("`'\"")
     if not query:
-        return None
+        return idaapi.BADADDR
     ea = idc.get_name_ea_simple(query)
     if ea == idaapi.BADADDR:
         for base in (0, 16):
@@ -718,9 +841,39 @@ def resolve_function_query(query):
                 break
             except ValueError:
                 ea = idaapi.BADADDR
+    return ea
+
+
+def resolve_function_query(query):
+    """Resolve a model-supplied identifier (name or address) to a func_t."""
+    ea = _resolve_name_or_address(query)
     if ea == idaapi.BADADDR:
         return None
     return ida_funcs.get_func(ea)
+
+
+def resolve_global_query(query):
+    """Resolve a model-supplied identifier for a GLOBAL/data variable (e.g.
+    byte_18002C6C3, dword_18002C178, or a raw address) to its linear
+    address, or idaapi.BADADDR if it can't be resolved or the address
+    turns out to be a function entry (functions are handled by
+    SUGGESTED_CALLEE_NAME instead, never here). The address must be a
+    valid, loaded location that actually has a name attached - i.e. a
+    real data item the listing refers to - so a bare number that happens
+    to parse but points at nothing is rejected rather than blindly
+    renamed."""
+    ea = _resolve_name_or_address(query)
+    if ea == idaapi.BADADDR:
+        return idaapi.BADADDR
+    try:
+        if not ida_bytes.is_loaded(ea):
+            return idaapi.BADADDR
+    except Exception:
+        return idaapi.BADADDR
+    func = ida_funcs.get_func(ea)
+    if func is not None and func.start_ea == ea:
+        return idaapi.BADADDR  # a function entry - not a data global
+    return ea
 
 
 def build_user_message(config, func, blocks, callee_names, data_refs=None):
@@ -755,6 +908,20 @@ def _resolve_func(ctx):
     return ida_funcs.get_func(ea)
 
 
+def _dedupe_name(desired, taken):
+    """Return `desired` if it isn't in the `taken` set, otherwise the first
+    of desired_1, desired_2, ... that is free. Used so two locals the
+    model wants to give the same descriptive name to (or a name that
+    collides with an existing local it left alone) don't fail the second
+    rename outright - IDA forbids two locals sharing a name."""
+    if desired not in taken:
+        return desired
+    i = 1
+    while ("%s_%d" % (desired, i)) in taken:
+        i += 1
+    return "%s_%d" % (desired, i)
+
+
 def _rename_lvars(func_ea, var_renames):
     """Rename local variables BEFORE any signature/type change is applied
     to the same function: retyping a function (e.g. via idc.SetType) can
@@ -764,15 +931,21 @@ def _rename_lvars(func_ea, var_renames):
     being silently skipped. Also validates the old name actually exists in
     the current decompilation (with a case-insensitive fallback) instead of
     just trying the exact name blind, and logs a clearer reason on failure.
+
+    Returns a dict mapping each ORIGINAL requested old name to the name
+    actually applied (which may differ from the requested new name when a
+    collision forced a numeric suffix - see _dedupe_name), so the caller
+    can translate any follow-on SUGGESTED_VAR_TYPE lookups through it.
     """
+    applied = {}
     if not var_renames or ida_hexrays is None:
-        return
+        return applied
     try:
         hexrays_ready = ida_hexrays.init_hexrays_plugin()
     except Exception:
         hexrays_ready = False
     if not hexrays_ready:
-        return
+        return applied
 
     lvar_names = None
     try:
@@ -781,6 +954,11 @@ def _rename_lvars(func_ea, var_renames):
             lvar_names = {lv.name for lv in cfunc.get_lvars() if lv.name}
     except Exception:
         lvar_names = None
+
+    # Live set of names currently in use, kept in sync as we rename, so
+    # collisions against both untouched locals AND already-applied renames
+    # this pass are avoided.
+    taken = set(lvar_names) if lvar_names is not None else set()
 
     for old_name, new_name_var in var_renames:
         actual_old_name = old_name
@@ -795,15 +973,34 @@ def _rename_lvars(func_ea, var_renames):
                     % (PLUGIN_NAME, old_name, new_name_var)
                 )
                 continue
+
+        # De-collide against every name currently in use except this
+        # variable's own (renaming a var to its current name is a no-op,
+        # not a collision).
+        desired = new_name_var
+        if desired != actual_old_name:
+            desired = _dedupe_name(desired, taken - {actual_old_name})
+
         try:
-            ok = ida_hexrays.rename_lvar(func_ea, actual_old_name, new_name_var)
+            ok = ida_hexrays.rename_lvar(func_ea, actual_old_name, desired)
         except Exception as exc:
             ok = False
             ida_kernwin.msg("[%s] Failed to rename variable '%s': %s\n" % (PLUGIN_NAME, actual_old_name, exc))
-        if not ok:
+        if ok:
+            if desired != new_name_var:
+                ida_kernwin.msg(
+                    "[%s] Renamed variable '%s' -> '%s' (requested '%s' was "
+                    "already taken by another local).\n"
+                    % (PLUGIN_NAME, actual_old_name, desired, new_name_var)
+                )
+            taken.discard(actual_old_name)
+            taken.add(desired)
+            applied[old_name] = desired
+        else:
             ida_kernwin.msg(
-                "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, actual_old_name, new_name_var)
+                "[%s] Failed to rename variable '%s' -> '%s'.\n" % (PLUGIN_NAME, actual_old_name, desired)
             )
+    return applied
 
 
 def _create_struct_type(decl_text):
@@ -878,7 +1075,7 @@ def _apply_var_types(func_ea, var_types):
 
 def _apply_suggestions_and_refresh(
     func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None,
-    struct_decl=None, var_types=None,
+    struct_decl=None, var_types=None, global_renames=None,
 ):
     # Struct creation must happen first: the signature and/or variable
     # types below may reference the new type by name, and need it to
@@ -886,11 +1083,27 @@ def _apply_suggestions_and_refresh(
     if struct_decl:
         _create_struct_type(struct_decl)
 
-    # Variable types/renames operate on the CURRENT decompilation, before
-    # the signature changes it (retyping a function can change how
-    # Hex-Rays decomposes its locals and make old names/lookups stale).
-    _apply_var_types(func_ea, var_types)
-    _rename_lvars(func_ea, var_renames)
+    # Variable renames run BEFORE variable retyping, and both run before
+    # the signature change below: renaming a variable is a pure name-swap
+    # that doesn't touch how Hex-Rays decomposes locals, but assigning a
+    # variable a new TYPE (e.g. a struct pointer from a SUGGESTED_STRUCT)
+    # can - same as a signature change can - and that would silently make
+    # any old v-name the model was still referring to (including the ones
+    # in var_types itself, which are keyed by the ORIGINAL name the model
+    # saw) stale for everything applied afterward. Doing renames first,
+    # while every original name is still guaranteed to resolve, and only
+    # then retyping, avoids that: var_types is translated through
+    # var_renames below so it looks up by whatever name is now current.
+    applied_renames = _rename_lvars(func_ea, var_renames)
+    translated_var_types = var_types
+    if var_types and applied_renames:
+        # Translate through the names ACTUALLY applied (which may carry a
+        # collision-avoidance suffix), not the requested ones, so a type
+        # still lands on the right - possibly renamed - variable.
+        translated_var_types = [
+            (applied_renames.get(var_name, var_name), type_str) for var_name, type_str in var_types
+        ]
+    _apply_var_types(func_ea, translated_var_types)
 
     try:
         idc.set_func_cmt(func_ea, comment, 0)
@@ -931,6 +1144,17 @@ def _apply_suggestions_and_refresh(
             except Exception as exc:
                 ida_kernwin.msg("[%s] Failed to rename called function: %s\n" % (PLUGIN_NAME, exc))
 
+    if global_renames:
+        for global_ea, global_new_name in global_renames:
+            try:
+                ok = ida_name.set_name(global_ea, global_new_name, ida_name.SN_NOWARN | ida_name.SN_FORCE)
+                if not ok:
+                    ida_kernwin.msg(
+                        "[%s] Failed to rename global variable to '%s'.\n" % (PLUGIN_NAME, global_new_name)
+                    )
+            except Exception as exc:
+                ida_kernwin.msg("[%s] Failed to rename global variable: %s\n" % (PLUGIN_NAME, exc))
+
     try:
         if ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
             ida_hexrays.mark_cfunc_dirty(func_ea)
@@ -951,8 +1175,10 @@ def _apply_suggestions_and_refresh(
 # ---------------------------------------------------------------------------
 
 # role: "jump_target" (explicit direct branch target) | "fallthrough" |
-# "case" (jump-table case, case_values set) | "unresolved" (indirect jump
-# whose targets IDA could not enumerate - ea is None in that case).
+# "case" (jump-table case, case_values set) | "resolved" (indirect jump
+# with no switch table but exactly one plain code xref IDA's own static
+# analysis already resolved) | "unresolved" (indirect jump whose targets
+# IDA could not enumerate at all - ea is None in that case).
 BlockSuccessor = namedtuple("BlockSuccessor", ["ea", "role", "case_values", "note"])
 
 # kind: "return" | "unconditional_jump" | "conditional_branch" |
@@ -1021,18 +1247,415 @@ def _fixup_instruction_boundary(ea, expected_size):
         return False
 
 
-def _resolve_indirect_jump_successors(ea):
-    """Best-effort enumeration of an indirect jump/call's targets via IDA's
-    switch/jump-table analysis. Returns a list of BlockSuccessor. If IDA
-    did not recognize a switch here, returns a single role="unresolved"
-    successor (ea=None) - the block itself is still real, only its final
-    jump's destination is ambiguous.
+def _arm64_insn_writes_reg(insn, reg):
+    """Conservative "does this instruction clobber register `reg`" check
+    for the backward scan in _try_resolve_arm64_fixed_pointer_jump: true
+    if operand 0 or 1 is exactly this register (covers the destination
+    of virtually every data-processing/load instruction, plus the second
+    destination of a register pair like LDP). May return a false
+    positive for a handful of instructions where operand 0 is actually a
+    SOURCE (e.g. STR's first operand is the value being stored, not a
+    destination) - deliberately left uncorrected, since a false positive
+    here only means the scan gives up one instruction too early (safe:
+    falls back to the LLM), whereas a false NEGATIVE could let a genuinely
+    clobbered register look untouched and produce a wrong resolved
+    address - so this only ever errs toward refusing.
+    """
+    for i in (0, 1):
+        try:
+            op = insn.ops[i]
+        except Exception:
+            break
+        if op.type == ida_ua.o_void:
+            break
+        if op.type == ida_ua.o_reg and op.reg == reg:
+            return True
+    return False
+
+
+def _try_resolve_arm64_fixed_pointer_jump(term_ea, insn_eas):
+    """ARM64-specific fallback for a "BR/BLR Xn" whose value was loaded
+    from a FIXED memory address - a computed-address stub/veneer/tail-
+    call (common in obfuscated and even ordinary compiler-generated ARM64
+    code), not a genuine jump table. Walks this block's OWN instructions
+    (never past its start) backward from the branch for:
+        <address materialized into Xbase - ADRP+ADD, ADRL, ADR, ...>
+        ...(any instructions that don't touch Xbase)...
+        LDR       Xn, [Xbase, #imm]
+        ...(any instructions that don't touch Xn)...
+        BR/BLR    Xn
+    Rather than reconstruct the base address from the materializing
+    instruction(s) itself - fragile, because IDA displays the common
+    ADRP+ADD pair as a single merged "ADRL" line while it is really two
+    separate 4-byte instructions, and other sequences exist - this reads
+    the FIXED data address IDA's own value tracking already resolved for
+    the LDR and recorded as that instruction's single data cross-
+    reference (the same resolution that makes IDA display the pointer
+    slot's name and the pointed-to symbol next to the LDR/BR), then reads
+    the pointer stored there straight from the loaded binary image. The
+    load address is a build-time constant, so the stored pointer is a
+    single fixed target - exactly what a human reads off the listing.
+    Returns a resolved target ea, or None if the pattern isn't matched
+    with full confidence (no such LDR, or IDA has no single resolved data
+    address for it) - never a guess. Fully wrapped so it can NEVER raise
+    into gather_block (which is not itself guarded) - any unexpected error
+    is logged and treated as "couldn't resolve", never a crash that would
+    abort the whole trace.
+    """
+    if not _is_arm64_target():
+        return None
+    try:
+        return _try_resolve_arm64_fixed_pointer_jump_impl(term_ea, insn_eas)
+    except Exception as exc:
+        try:
+            ida_kernwin.msg(
+                "[%s] ARM64 indirect-jump resolver hit an error at %#010x (%s); "
+                "leaving it unresolved.\n" % (PLUGIN_NAME, term_ea, exc)
+            )
+        except Exception:
+            pass
+        return None
+
+
+def _canon_mnem(insn):
+    """insn.get_canon_mnem() can return None for some instructions - guard
+    it the same way the rest of this file does, so a bare .lower() never
+    raises AttributeError (which, uncaught inside gather_block, would abort
+    the whole trace)."""
+    try:
+        return (insn.get_canon_mnem() or "").lower()
+    except Exception:
+        return ""
+
+
+def _try_resolve_arm64_fixed_pointer_jump_impl(term_ea, insn_eas):
+    term_insn = ida_ua.insn_t()
+    if ida_ua.decode_insn(term_insn, term_ea) <= 0:
+        return None
+    if _canon_mnem(term_insn) not in ("br", "blr"):
+        return None
+    if term_insn.ops[0].type != ida_ua.o_reg:
+        return None
+    target_reg = term_insn.ops[0].reg
+
+    try:
+        term_idx = list(insn_eas).index(term_ea)
+    except ValueError:
+        return None
+
+    # Walk back to the LDR that loads the branch register from memory,
+    # refusing if anything else writes that register first (which would
+    # mean the value going into the branch isn't this load's result).
+    ldr_ea = None
+    for idx in range(term_idx - 1, -1, -1):
+        cand_ea = insn_eas[idx]
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, cand_ea) <= 0:
+            return None
+        mnem = _canon_mnem(insn)
+        if (
+            mnem == "ldr" and insn.ops[0].type == ida_ua.o_reg
+            and insn.ops[0].reg == target_reg
+        ):
+            if insn.ops[1].type not in (ida_ua.o_displ, ida_ua.o_mem, ida_ua.o_phrase):
+                return None  # not a memory load - refuse
+            ldr_ea = cand_ea
+            break
+        if _arm64_insn_writes_reg(insn, target_reg):
+            return None  # something else set the branch register first
+    if ldr_ea is None:
+        return None
+
+    # The fixed pointer slot(s) this LDR reads from, taken from IDA's own
+    # resolved data cross-references rather than recomputed (which would
+    # mean interpreting the ADRP+ADD/ADRL that materialized the base).
+    # For each, read the stored pointer and keep it if it lands on a
+    # loaded address. In the normal fixed-pointer veneer there is exactly
+    # one such slot yielding exactly one target; if the reads disagree
+    # (2+ distinct targets) it's ambiguous and we refuse rather than
+    # guess. Logged either way so "why didn't my BR get patched" is
+    # answerable from the Output window instead of looking like a bug.
+    try:
+        data_slots = [r for r in idautils.DataRefsFrom(ldr_ea) if r != idaapi.BADADDR]
+    except Exception:
+        data_slots = []
+    targets = set()
+    for slot in data_slots:
+        try:
+            if not ida_bytes.is_loaded(slot):
+                continue
+            val = ida_bytes.get_qword(slot)
+        except Exception:
+            continue
+        if val and val != idaapi.BADADDR and ida_bytes.is_loaded(val):
+            targets.add(val)
+
+    if len(targets) == 1:
+        target = targets.pop()
+        ida_kernwin.msg(
+            "[%s] Resolved indirect BR/BLR at %#010x to a single fixed target "
+            "%#010x (via the pointer loaded at %#010x).\n"
+            % (PLUGIN_NAME, term_ea, target, ldr_ea)
+        )
+        return target
+
+    ida_kernwin.msg(
+        "[%s] Could not resolve indirect BR/BLR at %#010x: its feeding LDR at "
+        "%#010x has %d data reference(s) yielding %d distinct loaded target(s) "
+        "- leaving it for the model to decide.\n"
+        % (PLUGIN_NAME, term_ea, ldr_ea, len(data_slots), len(targets))
+    )
+    return None
+
+
+# Absolute ceiling on how many entries a computed-jump-table walk will
+# ever read, independent of the "stop at first non-code entry" rule -
+# purely a runaway guard against a mis-extracted base/stride wandering
+# through a huge mapped region.
+_ARM64_TABLE_ENUM_HARD_CAP = 512
+
+
+def _arm64_addr_is_code(ea):
+    """True if ea is a loaded, 4-aligned address inside an executable
+    segment - the acceptance test for a byte pattern to be treated as a
+    real AArch64 branch destination (every enumerated table entry must
+    pass this, which is what keeps a mis-extracted table from producing
+    junk targets: garbage almost never satisfies all three)."""
+    try:
+        if ea is None or ea == idaapi.BADADDR or (ea & 3) != 0:
+            return False
+        if not ida_bytes.is_loaded(ea):
+            return False
+        seg = ida_segment.getseg(ea)
+        return seg is not None and bool(seg.perm & ida_segment.SEGPERM_EXEC)
+    except Exception:
+        return False
+
+
+def _arm64_trace_reg_back(insn_eas, before_idx, reg, want):
+    """Walk insn_eas backward from before_idx for the instruction that
+    writes `reg`, and if it matches `want` (a predicate over the decoded
+    insn) return (idx, insn); otherwise return (None, None) as soon as
+    `reg` is written by something that does NOT match (so we never trace
+    THROUGH an unrelated clobber). Pure read-only decode."""
+    for idx in range(before_idx, -1, -1):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, insn_eas[idx]) <= 0:
+            return None, None
+        if insn.ops[0].type == ida_ua.o_reg and insn.ops[0].reg == reg:
+            if want(insn):
+                return idx, insn
+            return None, None  # reg written by something unexpected - stop
+    return None, None
+
+
+def _arm64_reg_immediate(insn_eas, before_idx, reg):
+    """The immediate a MOV/MOVZ set into `reg` just before before_idx, via
+    IDA's resolved operand value (handles MOV #imm and MOVZ/MOVN forms),
+    or None if the most recent writer of reg isn't a simple immediate
+    move."""
+    idx, insn = _arm64_trace_reg_back(
+        insn_eas, before_idx, reg,
+        lambda ins: _canon_mnem(ins) in ("mov", "movz", "movn") and ins.ops[1].type == ida_ua.o_imm,
+    )
+    if insn is None:
+        return None
+    try:
+        val = idc.get_operand_value(insn_eas[idx], 1)
+    except Exception:
+        return None
+    return val if val is not None and val >= 0 else None
+
+
+def _arm64_reg_fixed_address(insn_eas, before_idx, reg):
+    """The fixed address materialized into `reg` (ADR/ADRL, or the
+    ADRP+ADD pair IDA shows merged as ADRL), taken from IDA's own resolved
+    data cross-reference on the materializing instruction rather than
+    recomputed - same robustness argument as _try_resolve_arm64_fixed_
+    pointer_jump. Scans back over the (up to two) instructions that build
+    the address; returns the single data reference found, or None."""
+    for idx in range(before_idx, -1, -1):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, insn_eas[idx]) <= 0:
+            return None
+        if insn.ops[0].type != ida_ua.o_reg or insn.ops[0].reg != reg:
+            continue
+        mnem = _canon_mnem(insn)
+        try:
+            refs = [r for r in idautils.DataRefsFrom(insn_eas[idx]) if r != idaapi.BADADDR]
+        except Exception:
+            refs = []
+        if len(refs) == 1:
+            return refs[0]
+        if mnem in ("adr", "adrl"):
+            try:
+                val = idc.get_operand_value(insn_eas[idx], 1)
+            except Exception:
+                val = idaapi.BADADDR
+            return val if val != idaapi.BADADDR else None
+        # ADRP, or the ADD low-half of an ADRP+ADD pair: no single data
+        # ref on THIS line - keep scanning back to the other half.
+        if mnem in ("adrp", "add"):
+            continue
+        return None  # written by something that isn't address materialization
+    return None
+
+
+def _try_enumerate_arm64_table_dispatch(term_ea, insn_eas):
+    """Opt-in (see config.cfg_trace_enumerate_computed_jumps) enumeration
+    of an AArch64 computed table dispatch:
+        <materialize table base into Xbase>
+        MOV   Xstride, #<stride>
+        MADD  Xt, Xindex, Xstride, Xbase      ; Xt = index*stride + base
+        [ADD  Xt, Xt, #<field>]               ; optional field offset
+        LDR   Xd, [Xt{, #<ldr_disp>}]
+        BR/BLR Xd
+    Reads the pointer at base + i*stride + field for i = 0,1,2,... from
+    the loaded image, keeping each that lands on executable code, and
+    stopping at the first that doesn't (bounded by _ARM64_TABLE_ENUM_HARD_
+    CAP). Returns a sorted list of distinct target eas (possibly empty),
+    or None if the block isn't this pattern at all. Never guesses: a mis-
+    extracted base/stride simply yields entries that fail _arm64_addr_is_
+    code and the walk ends immediately.
+    """
+    if not _is_arm64_target():
+        return None
+    term_insn = ida_ua.insn_t()
+    if ida_ua.decode_insn(term_insn, term_ea) <= 0:
+        return None
+    if _canon_mnem(term_insn) not in ("br", "blr") or term_insn.ops[0].type != ida_ua.o_reg:
+        return None
+    branch_reg = term_insn.ops[0].reg
+    try:
+        term_idx = list(insn_eas).index(term_ea)
+    except ValueError:
+        return None
+
+    # LDR Xd, [Xt {, #disp}] feeding the branch register.
+    ldr_idx, ldr_insn = _arm64_trace_reg_back(
+        insn_eas, term_idx - 1, branch_reg,
+        lambda ins: _canon_mnem(ins) == "ldr" and ins.ops[1].type in (ida_ua.o_displ, ida_ua.o_phrase),
+    )
+    if ldr_insn is None or ldr_insn.ops[1].type == ida_ua.o_void:
+        return None
+    addr_reg = ldr_insn.ops[1].reg
+    field = ldr_insn.ops[1].addr if ldr_insn.ops[1].type == ida_ua.o_displ else 0
+
+    # Follow addr_reg back through any immediate ADDs (each contributing to
+    # the field offset) until the MADD that formed index*stride + base.
+    cur = addr_reg
+    cur_idx = ldr_idx - 1
+    madd_insn = None
+    madd_idx = None
+    for _ in range(8):  # small bound: real dispatch prologues are short
+        idx, insn = _arm64_trace_reg_back(
+            insn_eas, cur_idx, cur,
+            lambda ins: _canon_mnem(ins) in ("madd", "add"),
+        )
+        if insn is None:
+            return None
+        if _canon_mnem(insn) == "madd":
+            madd_insn, madd_idx = insn, idx
+            break
+        # ADD Xcur, Xsrc, #imm - fold the immediate into the field offset
+        # and keep chasing Xsrc; anything else (register add) isn't this
+        # pattern.
+        if insn.ops[1].type == ida_ua.o_reg and insn.ops[2].type == ida_ua.o_imm:
+            field += idc.get_operand_value(insn_eas[idx], 2)
+            cur = insn.ops[1].reg
+            cur_idx = idx - 1
+            continue
+        return None
+    if madd_insn is None:
+        return None
+
+    # MADD Xd, Xn, Xm, Xa -> Xd = Xn*Xm + Xa. One of Xn/Xm is the constant
+    # stride, the other the runtime index; Xa is the table base register.
+    if (
+        madd_insn.ops[1].type != ida_ua.o_reg or madd_insn.ops[2].type != ida_ua.o_reg
+        or madd_insn.ops[3].type != ida_ua.o_reg
+    ):
+        return None
+    reg_n, reg_m, reg_a = madd_insn.ops[1].reg, madd_insn.ops[2].reg, madd_insn.ops[3].reg
+
+    stride = _arm64_reg_immediate(insn_eas, madd_idx - 1, reg_m)
+    if stride is None:
+        stride = _arm64_reg_immediate(insn_eas, madd_idx - 1, reg_n)
+    if not stride or stride <= 0:
+        return None
+
+    table_base = _arm64_reg_fixed_address(insn_eas, madd_idx - 1, reg_a)
+    if table_base is None or table_base == idaapi.BADADDR:
+        return None
+
+    targets = []
+    seen = set()
+    for i in range(_ARM64_TABLE_ENUM_HARD_CAP):
+        slot = table_base + i * stride + field
+        try:
+            if not ida_bytes.is_loaded(slot):
+                break
+            ptr = ida_bytes.get_qword(slot)
+        except Exception:
+            break
+        if not _arm64_addr_is_code(ptr):
+            break  # first non-code entry ends the table
+        if ptr not in seen:
+            seen.add(ptr)
+            targets.append(ptr)
+
+    targets.sort()
+    ida_kernwin.msg(
+        "[%s] Computed jump table at %#010x: base=%#010x stride=%#x field=%#x "
+        "-> %d target(s) enumerated%s.\n"
+        % (PLUGIN_NAME, term_ea, table_base, stride, field, len(targets),
+           " (hit hard cap)" if len(targets) == _ARM64_TABLE_ENUM_HARD_CAP else "")
+    )
+    return targets
+
+
+def _resolve_indirect_jump_successors(ea, insn_eas=()):
+    """Best-effort enumeration of an indirect jump/call's targets: prefers
+    IDA's switch/jump-table analysis (a genuine multi-case dispatch);
+    when that finds nothing, tries the ARM64 fixed-pointer-load pattern
+    match (_try_resolve_arm64_fixed_pointer_jump - computes the answer
+    directly, independent of IDA's own xref/comment analysis); and if
+    that doesn't apply either (wrong architecture, or the pattern doesn't
+    match), falls back to IDA's plain code cross-references IF there's
+    exactly one - e.g. an x86 computed jump through a fixed pointer load,
+    which is not a switch table but which IDA's own analysis frequently
+    still resolves and xrefs on its own. Two or more code xrefs with no
+    switch info is left unresolved rather than guessed at - that shape
+    means something this hasn't specifically modeled (e.g. a real multi-
+    target dispatch IDA didn't recognize as a formal switch), not a
+    single safe answer. Returns a list of BlockSuccessor. If nothing
+    could be resolved, returns a single role="unresolved" successor
+    (ea=None) - the block itself is still real, only its final jump's
+    destination is ambiguous.
     """
     try:
         si = ida_nalt.get_switch_info(ea)
     except Exception:
         si = None
     if si is None:
+        arm_target = _try_resolve_arm64_fixed_pointer_jump(ea, list(insn_eas))
+        if arm_target is not None:
+            return [BlockSuccessor(
+                ea=arm_target, role="resolved", case_values=None,
+                note="Indirect jump; resolved by reading the pointer stored "
+                     "at a fixed address computed from an ADR/ADRL + LDR "
+                     "sequence feeding this branch (not a switch table).",
+            )]
+        try:
+            xref_targets = sorted(set(idautils.CodeRefsFrom(ea, 0)))
+        except Exception:
+            xref_targets = []
+        if len(xref_targets) == 1:
+            return [BlockSuccessor(
+                ea=xref_targets[0], role="resolved", case_values=None,
+                note="Indirect jump; IDA statically resolved a single "
+                     "target via its own analysis (not a switch table).",
+            )]
         return [BlockSuccessor(
             ea=None, role="unresolved", case_values=None,
             note="Indirect jump; IDA did not resolve a jump table here.",
@@ -2417,7 +3040,16 @@ def gather_block(start_ea, max_instrs=_MAX_BLOCK_INSTRS, claimed_insns=None):
             )
 
         if is_indirect:
-            successors = _resolve_indirect_jump_successors(ea)
+            try:
+                successors = _resolve_indirect_jump_successors(ea, insn_eas)
+            except Exception:
+                # Never let successor enumeration abort the whole trace -
+                # fall back to "unresolved" (the block itself is still
+                # real, only its final jump's destination is unknown).
+                successors = [BlockSuccessor(
+                    ea=None, role="unresolved", case_values=None,
+                    note="Indirect jump; successor enumeration raised an error.",
+                )]
             return BlockInfo(
                 start_ea=start_ea, end_ea=next_ea, text="", kind="indirect_jump",
                 successors=successors, last_insn_ea=ea, insn_eas=insn_eas, sym_insns=sym_insns,
@@ -2492,12 +3124,27 @@ class PluginConfig(object):
 
     def save(self):
         self._validate()
+        # Stamp the CURRENT defaults' hashes so a future load can tell an
+        # unmodified default (adopt the newer default then) from a genuine
+        # customization (keep it). See _upgrade_stale_default_prompts.
+        self.system_prompt_default_hash = _prompt_hash(DEFAULT_SYSTEM_PROMPT)
+        self.cfg_trace_prompt_default_hash = _prompt_hash(CFG_TRACE_SYSTEM_PROMPT)
+        data = self.to_dict()
+        # Never persist a prompt that is just the current default - store it
+        # empty so a non-customizer always picks up the latest default on
+        # load (load restores the default from empty) instead of freezing a
+        # copy that would shadow every future prompt improvement. A genuinely
+        # customized prompt (differs from the default) is stored verbatim.
+        if data.get("system_prompt") == DEFAULT_SYSTEM_PROMPT:
+            data["system_prompt"] = ""
+        if data.get("cfg_trace_system_prompt") == CFG_TRACE_SYSTEM_PROMPT:
+            data["cfg_trace_system_prompt"] = ""
         path = self._config_path()
         tmp_path = path + ".tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(self.to_dict(), fh, indent=2)
+                json.dump(data, fh, indent=2)
             os.replace(tmp_path, path)
         except Exception as exc:
             ida_kernwin.msg("[%s] Failed to save config: %s\n" % (PLUGIN_NAME, exc))
@@ -2596,6 +3243,7 @@ class PluginConfig(object):
             self.max_recursive_callees = DEFAULT_CONFIG["max_recursive_callees"]
         self.model = (self.model or "").strip()
         self.api_key = (self.api_key or "").strip()
+        self._upgrade_stale_default_prompts()
         self.system_prompt = self.system_prompt or DEFAULT_SYSTEM_PROMPT
         self.explain_hotkey = (self.explain_hotkey or "").strip()
         self.include_callees = bool(self.include_callees)
@@ -2610,6 +3258,43 @@ class PluginConfig(object):
                 setattr(self, _color_key, DEFAULT_CONFIG[_color_key])
         self.cfg_trace_system_prompt = self.cfg_trace_system_prompt or CFG_TRACE_SYSTEM_PROMPT
         self.cfg_trace_use_symbolic = bool(self.cfg_trace_use_symbolic)
+        self.cfg_trace_enumerate_computed_jumps = bool(self.cfg_trace_enumerate_computed_jumps)
+
+    def _upgrade_stale_default_prompts(self):
+        """Auto-adopt the current default for any stored prompt that is an
+        UNMODIFIED default carried over from an older plugin version - the
+        common "I updated the plugin but my old config still pins the old
+        prompt, so none of the new SUGGESTED_* markers ever reach the
+        model" trap. A stored prompt is treated as a stale default (and
+        replaced) when its hash matches either the default hash recorded
+        when THIS config was saved (save-time stamp, exact) or any default
+        this plugin has ever shipped (frozen historical registry, for
+        configs predating the stamp). A genuinely customized prompt
+        matches neither and is left untouched."""
+        self.system_prompt = self._maybe_adopt_default(
+            self.system_prompt, DEFAULT_SYSTEM_PROMPT,
+            getattr(self, "system_prompt_default_hash", ""),
+            _KNOWN_DEFAULT_SYSTEM_PROMPT_HASHES, "system prompt",
+        )
+        self.cfg_trace_system_prompt = self._maybe_adopt_default(
+            self.cfg_trace_system_prompt, CFG_TRACE_SYSTEM_PROMPT,
+            getattr(self, "cfg_trace_prompt_default_hash", ""),
+            _KNOWN_CFG_TRACE_PROMPT_HASHES, "CFG trace system prompt",
+        )
+
+    @staticmethod
+    def _maybe_adopt_default(stored, current_default, saved_default_hash, known_hashes, label):
+        if not stored or stored == current_default:
+            return stored  # empty (default applied elsewhere) or already current
+        h = _prompt_hash(stored)
+        if (saved_default_hash and h == saved_default_hash) or h in known_hashes:
+            ida_kernwin.msg(
+                "[%s] Your saved %s was an older version's default; updating it to "
+                "this version's default so new capabilities take effect.\n"
+                % (PLUGIN_NAME, label)
+            )
+            return current_default
+        return stored
 
 
 # ---------------------------------------------------------------------------
@@ -2786,7 +3471,8 @@ class LlamaStreamWorker(threading.Thread):
 ConversationResult = namedtuple("ConversationResult", [
     "text", "reasoning_text", "suggested_name", "suggested_signature",
     "suggested_vars", "suggested_callee_renames", "suggested_struct",
-    "suggested_var_types", "root_is_pseudocode", "error",
+    "suggested_var_types", "suggested_global_renames", "suggested_reanalyze",
+    "root_is_pseudocode", "error",
 ])
 
 
@@ -2927,7 +3613,8 @@ class ConversationRunner(object):
             self._on_result_cb(ConversationResult(
                 text="", reasoning_text=reasoning_text, suggested_name=None,
                 suggested_signature=None, suggested_vars=[], suggested_callee_renames=[],
-                suggested_struct=None, suggested_var_types=[],
+                suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
+                suggested_reanalyze=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
             ))
             return 0
@@ -3006,11 +3693,17 @@ class ConversationRunner(object):
                     continue
                 # Only allow renaming functions whose code the model actually
                 # saw (eagerly included or fetched via REQUEST_CODE this
-                # conversation), and only when still under a default name -
-                # never overwrite a name a human already gave it. Both
-                # rejections are logged (rather than silently dropped) since
-                # from the outside "the LLM proposed a name but nothing
-                # happened" looks exactly like a bug otherwise.
+                # conversation) - rejection is logged (rather than silently
+                # dropped) since from the outside "the LLM proposed a name
+                # but nothing happened" looks exactly like a bug otherwise.
+                # Deliberately NOT gated on the callee's current name looking
+                # auto-generated: the model may re-propose a better name for
+                # a callee it (or a prior round) already renamed once it
+                # understands the function better, and it's in a better
+                # position than a fixed naming-pattern regex to judge
+                # whether a fresh name is actually an improvement - trust
+                # its judgment rather than hard-blocking every non-default
+                # name.
                 if callee_ea not in self._fetched_eas:
                     ida_kernwin.msg(
                         "[%s] Ignored SUGGESTED_CALLEE_NAME for '%s' -> "
@@ -3022,17 +3715,34 @@ class ConversationRunner(object):
                         % (PLUGIN_NAME, query, callee_new_name)
                     )
                     continue
-                current_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
-                if not is_auto_generated_name(current_callee_name):
-                    ida_kernwin.msg(
-                        "[%s] Ignored SUGGESTED_CALLEE_NAME for '%s': it "
-                        "already has a non-default name ('%s'); not "
-                        "overwriting it automatically.\n"
-                        % (PLUGIN_NAME, query, current_callee_name)
-                    )
-                    continue
                 seen_callee_eas.add(callee_ea)
                 suggested_callee_renames.append((callee_ea, callee_new_name))
+
+        suggested_global_renames = []
+        global_matches = _SUGGESTED_GLOBAL_NAME_RE.findall(text)
+        if global_matches:
+            text = _SUGGESTED_GLOBAL_NAME_RE.sub("", text).strip()
+            seen_global_eas = set()
+            for query, global_new_name_raw in global_matches:
+                global_new_name = sanitize_suggested_name(global_new_name_raw)
+                if not global_new_name:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_GLOBAL_NAME for '%s': '%s' "
+                        "is not a valid identifier.\n"
+                        % (PLUGIN_NAME, query, global_new_name_raw)
+                    )
+                    continue
+                global_ea = resolve_global_query(query.strip())
+                if global_ea == idaapi.BADADDR:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_GLOBAL_NAME: could not "
+                        "resolve '%s' to a data/global variable.\n" % (PLUGIN_NAME, query)
+                    )
+                    continue
+                if global_ea == self.func_ea or global_ea in seen_global_eas:
+                    continue
+                seen_global_eas.add(global_ea)
+                suggested_global_renames.append((global_ea, global_new_name))
 
         suggested_struct = None
         struct_matches = _SUGGESTED_STRUCT_RE.findall(text)
@@ -3055,6 +3765,25 @@ class ConversationRunner(object):
                         seen_vartype_names.add(var_name)
                         suggested_var_types.append((var_name, type_expr))
 
+        suggested_reanalyze = []
+        reanalyze_matches = _SUGGESTED_REANALYZE_RE.findall(text)
+        if reanalyze_matches:
+            text = _SUGGESTED_REANALYZE_RE.sub("", text).strip()
+            seen_reanalyze_eas = set()
+            for query, reason in reanalyze_matches:
+                target = resolve_function_query(query.strip())
+                if target is None:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_REANALYZE: could not resolve "
+                        "'%s' to a function.\n" % (PLUGIN_NAME, query)
+                    )
+                    continue
+                target_ea = target.start_ea
+                if target_ea == self.func_ea or target_ea in seen_reanalyze_eas:
+                    continue
+                seen_reanalyze_eas.add(target_ea)
+                suggested_reanalyze.append((target_ea, (reason or "").strip()))
+
         text = strip_markdown_fences(_REQUEST_CODE_RE.sub("", text).strip())
 
         self._on_result_cb(ConversationResult(
@@ -3062,6 +3791,8 @@ class ConversationRunner(object):
             suggested_name=suggested_name, suggested_signature=suggested_signature,
             suggested_vars=suggested_vars, suggested_callee_renames=suggested_callee_renames,
             suggested_struct=suggested_struct, suggested_var_types=suggested_var_types,
+            suggested_global_renames=suggested_global_renames,
+            suggested_reanalyze=suggested_reanalyze,
             root_is_pseudocode=self._root_is_pseudocode,
             error=None,
         ))
@@ -3116,6 +3847,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._suggested_vars = []
         self._suggested_callee_renames = []
         self._suggested_var_types = []
+        self._suggested_global_renames = []
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
         self.resize(560, 620)
@@ -3180,6 +3912,16 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.calleerename_label.setEnabled(False)
         calleerename_layout.addWidget(self.calleerename_label, 1)
         layout.addLayout(calleerename_layout)
+
+        globalrename_layout = QtWidgets.QHBoxLayout()
+        self.globalrename_check = QtWidgets.QCheckBox("Rename global variable(s):")
+        self.globalrename_check.setEnabled(False)
+        globalrename_layout.addWidget(self.globalrename_check)
+        self.globalrename_label = QtWidgets.QLineEdit()
+        self.globalrename_label.setReadOnly(True)
+        self.globalrename_label.setEnabled(False)
+        globalrename_layout.addWidget(self.globalrename_label, 1)
+        layout.addLayout(globalrename_layout)
 
         struct_layout = QtWidgets.QHBoxLayout()
         self.struct_check = QtWidgets.QCheckBox("Create struct type:")
@@ -3318,6 +4060,17 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.calleerename_label.setEnabled(True)
             self.calleerename_check.setChecked(True)
 
+        if result.suggested_global_renames:
+            self._suggested_global_renames = result.suggested_global_renames
+            global_labels = []
+            for global_ea, global_new_name in result.suggested_global_renames:
+                old_global_name = idc.get_name(global_ea) or ("%#x" % global_ea)
+                global_labels.append("%s -> %s" % (old_global_name, global_new_name))
+            self.globalrename_label.setText(", ".join(global_labels))
+            self.globalrename_check.setEnabled(True)
+            self.globalrename_label.setEnabled(True)
+            self.globalrename_check.setChecked(True)
+
         if result.suggested_struct:
             self.struct_edit.setText(result.suggested_struct)
             self.struct_check.setEnabled(True)
@@ -3378,6 +4131,8 @@ class ExplainResultDialog(QtWidgets.QDialog):
         comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
         comment = _SUGGESTED_VAR_RE.sub("", comment)
         comment = _SUGGESTED_CALLEE_NAME_RE.sub("", comment)
+        comment = _SUGGESTED_GLOBAL_NAME_RE.sub("", comment)
+        comment = _SUGGESTED_REANALYZE_RE.sub("", comment)
         comment = _SUGGESTED_STRUCT_RE.sub("", comment)
         comment = _SUGGESTED_VAR_TYPE_RE.sub("", comment).strip()
 
@@ -3398,6 +4153,10 @@ class ExplainResultDialog(QtWidgets.QDialog):
             list(self._suggested_callee_renames)
             if (self.calleerename_check.isChecked() and self._suggested_callee_renames) else None
         )
+        global_renames = (
+            list(self._suggested_global_renames)
+            if (self.globalrename_check.isChecked() and self._suggested_global_renames) else None
+        )
 
         struct_decl = None
         if self.struct_check.isChecked() and self.struct_edit.text().strip():
@@ -3411,7 +4170,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         ida_kernwin.execute_sync(
             functools.partial(
                 _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature,
-                var_renames, callee_renames, struct_decl, var_types,
+                var_renames, callee_renames, struct_decl, var_types, global_renames,
             ),
             ida_kernwin.MFF_WRITE,
         )
@@ -3605,6 +4364,23 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow(self.cfg_trace_use_symbolic_check)
 
+        self.cfg_trace_enumerate_computed_jumps_check = QtWidgets.QCheckBox(
+            "Enumerate ARM64 computed jump tables (experimental)"
+        )
+        self.cfg_trace_enumerate_computed_jumps_check.setToolTip(
+            "When a trace hits an AArch64 'BR/BLR Xn' whose target is "
+            "computed as *(table_base + index*stride + field) - a struct/"
+            "vtable-style dispatch where the index is runtime data - walk "
+            "the table in the loaded image and treat each stored pointer "
+            "that lands on executable code as a real successor, so the "
+            "dispatcher's handlers get explored. Experimental and OFF by "
+            "default: the index range can't be bounded statically, so it "
+            "walks entries until the first one that doesn't point at code, "
+            "which may under- or over-shoot. Every recovered target is "
+            "still shown for review before anything is written or patched."
+        )
+        form.addRow(self.cfg_trace_enumerate_computed_jumps_check)
+
         color_row = QtWidgets.QHBoxLayout()
         self.cfg_trace_color_real_edit = QtWidgets.QLineEdit()
         self.cfg_trace_color_real_edit.setPlaceholderText("#RRGGBB")
@@ -3671,6 +4447,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.system_prompt_edit.setPlainText(config.system_prompt)
         self.max_trace_blocks_spin.setValue(config.max_trace_blocks)
         self.cfg_trace_use_symbolic_check.setChecked(config.cfg_trace_use_symbolic)
+        self.cfg_trace_enumerate_computed_jumps_check.setChecked(config.cfg_trace_enumerate_computed_jumps)
         self.cfg_trace_color_real_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_real))
         self.cfg_trace_color_dead_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_dead))
         self.cfg_trace_color_unresolved_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_unresolved))
@@ -3723,6 +4500,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
         cfg.max_trace_blocks = self.max_trace_blocks_spin.value()
         cfg.cfg_trace_use_symbolic = self.cfg_trace_use_symbolic_check.isChecked()
+        cfg.cfg_trace_enumerate_computed_jumps = self.cfg_trace_enumerate_computed_jumps_check.isChecked()
         cfg.cfg_trace_color_real = _rgb_hex_to_bgr_int(
             self.cfg_trace_color_real_edit.text(), cfg.cfg_trace_color_real
         )
@@ -3842,27 +4620,36 @@ BatchItemResult = namedtuple("BatchItemResult", [
     "func_ea", "orig_name", "ok", "message", "comment",
     "suggested_name", "suggested_signature", "suggested_vars",
     "suggested_callee_renames", "suggested_struct", "suggested_var_types",
-    "root_is_pseudocode",
+    "suggested_global_renames", "suggested_reanalyze", "root_is_pseudocode",
 ])
 
 
-def _compute_apply_args(item):
+def _compute_apply_args(item, allow_rename_named=False):
     """Given a BatchItemResult, compute the positional args tuple for
     _apply_suggestions_and_refresh, using the same conservative defaults
     used throughout the plugin (rename only when the current name looks
     auto-generated; signature/variable/struct suggestions only when the
     root context was Hex-Rays pseudocode). Returns None if there's nothing
     to apply (missing or failed result).
+
+    allow_rename_named=True lifts the "only rename auto-generated names"
+    guard for THIS function's own name - used for functions pulled in by a
+    SUGGESTED_REANALYZE request, where the whole point is that the model
+    thinks the existing (non-default) name is wrong and should be replaced.
     """
     if item is None or not item.ok:
         return None
-    new_name = item.suggested_name if (item.suggested_name and is_auto_generated_name(item.orig_name)) else None
+    new_name = item.suggested_name if (
+        item.suggested_name and (allow_rename_named or is_auto_generated_name(item.orig_name))
+    ) else None
     signature = item.suggested_signature if item.root_is_pseudocode else None
     var_renames = item.suggested_vars if (item.root_is_pseudocode and item.suggested_vars) else None
     callee_renames = item.suggested_callee_renames or None
     struct_decl = item.suggested_struct if item.root_is_pseudocode else None
     var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
-    return (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types)
+    global_renames = item.suggested_global_renames or None
+    return (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames,
+            struct_decl, var_types, global_renames)
 
 
 class BatchController(object):
@@ -3877,12 +4664,16 @@ class BatchController(object):
     immediately dispatched to that now-free server.
     """
 
-    def __init__(self, config, funcs, on_row_update, on_finished, on_item_result=None):
+    def __init__(self, config, funcs, on_row_update, on_finished, on_item_result=None,
+                 on_row_add=None, max_extra=0):
         self.config = config
         self.funcs = funcs
         self._on_row_update = on_row_update
         self._on_finished = on_finished
         self._on_item_result = on_item_result or (lambda item: None)
+        # Called when a function is appended to the queue AFTER start (a
+        # SUGGESTED_REANALYZE expansion) so the dialog can add a row for it.
+        self._on_row_add = on_row_add or (lambda index, func: None)
         self._servers = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
         self._next_index = 0
         self._cancelled = False
@@ -3891,6 +4682,30 @@ class BatchController(object):
         # at most one per server, so this also caps concurrency at len(servers).
         self._active = {}
         self.results = {}
+        # Every ea ever in the queue (initial + dynamically added), so a
+        # reanalyze request never double-queues a function.
+        self._known_eas = {f.start_ea for f in funcs}
+        # Budget for dynamic SUGGESTED_REANALYZE additions, so a chain of
+        # reanalyze requests can't make the run grow without bound.
+        self._extra_budget = max(0, int(max_extra))
+
+    def request_reanalysis(self, func):
+        """Append a function discovered via SUGGESTED_REANALYZE to the
+        queue (if not already present and budget remains). Safe to call
+        from an on_item_result callback: it runs before this controller's
+        _dispatch_next for the just-freed server, so the newly appended
+        function is picked up on the next dispatch without any extra
+        kicking. Returns True if it was actually queued."""
+        if self._cancelled or self._finished or self._extra_budget <= 0:
+            return False
+        if func is None or func.start_ea in self._known_eas:
+            return False
+        self._extra_budget -= 1
+        self._known_eas.add(func.start_ea)
+        index = len(self.funcs)
+        self.funcs.append(func)
+        self._on_row_add(index, func)
+        return True
 
     def start(self):
         for server_url in self._servers:
@@ -3956,13 +4771,14 @@ class BatchController(object):
         label = self.config.server_label(server_url)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
-                                    None, None, None, [], [], None, [], result.root_is_pseudocode)
+                                    None, None, None, [], [], None, [], [], [], result.root_is_pseudocode)
             self._on_row_update(index, "Error", "[%s] %s" % (label, result.error))
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
                                     result.suggested_name, result.suggested_signature,
                                     result.suggested_vars, result.suggested_callee_renames,
                                     result.suggested_struct, result.suggested_var_types,
+                                    result.suggested_global_renames, result.suggested_reanalyze,
                                     result.root_is_pseudocode)
             self._on_row_update(index, "Done", "[%s] %s" % (label, result.text[:120]))
         self._record_and_advance(item, server_url)
@@ -3970,25 +4786,28 @@ class BatchController(object):
     def _on_error(self, index, func, server_url, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
-                                None, None, None, [], [], None, [], False)
+                                None, None, None, [], [], None, [], [], [], False)
         self._on_row_update(index, "Error", "[%s] %s" % (self.config.server_label(server_url), message))
         self._record_and_advance(item, server_url)
 
 
 def _apply_batch_and_refresh(items):
     """items: list of (func_ea, comment, new_name, signature, var_renames,
-    callee_renames, struct_decl, var_types). One execute_sync/MFF_WRITE
-    round-trip for the whole batch instead of N.
+    callee_renames, struct_decl, var_types, global_renames). One
+    execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
     """
-    for func_ea, comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types in items:
+    for (func_ea, comment, new_name, signature, var_renames, callee_renames,
+         struct_decl, var_types, global_renames) in items:
         _apply_suggestions_and_refresh(
-            func_ea, comment, new_name, signature, var_renames, callee_renames, struct_decl, var_types
+            func_ea, comment, new_name, signature, var_renames, callee_renames,
+            struct_decl, var_types, global_renames,
         )
     return 1
 
 
 class BatchProgressDialog(QtWidgets.QDialog):
-    """Table: [Apply checkbox | Function | Status | Comment/Error preview].
+    """Table: [Apply checkbox | Function | New Name | Status | Comment/Error
+    preview].
 
     Two modes:
     - auto_apply=False (default, used by "Batch Explain Functions..."):
@@ -4007,7 +4826,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
     interactive single-function dialog to refine any one function further.
     """
 
-    COL_APPLY, COL_FUNC, COL_STATUS, COL_PREVIEW = range(4)
+    COL_APPLY, COL_FUNC, COL_NEW_NAME, COL_STATUS, COL_PREVIEW = range(5)
 
     def __init__(self, config, funcs, parent=None, auto_apply=False):
         super().__init__(parent)
@@ -4017,10 +4836,15 @@ class BatchProgressDialog(QtWidgets.QDialog):
         self.resize(720, 480)
         self.funcs = funcs
         self._row_by_ea = {f.start_ea: i for i, f in enumerate(funcs)}
+        # eas pulled in dynamically by a SUGGESTED_REANALYZE request - their
+        # apply is allowed to replace an existing non-default name (that's
+        # the whole point of re-analyzing them). See _on_item_auto_apply.
+        self._reanalysis_eas = set()
 
-        self.table = QtWidgets.QTableWidget(len(funcs), 4)
+        self.table = QtWidgets.QTableWidget(len(funcs), 5)
         apply_header = "Applied" if auto_apply else "Apply"
-        self.table.setHorizontalHeaderLabels([apply_header, "Function", "Status", "Comment / Error"])
+        self.table.setHorizontalHeaderLabels(
+            [apply_header, "Function", "New Name", "Status", "Comment / Error"])
         self.table.horizontalHeader().setStretchLastSection(True)
         for i, func in enumerate(funcs):
             name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
@@ -4030,6 +4854,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
             check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             self.table.setItem(i, self.COL_APPLY, check_item)
             self.table.setItem(i, self.COL_FUNC, QtWidgets.QTableWidgetItem("%s @ %#x" % (name, func.start_ea)))
+            self.table.setItem(i, self.COL_NEW_NAME, QtWidgets.QTableWidgetItem(""))
             self.table.setItem(i, self.COL_STATUS, QtWidgets.QTableWidgetItem("Pending"))
             self.table.setItem(i, self.COL_PREVIEW, QtWidgets.QTableWidgetItem(""))
 
@@ -4056,7 +4881,11 @@ class BatchProgressDialog(QtWidgets.QDialog):
 
         self.controller = BatchController(
             config, funcs, self._on_row_update, self._on_batch_finished,
-            on_item_result=self._on_item_auto_apply if auto_apply else None,
+            on_item_result=self._on_item_result,
+            # Only the recursive auto-accept scan expands itself via
+            # SUGGESTED_REANALYZE, bounded by the same recursive-callee cap.
+            on_row_add=self._on_row_add_dynamic if auto_apply else None,
+            max_extra=config.max_recursive_callees if auto_apply else 0,
         )
         self.controller.start()
 
@@ -4065,8 +4894,46 @@ class BatchProgressDialog(QtWidgets.QDialog):
         if preview:
             self.table.item(index, self.COL_PREVIEW).setText(preview)
 
+    def _on_row_add_dynamic(self, index, func):
+        """A SUGGESTED_REANALYZE request appended `func` to the controller's
+        queue (recursive mode only) - add a matching table row so its
+        progress shows, and remember it so its apply may replace an
+        existing non-default name. `index` mirrors the controller's own
+        row index (table rows stay 1:1 with controller.funcs)."""
+        self._reanalysis_eas.add(func.start_ea)
+        name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        self.table.insertRow(index)
+        check_item = QtWidgets.QTableWidgetItem()
+        check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        self.table.setItem(index, self.COL_APPLY, check_item)
+        self.table.setItem(index, self.COL_FUNC,
+                           QtWidgets.QTableWidgetItem("%s @ %#x  (reanalyze)" % (name, func.start_ea)))
+        self.table.setItem(index, self.COL_NEW_NAME, QtWidgets.QTableWidgetItem(""))
+        self.table.setItem(index, self.COL_STATUS, QtWidgets.QTableWidgetItem("Pending"))
+        self.table.setItem(index, self.COL_PREVIEW, QtWidgets.QTableWidgetItem(""))
+        self._row_by_ea[func.start_ea] = index
+
+    def _on_item_result(self, item):
+        """Runs for every finished function in BOTH modes: fill in the
+        New Name column with the model's suggested name (annotated when
+        the conservative rename guard would keep the existing name), then
+        hand off to the auto-apply step in recursive mode."""
+        row = self._row_by_ea.get(item.func_ea)
+        if row is not None and item.ok and item.suggested_name:
+            text = item.suggested_name
+            allow_named = self.auto_apply and item.func_ea in self._reanalysis_eas
+            if (item.suggested_name != item.orig_name
+                    and not allow_named and not is_auto_generated_name(item.orig_name)):
+                text += "  (kept: %s)" % item.orig_name
+            self.table.item(row, self.COL_NEW_NAME).setText(text)
+        if self.auto_apply:
+            self._on_item_auto_apply(item)
+
     def _on_item_auto_apply(self, item):
-        args = _compute_apply_args(item)
+        # A function pulled in by SUGGESTED_REANALYZE is allowed to have its
+        # existing (non-default) name replaced - that's why it was re-queued.
+        allow_named = item.func_ea in self._reanalysis_eas
+        args = _compute_apply_args(item, allow_rename_named=allow_named)
         if args is not None:
             ida_kernwin.execute_sync(
                 functools.partial(_apply_suggestions_and_refresh, *args), ida_kernwin.MFF_WRITE
@@ -4077,6 +4944,20 @@ class BatchProgressDialog(QtWidgets.QDialog):
             check_item.setCheckState(
                 QtCore.Qt.CheckState.Checked if args is not None else QtCore.Qt.CheckState.Unchecked
             )
+        # Expand the recursive walk with any already-named callees the model
+        # flagged for re-analysis (bounded by the controller's own budget;
+        # duplicates/self are dropped there).
+        for target_ea, reason in (item.suggested_reanalyze or []):
+            func = ida_funcs.get_func(target_ea)
+            if func is not None and self.controller.request_reanalysis(func):
+                self._log_reanalyze(target_ea, reason)
+
+    def _log_reanalyze(self, target_ea, reason):
+        name = ida_funcs.get_func_name(target_ea) or ("sub_%X" % target_ea)
+        detail = (" - %s" % reason) if reason else ""
+        ida_kernwin.msg(
+            "[%s] Re-analyzing %s at the model's request%s\n" % (PLUGIN_NAME, name, detail)
+        )
 
     def _on_batch_finished(self):
         self.cancel_button.setEnabled(False)
@@ -4197,13 +5078,23 @@ def _undo_applied_cfg_patch(applied):
             pass
     return reverted
 
-# A fully-resolved binary opaque predicate found during the trace: a
-# conditional_branch block whose two successors have opposite verdicts
-# (one real, one dead) - the only case eligible for jump patching. NOT
-# emitted for genuine data-dependent branches (both real) or anything
+# A fully-resolved branch found during the trace, eligible for in-place
+# byte patching. Two distinct cases feed this, both produced by
+# CfgTraceRunner._compute_jump_patches:
+#   - A conditional_branch block whose two successors have opposite
+#     verdicts (one real, one dead) - a fully-resolved binary opaque
+#     predicate. role_of_real: "jump_target" | "fallthrough" - which side
+#     of the original Jcc/B.cond is the real one. dead_target_ea is the
+#     other side's address (used for the "both sides checked" UI gate).
+#   - An indirect_jump block (e.g. "BR X8" fed by a computed/table
+#     pointer load) with exactly one confirmed-real successor and no
+#     live alternative - the indirection always resolves to the same
+#     fixed target, so it can be replaced outright with a direct branch.
+#     role_of_real: "only". dead_target_ea is None (there is no opposite
+#     side to require checked).
+# NOT emitted for genuine data-dependent branches (both real), a live
+# multi-case indirect dispatch (2+ real successors), or anything
 # involving an unresolved successor - see CfgTraceRunner._build_result.
-# role_of_real: "jump_target" | "fallthrough" - which side of the
-# original Jcc is the real one, determining how to patch it.
 CfgTraceJumpPatch = namedtuple(
     "CfgTraceJumpPatch", ["jcc_ea", "real_target_ea", "dead_target_ea", "role_of_real"]
 )
@@ -4346,6 +5237,25 @@ class CfgTraceRunner(object):
                     sym_state = sym_run_block(self.sym_states.get(ea, SymState()), block.sym_insns, _family_of("rsp"))
                     self._enqueue(target, ea, "auto-continue (only successor)", sym_state)
                 continue
+            if (
+                block.kind == "indirect_jump"
+                and len(block.successors) == 1
+                and block.successors[0].ea is not None
+            ):
+                # A statically PRE-resolved single-target indirect jump -
+                # e.g. an ARM64 fixed-pointer veneer resolved in
+                # _resolve_indirect_jump_successors, or a one-case switch.
+                # The destination is already known from the block's
+                # successors, so treat it like an unconditional jump there
+                # instead of handing it to the symbolic engine (which
+                # can't model a load-from-memory and would return
+                # "unknown") or spending an LLM round-trip re-deriving it.
+                # This also makes it eligible for the "collapse to a
+                # direct branch" byte patch - see _compute_jump_patches.
+                target = block.successors[0].ea
+                sym_state = sym_run_block(self.sym_states.get(ea, SymState()), block.sym_insns, _family_of("rsp"))
+                self._enqueue(target, ea, "resolved single-target indirect jump", sym_state)
+                continue
 
             # Genuine decision point: conditional_branch or indirect_jump.
             # Try to resolve it via constant propagation first - this is
@@ -4357,8 +5267,46 @@ class CfgTraceRunner(object):
             self._current_block_sym_state = sym_state
             if self._try_symbolic_resolve(block, sym_state):
                 continue
+            if self._try_enumerate_computed_dispatch(block, sym_state):
+                continue
             self._issue_decision_request(block)
             return 0
+
+    def _try_enumerate_computed_dispatch(self, block, sym_state):
+        """Opt-in (config.cfg_trace_enumerate_computed_jumps) handling for a
+        computed ARM64 table dispatch that neither IDA nor the symbolic
+        engine could resolve to fixed targets: statically walk the table
+        (see _try_enumerate_arm64_table_dispatch) and, if it yields any
+        destinations, mark them all real and continue - no LLM round-trip.
+        Returns True if it handled the block. A genuinely runtime-indexed
+        dispatch has many real successors, so it is deliberately NOT
+        eligible for the 'collapse to one direct branch' byte patch (that
+        only fires for a single real successor - see _compute_jump_patches);
+        this just recovers the handlers for exploration/coloring.
+        """
+        if not self.config.cfg_trace_enumerate_computed_jumps:
+            return False
+        if block.kind != "indirect_jump" or not block.insn_eas:
+            return False
+        try:
+            targets = _try_enumerate_arm64_table_dispatch(block.last_insn_ea, block.insn_eas)
+        except Exception as exc:
+            self._log("Computed-jump enumeration errored at %#010x (%s); deferring to the LLM." % (block.start_ea, exc))
+            return False
+        if not targets:
+            return False
+        self.symbolic_resolved_count += 1
+        self._log(
+            "Block %#010x: enumerated %d target(s) of a computed jump table "
+            "statically - no LLM call needed." % (block.start_ea, len(targets))
+        )
+        reason = "[table] computed jump-table dispatch enumerated from the loaded image"
+        for target in targets:
+            # Each handler starts a fresh state - the dispatch index is
+            # runtime data, so nothing from this block's state carries
+            # meaningfully into a specific handler.
+            self._apply_target_verdict(target, "real", reason, block.start_ea, sym_state_override=SymState())
+        return True
 
     def _try_symbolic_resolve(self, block, sym_state):
         """Attempts to resolve a decision point without an LLM call, via
@@ -4550,39 +5498,56 @@ class CfgTraceRunner(object):
         )
 
     def _compute_jump_patches(self):
-        """Finds every conditional_branch block whose two successors were
-        BOTH fully decided with OPPOSITE verdicts (one real, one dead) -
-        a fully-resolved binary opaque predicate, the only case eligible
-        for jump patching. Deliberately excludes genuine data-dependent
-        branches (both sides real - nothing to redirect, both are
-        legitimately reachable) and anything touching an unresolved
-        successor (never patch based on an undecided verdict).
+        """Finds every branch eligible for in-place byte patching - see
+        CfgTraceJumpPatch above for the two cases (resolved conditional
+        opaque predicate, and an indirect jump collapsed to one target).
+        Deliberately excludes genuine data-dependent branches (both sides
+        real - nothing to redirect, both are legitimately reachable), a
+        live multi-case indirect dispatch, and anything touching an
+        unresolved successor (never patch based on an undecided verdict).
         """
         patches = []
         for ea, block in self.visited.items():
-            if block.kind != "conditional_branch" or len(block.successors) != 2:
-                continue
-            jump_succ = next((s for s in block.successors if s.role == "jump_target"), None)
-            fall_succ = next((s for s in block.successors if s.role == "fallthrough"), None)
-            if jump_succ is None or fall_succ is None or jump_succ.ea is None or fall_succ.ea is None:
-                continue
-            jump_is_real = jump_succ.ea in self.visited or jump_succ.ea in self.queued
-            jump_is_dead = jump_succ.ea in self.dead
-            fall_is_real = fall_succ.ea in self.visited or fall_succ.ea in self.queued
-            fall_is_dead = fall_succ.ea in self.dead
-            if jump_is_real and fall_is_dead:
-                patches.append(CfgTraceJumpPatch(
-                    jcc_ea=block.last_insn_ea, real_target_ea=jump_succ.ea,
-                    dead_target_ea=fall_succ.ea, role_of_real="jump_target",
-                ))
-            elif fall_is_real and jump_is_dead:
-                patches.append(CfgTraceJumpPatch(
-                    jcc_ea=block.last_insn_ea, real_target_ea=fall_succ.ea,
-                    dead_target_ea=jump_succ.ea, role_of_real="fallthrough",
-                ))
-            # else: both real (data-dependent), both dead (shouldn't
-            # happen - a live block always has a real predecessor chain),
-            # or one/both unresolved - nothing eligible to patch here.
+            if block.kind == "conditional_branch" and len(block.successors) == 2:
+                jump_succ = next((s for s in block.successors if s.role == "jump_target"), None)
+                fall_succ = next((s for s in block.successors if s.role == "fallthrough"), None)
+                if jump_succ is None or fall_succ is None or jump_succ.ea is None or fall_succ.ea is None:
+                    continue
+                jump_is_real = jump_succ.ea in self.visited or jump_succ.ea in self.queued
+                jump_is_dead = jump_succ.ea in self.dead
+                fall_is_real = fall_succ.ea in self.visited or fall_succ.ea in self.queued
+                fall_is_dead = fall_succ.ea in self.dead
+                if jump_is_real and fall_is_dead:
+                    patches.append(CfgTraceJumpPatch(
+                        jcc_ea=block.last_insn_ea, real_target_ea=jump_succ.ea,
+                        dead_target_ea=fall_succ.ea, role_of_real="jump_target",
+                    ))
+                elif fall_is_real and jump_is_dead:
+                    patches.append(CfgTraceJumpPatch(
+                        jcc_ea=block.last_insn_ea, real_target_ea=fall_succ.ea,
+                        dead_target_ea=jump_succ.ea, role_of_real="fallthrough",
+                    ))
+                # else: both real (data-dependent), both dead (shouldn't
+                # happen - a live block always has a real predecessor
+                # chain), or one/both unresolved - nothing eligible here.
+            elif block.kind == "indirect_jump":
+                # A computed/table-driven indirect jump (e.g. ARM64 "BR
+                # X8" fed by a fixed pointer load, or an x86 "jmp [reg]")
+                # that this trace found exactly one confirmed-real
+                # destination for, with no other live candidate - i.e.
+                # the indirection is not a genuine multi-case dispatch,
+                # it always lands on the same address. Mirrors the
+                # relocatability test _classify_block_for_rebuild already
+                # uses for the same pattern in Rebuild Linear mode.
+                real_succs = [
+                    s for s in block.successors
+                    if s.ea is not None and (s.ea in self.visited or s.ea in self.queued)
+                ]
+                if len(real_succs) == 1:
+                    patches.append(CfgTraceJumpPatch(
+                        jcc_ea=block.last_insn_ea, real_target_ea=real_succs[0].ea,
+                        dead_target_ea=None, role_of_real="only",
+                    ))
         return patches
 
     # -- LLM round-trip for one decision point -------------------------
@@ -4930,17 +5895,73 @@ _CfgTraceApplyItem = namedtuple("_CfgTraceApplyItem", ["insn_eas", "verdict", "c
 
 _PATCH_MASK64 = 0xFFFFFFFFFFFFFFFF
 
+_ARM64_NOP_WORD = b"\x1f\x20\x03\xd5"  # little-endian encoding of 0xD503201F
+_ARM64_BR_MASK = 0xFFFFFC1F   # BR Xn: bits [31:10] and [4:0] fixed, Rn in [9:5]
+_ARM64_BR_FIXED = 0xD61F0000
+
+# Recognized AArch64 conditional-branch encodings, as (mask, value) pairs
+# on the 32-bit little-endian instruction word - used to VERIFY an
+# instruction really is a conditional branch before rewriting it (never
+# guess). B.cond: bits [31:24]=0x54 and bit[4]=0. CBZ/CBNZ: bits
+# [30:25]=011010 (sf at [31] and op at [24] both free). TBZ/TBNZ: bits
+# [30:25]=011011. All are 4 bytes and PC-relative, so all are safely
+# replaceable in place with a same-size NOP or unconditional B.
+_ARM64_COND_BRANCH_FORMS = (
+    (0xFF000010, 0x54000000),  # B.cond
+    (0x7E000000, 0x34000000),  # CBZ / CBNZ (both operand sizes)
+    (0x7E000000, 0x36000000),  # TBZ / TBNZ (both operand sizes)
+)
+
+
+def _is_arm64_cond_branch_word(word):
+    return any((word & mask) == value for mask, value in _ARM64_COND_BRANCH_FORMS)
+
+
+def _compute_arm64_cond_branch_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real):
+    """AArch64 counterpart to _compute_jcc_patch_bytes for a resolved
+    conditional opaque predicate. Verifies the instruction is one of the
+    recognized 4-byte conditional branches (B.cond/CBZ/CBNZ/TBZ/TBNZ)
+    before touching it, then:
+      - role "fallthrough" (real path never branches) -> a 4-byte NOP, so
+        execution always falls through;
+      - role "jump_target" (real path always branches) -> a 4-byte
+        unconditional B to real_target_ea (imm26, +/-128MB reach), which
+        is the conditional branch's own taken destination.
+    Returns the 4-byte replacement, or None if unrecognized/out of range.
+    """
+    if size != 4 or len(raw) != 4:
+        return None
+    word = int.from_bytes(raw, "little")
+    if not _is_arm64_cond_branch_word(word):
+        return None
+    if role_of_real == "fallthrough":
+        return _ARM64_NOP_WORD
+    if role_of_real != "jump_target":
+        return None
+    delta = real_target_ea - jcc_ea
+    if delta % 4 != 0:
+        return None  # A64 branch targets are 4-byte aligned
+    imm26 = delta // 4
+    if not (-(1 << 25) <= imm26 < (1 << 25)):
+        return None  # out of B's +/-128MB reach
+    new_word = 0x14000000 | (imm26 & 0x3FFFFFF)
+    return new_word.to_bytes(4, "little")
+
 
 def _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real):
-    """Pure byte-level computation (no IDA calls) - given a decoded Jcc's
-    address/size/raw bytes, the resolved real target, and which side is
-    real, returns the exact `size`-byte replacement to write at jcc_ea,
-    or None if this encoding isn't confidently recognized/supported (the
-    caller must leave the original bytes untouched in that case - never
-    guess at an encoding this hasn't verified).
+    """Pure byte-level computation (no IDA calls) - given a decoded
+    conditional branch's address/size/raw bytes, the resolved real
+    target, and which side is real, returns the exact `size`-byte
+    replacement to write at jcc_ea, or None if this encoding isn't
+    confidently recognized/supported (the caller must leave the original
+    bytes untouched in that case - never guess at an encoding this hasn't
+    verified). Handles x86/x64 Jcc and, on an AArch64 target, the 4-byte
+    conditional branches via _compute_arm64_cond_branch_patch_bytes.
     """
     if len(raw) != size:
         return None
+    if _is_arm64_target():
+        return _compute_arm64_cond_branch_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real)
     if role_of_real == "fallthrough":
         # Real path is "don't take the jump" - NOP the whole instruction
         # so execution always falls through, now unconditionally.
@@ -4970,15 +5991,73 @@ def _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real):
     return None
 
 
-def _patch_bytes_and_reanalyze(ea, new_bytes):
+def _compute_indirect_jump_patch_bytes(jcc_ea, size, raw, real_target_ea):
+    """Pure byte-level computation for collapsing an indirect_jump (a
+    computed/table-driven branch through a register - x86 "jmp reg/mem",
+    ARM64 "BR Xn") that this trace found always lands on the SAME single
+    target, into a direct unconditional branch to it. Same contract as
+    _compute_jcc_patch_bytes: returns the exact `size`-byte replacement,
+    or None if this encoding/architecture isn't confidently recognized
+    (never guessed at) or the target is out of the encoding's reachable
+    range.
+    """
+    if len(raw) != size:
+        return None
+    if _is_arm64_target():
+        if size != 4:
+            return None
+        word = int.from_bytes(raw, "little")
+        if (word & _ARM64_BR_MASK) != _ARM64_BR_FIXED:
+            return None  # not a plain "BR Xn" - don't guess at anything else
+        delta = real_target_ea - jcc_ea
+        if delta % 4 != 0:
+            return None  # A64 branch targets must be 4-byte aligned
+        imm26 = delta // 4
+        if not (-(1 << 25) <= imm26 < (1 << 25)):
+            return None  # out of B's +/-128MB reach
+        new_word = 0x14000000 | (imm26 & 0x3FFFFFF)
+        return new_word.to_bytes(4, "little")
+    # x86/x64: only handles indirect jumps at least as long as a JMP
+    # rel32 (5 bytes), padding any remainder with NOP - same discipline
+    # as the near-Jcc case above. Shorter forms (2-3 byte "jmp reg") are
+    # refused rather than guessed at, since there's no room to encode a
+    # 32-bit displacement.
+    if size < 5:
+        return None
+    new_rel32 = (real_target_ea - (jcc_ea + 5)) & 0xFFFFFFFF
+    signed_new_rel32 = new_rel32 if new_rel32 < 0x80000000 else new_rel32 - 0x100000000
+    if (jcc_ea + 5 + signed_new_rel32) & _PATCH_MASK64 != real_target_ea & _PATCH_MASK64:
+        return None
+    return bytes([0xE9]) + new_rel32.to_bytes(4, "little") + b"\x90" * (size - 5)
+
+
+def _patch_bytes_and_reanalyze(ea, new_bytes, make_code=False):
     for i, b in enumerate(new_bytes):
         ida_bytes.patch_byte(ea + i, b)
+    end = ea + len(new_bytes)
     try:
         ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, len(new_bytes))
     except Exception:
         pass
+    if make_code:
+        # Force every patched instruction to be (re)created as code. When a
+        # dead block is NOPed (or a branch rewritten), there is often no
+        # live control flow left reaching these bytes, so IDA's auto-
+        # analysis won't turn them back into instructions on its own - they
+        # linger as undefined bytes or get coerced into a data item (e.g.
+        # an ARM64 NOP word shown as "DCB 0x1F, 0x20, 3, 0xD5" with "---"
+        # separators, instead of "NOP"). Creating each instruction
+        # explicitly fixes the listing and keeps the region walkable.
+        cur = ea
+        step = 4 if _is_arm64_target() else 1  # A64 is fixed 4-byte; x86 byte-granular
+        while cur < end:
+            try:
+                n = ida_ua.create_insn(cur)
+            except Exception:
+                n = 0
+            cur += n if n > 0 else step
     try:
-        ida_auto.plan_and_wait(ea, ea + len(new_bytes))
+        ida_auto.plan_and_wait(ea, end)
     except Exception:
         pass
 
@@ -4986,16 +6065,24 @@ def _patch_bytes_and_reanalyze(ea, new_bytes):
 def _patch_nop_instruction(ea):
     """Decodes the instruction currently at ea (fresh, so this reflects
     whatever is really there right now) and overwrites every one of its
-    bytes with NOP (0x90) - safe for any instruction length since NOP is
-    a valid single-byte filler, no multi-byte NOP encoding needed.
-    Returns the number of bytes touched, so the caller can record exactly
-    what this patch covers (for Undo Patches - see _AppliedCfgPatch).
+    bytes with a NOP encoding valid for the current architecture. x86 NOP
+    (0x90) is a single byte so it tiles any instruction length; AArch64
+    has no single-byte NOP, so its 4-byte NOP word is tiled instead
+    (decode_insn always returns a multiple of 4 for A64, so this divides
+    evenly). Returns the number of bytes touched, so the caller can
+    record exactly what this patch covers (for Undo Patches - see
+    _AppliedCfgPatch).
     """
     probe = ida_ua.insn_t()
     size = ida_ua.decode_insn(probe, ea)
     if size <= 0:
         size = 1  # could not decode - NOP at least the one byte we know about
-    _patch_bytes_and_reanalyze(ea, b"\x90" * size)
+    if _is_arm64_target():
+        whole_words, remainder = divmod(size, 4)
+        filler = _ARM64_NOP_WORD * whole_words + b"\x00" * remainder
+    else:
+        filler = b"\x90" * size
+    _patch_bytes_and_reanalyze(ea, filler, make_code=True)
     return size
 
 
@@ -5004,10 +6091,13 @@ def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
     bytes touched (for Undo Patches - see _AppliedCfgPatch), only
     meaningful when ok is True. Re-decodes the instruction at jcc_ea
     fresh (never trusts stale data) and verifies its raw bytes match one
-    of exactly two recognized x86 Jcc encodings before touching anything -
-    see _compute_jcc_patch_bytes. Any other encoding (jcxz, unusual
-    prefixes, anything this hasn't specifically verified) is refused,
-    not guessed at.
+    of the recognized encodings before touching anything: conditional
+    opaque predicates (role_of_real "jump_target"/"fallthrough") go
+    through _compute_jcc_patch_bytes (x86/x64 Jcc, or AArch64 B.cond/
+    CBZ/CBNZ/TBZ/TBNZ); a collapsed indirect jump (role_of_real "only")
+    goes through _compute_indirect_jump_patch_bytes (x86/x64 or ARM64).
+    Any other encoding (jcxz, unusual prefixes, anything neither helper
+    has specifically verified) is refused, not guessed at.
     """
     insn = ida_ua.insn_t()
     size = ida_ua.decode_insn(insn, jcc_ea)
@@ -5019,10 +6109,13 @@ def _patch_jcc_to_real_target(jcc_ea, real_target_ea, role_of_real):
         return False, "could not read instruction bytes: %s" % exc, None
     if raw is None or len(raw) != size:
         return False, "could not read instruction bytes at %#010x" % jcc_ea, None
-    patch = _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real)
+    if role_of_real == "only":
+        patch = _compute_indirect_jump_patch_bytes(jcc_ea, size, raw, real_target_ea)
+    else:
+        patch = _compute_jcc_patch_bytes(jcc_ea, size, raw, real_target_ea, role_of_real)
     if patch is None:
-        return False, "unrecognized or inconsistent Jcc encoding at %#010x (size=%d) - not patched" % (jcc_ea, size), None
-    _patch_bytes_and_reanalyze(jcc_ea, patch)
+        return False, "unrecognized or inconsistent branch encoding at %#010x (size=%d) - not patched" % (jcc_ea, size), None
+    _patch_bytes_and_reanalyze(jcc_ea, patch, make_code=True)
     return True, None, size
 
 
@@ -5493,10 +6586,11 @@ def _gather_linear_rebuild_plan(runner):
 def _apply_linear_rebuild(plan):
     """Writes plan.code starting at plan.entry_ea - the ONLY bytes this
     touches anywhere in the binary. Reuses _patch_bytes_and_reanalyze
-    (patch_byte per byte + del_items + plan_and_wait) exactly like every
-    other patch in this file.
+    exactly like every other patch in this file, with make_code so the
+    freshly written linear instruction stream is decoded as code rather
+    than left as undefined/data bytes.
     """
-    _patch_bytes_and_reanalyze(plan.entry_ea, plan.code)
+    _patch_bytes_and_reanalyze(plan.entry_ea, plan.code, make_code=True)
 
 
 def _ensure_function_at(start_ea):
@@ -5539,8 +6633,9 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None
     scope). If jump_patches is not None (only when the user explicitly
     opted in via "Also patch bytes" - it may still be an empty list),
     ALSO NOPs every checked dead instruction's bytes, redirects each
-    listed conditional jump to its real target (see
-    _patch_nop_instruction/_patch_jcc_to_real_target), and enforces that
+    listed conditional jump or collapsed indirect jump to its real
+    target (see _patch_nop_instruction/_patch_jcc_to_real_target), and
+    enforces that
     a proper function exists at start_ea (see _ensure_function_at) -
     only in patch mode, since forcing a function boundary is itself a
     database change beyond plain color/comment marking, consistent with
@@ -6287,26 +7382,37 @@ class CfgTraceDialog(QtWidgets.QDialog):
 
         jump_patches = None
         if self.mode_patch_in_place.isChecked():
-            # Only ever patch a jump when BOTH of its successors' rows are
-            # checked - if the user unchecked either side, treat that jcc
-            # as "not confirmed enough to touch bytes for", same as if
-            # patching were off entirely for that one.
+            # A conditional-branch patch (role_of_real "jump_target"/
+            # "fallthrough") only ever gets applied when BOTH of its
+            # successors' rows are checked - if the user unchecked either
+            # side, treat that jcc as "not confirmed enough to touch
+            # bytes for", same as if patching were off entirely for that
+            # one. A collapsed-indirect-jump patch (role_of_real "only")
+            # has no dead side to require - it's gated on its single real
+            # target alone.
             all_patches = self.result.jump_patches if self.result is not None else []
             jump_patches = [
                 jp for jp in all_patches
                 if (jp.real_target_ea, "real") in checked_by_addr_verdict
-                and (jp.dead_target_ea, "dead") in checked_by_addr_verdict
+                and (
+                    jp.role_of_real == "only"
+                    or (jp.dead_target_ea, "dead") in checked_by_addr_verdict
+                )
             ]
             dead_n = sum(1 for it in items if it.verdict == "dead")
+            cond_n = sum(1 for jp in jump_patches if jp.role_of_real != "only")
+            indirect_n = sum(1 for jp in jump_patches if jp.role_of_real == "only")
             answer = QtWidgets.QMessageBox.question(
                 self, "Patch Bytes - %s" % PLUGIN_NAME,
                 "This will modify the loaded binary image, not just IDB colors/comments:\n\n"
                 "  - NOP out %d dead instruction address(es)\n"
                 "  - Redirect %d conditional jump(s) to their confirmed real target\n"
+                "  - Replace %d indirect jump(s) that always land on the same address "
+                "with a direct jump to it\n"
                 "  - Ensure a function is defined at %#010x (IDA sometimes never\n"
                 "    recognized it as one), so it can be decompiled\n\n"
                 "This is revertible via Edit > Patches > ... in IDA if needed. Continue?"
-                % (dead_n, len(jump_patches), self.start_ea),
+                % (dead_n, cond_n, indirect_n, self.start_ea),
             )
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
@@ -6745,8 +7851,23 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         of callees are not included), each explained and auto-applied.
         Capped by config.max_recursive_callees, deliberately a smaller,
         separate setting from max_callees since this writes to the
-        database automatically."""
-        callees = gather_callee_funcs(func, self.config.max_recursive_callees)
+        database automatically.
+
+        The target itself is always explained (the user invoked this ON
+        it), but callees are limited to ones that are still UNDISCOVERED -
+        i.e. carry a default auto-generated name (sub_/loc_/nullsub_/...).
+        A callee that already has a meaningful name is left alone rather
+        than re-analyzed (and, importantly, never at risk of having its
+        existing name/comment auto-overwritten), since the point of the
+        recursive pass is to fill in the unnamed ones. See
+        is_auto_generated_name."""
+        def _is_undiscovered(callee):
+            name = ida_funcs.get_func_name(callee.start_ea) or ""
+            return is_auto_generated_name(name)
+
+        callees = gather_callee_funcs(
+            func, self.config.max_recursive_callees, include=_is_undiscovered
+        )
         funcs = [func]
         seen_eas = {func.start_ea}
         for callee in callees:

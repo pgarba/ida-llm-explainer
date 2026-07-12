@@ -2,435 +2,83 @@
 
 # LLM Explainer
 
-An IDA Pro 9.3 plugin that asks a locally-running [llama.cpp](https://github.com/ggml-org/llama.cpp)
-server (`llama-server`) to explain the function you're looking at — in either the Hex-Rays
-pseudocode view or the plain disassembly view — and streams the answer into a small,
-non-modal review dialog. Nothing is written to your database until you explicitly click Accept.
+Explain and rename IDA functions with a **local** [llama.cpp](https://github.com/ggml-org/llama.cpp)
+server — private, offline, nothing written to your database until you click **Accept**. Works in
+the Hex-Rays or the disassembly view.
 
-![LLM Explainer result dialog with proposed name, signature, variable renames, and called-function renames](example.png)
-
-The dialog above shows a real run against a license-check function: the model explained what it
-does, proposed a clearer name and signature, renamed every local variable, and — after fetching
-the code of the functions it calls — proposed names for those too. Each suggestion is its own
-checkbox, editable before anything is written.
+![LLM Explainer result dialog](example.png)
 
 ## Features
 
-- **Right-click, explain**: works from the pseudocode view, the disassembly view, or a
-  configurable hotkey (default `Ctrl-Alt-E`).
-- **Live streaming**: the answer streams in as it's generated. For "thinking"/reasoning models
-  (e.g. Qwen3) the chain-of-thought is shown separately, in gray italics, from the real answer.
-- **Human in the loop**: every result is Accept / Reason More / Cancel — the model never writes
-  to the database on its own.
-- **Call-graph awareness**: optionally follow called functions recursively (up to a configurable
-  depth) so the model sees callee code up front, and/or let the model ask for a specific callee's
-  code on demand mid-conversation (`REQUEST_CODE: <name-or-address>`), which the plugin fetches
-  and feeds back automatically.
-- **String/global context**: referenced string literals and named globals are included in the
-  prompt, since they're often the strongest clue to a function's purpose.
-- **Rename & retype suggestions**: the model can propose a better function name, a full C
-  signature (return type + argument types/names, Hex-Rays only), local variable renames, and
-  renames for *called* functions it actually examined and are still under a default name —
-  each shown as an editable, opt-in checkbox before you accept.
-- **Struct detection**: when the pseudocode accesses a pointer at multiple constant offsets in a
-  way that suggests an undefined structure, the model can define a proper struct type and apply
-  it — to a function argument via the signature, or to a local variable directly — again as an
-  editable, opt-in suggestion.
-- **Batch mode**: pick a set of functions (filterable checklist), process them, then review and
-  apply the results in bulk — same human-in-the-loop guarantee as the single-function flow.
-- **Recursive auto-accept mode**: `Explain function with LLM (recursively)` also explains the
-  target function's direct callees (depth 1 only) and applies every result automatically, with
-  no review step — the one exception to the human-in-the-loop rule above. Still uses the same
-  conservative apply defaults as a manual Accept, is capped by its own "Max recursive callees"
-  setting, and shows a live, cancellable progress dialog. Use with care since it writes to the
-  database unattended.
-- **Multi-server parallelism with priority + failover**: configure more than one `llama-server`
-  instance (list order = priority) and batch/recursive explain will run up to one function per
-  server concurrently — N servers gives roughly an Nx speedup over a single server. The
-  interactive single-function explain uses the first listed server. Either way, if a server
-  refuses/drops the connection or returns HTTP 502/503/504, that request automatically retries
-  against the next server on the list before giving up, so one offline server doesn't fail your
-  requests.
-- **LLM-guided CFG recovery for obfuscated functions**: right-click in the disassembly view →
-  **Trace/Recover CFG...**, give it a start address, and it walks the function's basic blocks
-  forward — auto-continuing through anything with a single successor, and at each real branch
-  or indirect-jump decision point first trying a fast, deterministic constant-propagation pass
-  (x86/x64 only) before ever asking the model. That pass resolves classic opaque predicates (a
-  dispatcher/state variable set to a known constant earlier in the trace — one side real, the
-  other dead) and also recognizes genuine data-dependent branches — a comparison against an
-  incoming argument, something read through one, or a called function's result — as ordinary,
-  non-obfuscated conditional logic, marking every side real automatically without needing to
-  know what the argument/call result actually contains; only when it can't confidently resolve
-  something does it fall back to the LLM,
-  so LLM calls stay proportional to actual obfuscation complexity rather than every branch in
-  the function. As it walks it also corrects any instruction boundaries IDA's original analysis
-  got wrong (undefine + recreate, never touching a byte — the same fixup you'd do by hand with
-  U then C), since obfuscated code routinely has real jump targets landing mid-instruction
-  relative to IDA's initial linear-sweep guess; this happens immediately, not deferred to
-  Accept. A live, cancellable transcript shows progress, alongside an optional live graph view
-  (a native IDA graph, colored the same green/red/amber as the eventual disassembly marking,
-  filling in node by node as the trace runs — double-click a node to jump there); once the
-  trace finishes (or a configurable block-count safety cap is hit), a review table lets you
-  check/uncheck each decided block before Accept, with a **"View Reasoning Log"** button to see
-  the full transcript in a separate window. By default Accept only colors the disassembly and
-  adds a comment — no byte patching. **"Patch in place"** additionally NOPs out confirmed dead
-  code and redirects confirmed opaque-predicate jumps straight to their real target; **"Rebuild
-  linear"** instead replaces the entry point with a freshly concatenated straight-line rebuild of
-  just the real blocks — see [below](#patching-the-recovered-cfg) for exactly what each mode does
-  and does not touch. The finished result is also cached in memory for the rest of the IDA
-  session: reopening **Trace/Recover CFG...** on the same address offers a **"Load Cached
-  Result"** button that jumps straight to the review screen — no re-tracing, no LLM calls — so
-  you can look at a result again later and decide then whether to patch it in. If you do patch
-  it in, that same screen also offers **"Undo Patches"** to revert exactly those bytes.
+- **Right-click → explain** — pseudocode or disassembly view, or a hotkey (`Ctrl-Alt-E`). Answer streams in live; reasoning models show their chain-of-thought separately.
+- **Human in the loop** — every suggestion is a separate, editable checkbox. Accept / Reason More / Cancel. The model never writes on its own.
+- **Rename & retype** — proposes a function name, full C signature, local-variable renames, **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names).
+- **Struct detection** — infers an undefined struct from pointer-offset access patterns and applies it.
+- **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer.
+- **Batch mode** — explain a checklist of functions, review (incl. each proposed new name), apply in bulk.
+- **Recursive auto-accept** — explains a function + its *undiscovered* (`sub_…`) callees and applies automatically; can re-analyze an already-named callee the model flags as misnamed.
+- **Multi-server** — list several `llama-server` endpoints for ~Nx parallel batch throughput, with priority order + automatic failover.
+- **CFG recovery for obfuscated code** — walks basic blocks, resolves opaque predicates / dead code / flattening dispatchers with a fast deterministic pass (falls back to the LLM only when unsure), then optionally **patches** or **rebuilds** the real control flow. x86/x64 and AArch64.
 
-![Trace/Recover CFG live view: the recovered control-flow graph, colored real/dead, next to the live transcript explaining each block's verdict](tracer.png)
+## Install
 
-The screenshot above shows a real trace against an obfuscated function: the live graph fills in
-as each block is decided (green = real path, red = decoy), while the transcript streams the
-model's reasoning behind every REAL/DEAD verdict — here, opaque predicates built on flag tricks
-(`xor dl, 0` clearing the overflow flag, `xchg ax, ax` fixing the parity flag) that fall outside
-what the constant-propagation pass models on its own, so the LLM works them out directly from
-the flag semantics instead.
+Copy `llm_explainer.py` into `<IDA user dir>\plugins\` (Windows: `%APPDATA%\Hex-Rays\IDA Pro\plugins\`) and restart IDA. Requires IDA 9.3+ (PySide6 ships with IDA) and a reachable `llama-server` (default `http://127.0.0.1:8080`). Hex-Rays is optional — it falls back to disassembly. Or install the packaged `dist/*.zip` via [`hcli`](https://hcli.docs.hex-rays.com/).
 
-## Requirements
+## Quick start
 
-- IDA Pro 9.3 or later (PySide6 is bundled with IDA — no extra Python packages to install).
-- One or more running `llama-server` instances reachable over HTTP (default
-  `http://127.0.0.1:8080`). Configuring more than one lets batch/recursive explain run in
-  parallel across all of them.
-- The Hex-Rays decompiler is optional. If it isn't available for the current architecture, the
-  plugin automatically falls back to a plain disassembly listing.
+- **One function** — right-click → *Explain function with LLM…*, review the streamed suggestions, **Accept & Add Comment**.
+- **Batch** — Functions window → *Batch Explain Functions…*, check functions, **Apply Selected** when done. A **New Name** column shows the proposed rename per function as it finishes (marked `(kept: …)` when the existing non-default name would be preserved).
+- **Recursive** — right-click → *Explain function with LLM (recursively)…*. Auto-applies; capped by *Max recursive callees*; writes unattended, so use with care.
+- **CFG recovery** — disassembly view → *Trace/Recover CFG…*, pick a start address, watch the live transcript/graph, then review each block and pick an **On Accept** mode.
 
-## Installation
+## CFG patching modes
 
-Copy `llm_explainer.py` into one of IDA's plugin directories:
+Chosen on the review screen (all re-verify actual bytes before touching anything, and refuse rather than guess):
 
-- **Per-user** (recommended, no admin rights needed):
-  `<IDA user dir>\plugins\llm_explainer.py`
-  On Windows this is typically `%APPDATA%\Hex-Rays\IDA Pro\plugins\llm_explainer.py`.
-- **Global** (all users of this IDA install):
-  `<IDA install dir>\plugins\llm_explainer.py`
+- **Mark only** *(default)* — colors + comments blocks. No bytes changed.
+- **Patch in place** — NOPs confirmed-dead code and redirects fully-resolved opaque-predicate branches to their real target; ensures a function exists at the entry. Also collapses a single-target computed/indirect jump to a direct branch (incl. AArch64 `BR`/`B.cond`).
+- **Rebuild linear** — writes just the real blocks as one straight-line sequence at the entry point, re-encoding every branch/call explicitly; touches only `[entry, entry+size)`.
 
-Restart IDA (or reload plugins) afterward.
-
-Alternatively, install via [`hcli`](https://hcli.docs.hex-rays.com/), Hex-Rays' plugin manager,
-using the packaged `ida-plugin.json` described below.
-
-## Packaging (hcli / Hex-Rays plugin repository)
-
-This repo follows the [official plugin packaging format](https://hcli.docs.hex-rays.com/reference/plugin-packaging-and-format/):
-`ida-plugin.json` sits at the repo root next to the entry point (`llm_explainer.py`), which is
-already the flat, single-file layout the format expects — no subfolder needed.
-
-To build the distributable archive:
-
-```sh
-python package.py
-```
-
-This writes `dist/llm-explainer-<version>.zip` with `ida-plugin.json` and `llm_explainer.py` at
-the archive root. Attach that zip as a GitHub release asset — don't rely on GitHub's
-auto-generated "Source code (zip)" link, since it wraps everything in a nested
-`<repo>-<tag>/` folder and would put the manifest one level too deep. Validate with:
-
-```sh
-hcli plugin lint dist/llm-explainer-<version>.zip
-```
-
-Note: `ida-plugin.json`'s `categories` currently lists `"ai"` as a best guess — the docs page
-doesn't publish the full list of accepted category values, so double-check that against
-`hcli plugin lint` (or hcli's own validation) before publishing, and adjust if it's rejected.
-
-## Usage
-
-### Explain a single function
-
-1. Open a function in the pseudocode or disassembly view.
-2. Right-click → **LLM Explainer → Explain function with LLM...** (or press the hotkey).
-3. Watch the answer stream in. If the model needs to see a called function's code to answer
-   accurately, it will fetch it automatically (up to the configured limit) — you'll see this
-   noted in the transcript.
-4. Review the proposed comment and any suggested rename / signature / variable renames (each has
-   its own checkbox and is editable before you commit).
-5. Click **Accept & Add Comment** to write everything to the database, **Reason More** to ask a
-   follow-up question, or **Cancel** to discard.
-
-### Batch-explain multiple functions
-
-1. Right-click in the **Functions** window → **LLM Explainer → Batch Explain Functions...**
-   (or Edit → Plugins → Batch Explain Functions...).
-2. Filter and check the functions you want processed. Nothing is pre-selected.
-3. The progress dialog processes up to one function per configured server concurrently (see
-   "Server base URL(s)" below) and shows live status per function, including which server is
-   handling it.
-4. Once finished, check/uncheck rows (successful ones are checked by default) and click
-   **Apply Selected** to write all of them in one batch. There is no follow-up chat in batch
-   mode — reopen the single-function flow on a specific function if you want to refine it further.
-
-### Recursive auto-accept
-
-Right-click a function → **LLM Explainer → Explain function with LLM (recursively)...**. This
-explains the target function plus its direct callees (depth 1 only — callees of callees are not
-included), and applies every successful result immediately as it completes, with no per-function
-review. A progress dialog still shows live status and can be cancelled mid-run; the callee count
-is capped by the separate "Max recursive callees" setting (default `10`) precisely because this
-mode writes to the database unattended.
-
-### Trace/Recover CFG (obfuscated functions)
-
-1. In the **disassembly view**, put the cursor on the function's entry point (or any address
-   you want to start from) and right-click → **LLM Explainer → Trace/Recover CFG...**.
-2. Confirm or edit the start address, optionally leave "Show live CFG graph while tracing"
-   checked (a native IDA graph view opens alongside, filling in as blocks are decided — use
-   **Show Graph** at any point later to reopen it if closed), then click **Start**.
-3. Watch the live transcript as it walks basic blocks, auto-continuing through single-successor
-   blocks and, at each real branch/indirect jump, first trying to resolve it automatically via
-   constant propagation before ever pausing for an LLM round-trip. As it walks it also fixes up
-   any instruction boundaries IDA's original analysis got wrong (undefine + recreate, no bytes
-   changed) — this happens immediately, since it's just correcting IDA's own analysis, not an
-   LLM opinion. **Cancel** at any time; any boundary fixes already made stay (they're harmless
-   corrections either way), but no REAL/DEAD/UNRESOLVED coloring/comments are written until you
-   explicitly accept in step 4.
-4. Once the worklist empties (or the "Max CFG trace blocks" cap is hit, producing a partial
-   result), review the table of every decided/flagged block — verdict REAL/DEAD/UNRESOLVED, with
-   a reason (rows resolved automatically are prefixed `[symbolic]`) — check/uncheck rows, pick an
-   "On Accept" mode (Mark only/Patch in place/Rebuild linear — see below), and click Accept. Mark
-   only just colors the affected instructions and adds a one-line comment on each block's first
-   instruction; it never patches bytes.
-5. The finished result stays cached in memory (this IDA session only) by its exact start
-   address. Reopening **Trace/Recover CFG...** on the same address shows a **"Load Cached
-   Result"** button on the first screen — use it to jump straight to the review table (and the
-   reasoning log) without re-tracing, then decide then whether to Accept. Starting a fresh trace
-   instead always re-traces from scratch and replaces the cached result once it finishes.
-6. If **Patch in place** or **Rebuild linear** was accepted, that same first screen also shows an
-   **"Undo Patches"** button (also cached in memory, this session only) — reverts exactly the
-   bytes that patch touched back to their original values, using IDA's own recorded pre-patch
-   bytes (the same mechanism behind **Edit → Patches → ...**, just scoped to precisely this
-   trace's own changes rather than everything in the database). It does not undo the
-   color/comment marking or remove any function definition the patch created.
-
-### Patching the recovered CFG
-
-The review screen has three mutually-exclusive **"On Accept"** modes (Mark only, selected by
-default):
-
-**Mark only** — color + comment the disassembly, exactly as described above. No bytes changed.
-
-**Patch in place** — additionally, with a confirmation prompt showing exact counts before
-anything is touched:
-
-- **NOPs out every checked DEAD instruction's bytes** (`0x90` per byte — safe for any
-  instruction length, no multi-byte NOP encoding needed).
-- **Redirects every fully-resolved opaque predicate to its real target** — only for a
-  `conditional_branch` block whose two successors were decided with *opposite* verdicts (one
-  real, one dead) *and* both corresponding rows are checked. A short `Jcc` becomes a short `JMP`
-  to the same target (2 bytes either way, opcode swap only); a near `Jcc` becomes a near `JMP`
-  (one byte shorter, padded with a trailing NOP) with a freshly-computed displacement — never
-  reused/guessed from the original bytes. Genuine data-dependent branches (both sides real) are
-  never touched, since there's nothing to redirect — both paths are legitimately reachable.
-- **Ensures a function is actually defined at the trace's start address**, since IDA sometimes
-  never recognized it as one in the first place — the whole reason obfuscated dispatcher entry
-  points need this feature at all. Only creates a function where none exists; if the address
-  turns out to already be inside a *different* function, it's left alone rather than forcing a
-  new boundary into existing analysis.
-
-Both byte-patching operations re-decode and verify the actual bytes at each address immediately before
-patching (never trust stale/cached data), and refuse to patch — logging why, leaving the
-original bytes untouched — for anything they don't fully recognize: an unusual `Jcc` encoding,
-a claimed target that doesn't match what the instruction actually encodes, or a dead-code
-address that (per IDA's "overlapping blocks" edge case — see the code comments) might also be
-claimed by a real, live instruction. This changes actual code bytes, not just IDB
-colors/comments — it's revertible via IDA's own **Edit → Patches** menu, but review the counts
-in the confirmation prompt before proceeding.
-
-**Rebuild linear** — a fundamentally different approach: instead of neutering dead paths in
-place, every confirmed-real block (the trace's complete, closed real set — not subject to the
-review checkboxes, since a rebuild missing part of the real control flow wouldn't be safe) is
-concatenated into one straight-line sequence and written starting exactly at the function's
-entry point. Every jump/call is re-encoded explicitly (a `Jcc`+`JMP` pair for a genuine
-data-dependent branch, a plain `JMP` for a resolved opaque predicate or single-case dispatch, a
-recomputed direct `call` for anything that calls out) rather than relying on layout adjacency, so
-correctness never depends on how blocks happen to be ordered. **Nothing else in the binary is
-touched** — every other address (dead code, and the block below) keeps its exact original bytes;
-only `[entry point, entry point + rebuilt size)` changes. This intentionally does *not* relocate
-code to a new segment: a freshly-added IDA segment has no backing in the actual executable file
-or process memory, so a jump to one wouldn't go anywhere real at runtime — the rebuilt code has
-to fit starting at the entry point instead. That available space isn't just the trace's own
-real/dead bytes packed with zero gaps (a real obfuscated function's blocks are rarely that
-tightly arranged) — it also crosses ordinary unexplored gaps between them, up to the furthest
-address any block the trace examined (real, dead, or unresolved) reached, as long as each gap
-byte/item isn't already claimed by a *different*, already-recognized IDA function and has no
-incoming xref (code or data) from an address genuinely outside every block this trace ever
-examined in any verdict (real, dead, *or* unresolved) — either of those stops the search right
-there rather than risk eating into something else. That last part matters for flattening-style
-obfuscation specifically: decoy/junk blocks routinely cross-reference *each other* without any of
-them ever being individually walked as real or dead (nothing reachable ever led the trace to
-them), so an xref from another address the trace simply never classified is not, by itself,
-evidence of anything external — only an xref from truly outside the whole span this trace looked
-at is treated that way. An UNRESOLVED block's own range is always excluded from the available
-space outright, never crossed.
-
-A block cannot always be safely relocated: one using RIP-relative addressing (a copy elsewhere
-would compute the wrong address, since RIP-relative displacements are relative to the next
-instruction, which moves) or an indirect jump with more than one genuinely real case (rewriting a
-live jump table is out of scope) is left at its original address, untouched, rather than
-guessed at — **provided** that address, and every relocated block's reference to it, falls
-outside the rebuilt range. If the entry block itself can't be relocated, if an unrelocatable
-block or its target *does* fall inside the rebuilt range, or if the rebuild simply doesn't fit in
-the available space, the whole operation is refused with a specific reason rather than producing
-a partially-correct result — nothing is written in that case. A "doesn't fit" refusal names the
-exact address the available-space search stopped at and why (hit a different function, hit
-something referenced from outside this trace, or simply reached the furthest address the trace
-ever explored), so it can actually be diagnosed rather than just reporting two byte counts.
-
-Blocks the model never gave a verdict for, addresses it invented outside the actual candidates,
-and conflicting REAL/DEAD verdicts for the same address reached from different paths are all
-surfaced as UNRESOLVED rather than silently resolved one way or the other, so you can just
-review those manually rather than trust a guess. The same applies to the constant-propagation
-pass: it only ever resolves a branch when it's actually confident (a concrete value it computed,
-or a value it can positively attribute to runtime/caller data) — anything it isn't sure about
-still falls back to the LLM rather than guessing.
-
-**Loops and re-entered dispatchers** are handled specially, since a flattening dispatcher is
-typically revisited every loop iteration with a *different* state value — a snapshot that
-confidently resolves one case as real and the rest as dead on the first pass can be wrong for
-every other pass. The trace detects both directions of this: a candidate that loops back to an
-earlier block in the same trace is flagged for the LLM instead of being auto-resolved by the
-constant-propagation pass (a value that looks fixed on this one pass through a loop isn't
-necessarily fixed on every pass), and if a dispatcher block already fully decided gets reached
-again from a *different* real block later in the trace — the loop-revisit pattern — any of its
-successors previously marked dead are automatically un-marked and moved to UNRESOLVED for
-review, rather than staying permanently (and possibly wrongly) dead.
-
-**Overlapping instructions** are refused rather than silently walked over. Obfuscators
-sometimes rely on the same bytes decoding differently depending on where you start reading them
-— a later-discovered target can land strictly inside an instruction a different block earlier
-in the *same* trace already fixed up in the database. Naively re-walking from that address would
-call IDA's own `del_items`, which deletes the *whole* item covering any address passed to it —
-silently destroying the earlier block's already-established boundary, even though that earlier
-block might already be confirmed real. The trace tracks every instruction address it has claimed
-across the whole run and refuses to touch the database at a strict-overlap address at all,
-flagging it UNRESOLVED for manual review instead of guessing which interpretation of the
-overlapping bytes is the real one. Re-walking from the *exact* same start address (an ordinary
-merge point, not an overlap) is unaffected.
-
-**Constant-propagation pass limitations** (falls back to the LLM for these, same as if the
-feature were off): x86/x64 only; indexed/scaled memory addressing (`[rcx+rdx*4]`,
-`[rax*8+table]`) is supported for reads but never round-trip-tracked through writes; a `call`'s
-effect on registers/memory isn't tracked precisely — its results are treated as genuine
-runtime data (same as an incoming argument), which resolves an ordinary
-`if (helper_call(...))`-shaped branch without an LLM call, but means the pass can't reason
-through a call to derive a fixed value; only
-`mov`/`movzx`/`movsx(d)`/`lea`/`add`/`sub`/`and`/`or`/`xor`/`not`/`neg`/`inc`/`dec`/`shl`/`shr`/
-`sar`/`cmp`/`test`/`push`/`pop`/`nop` are modeled — anything else resets tracking for that path.
-`and`/`or`/`xor`/`test` additionally resolve unsigned and signed relational jumps
-(`ja`/`jae`/`jb`/`jbe`/`jg`/`jge`/`jl`/`jle`, `jo`/`jno`, and aliases) directly from their result,
-since those four instructions architecturally guarantee the overflow and carry flags are cleared
-— `add`/`sub`/shifts/`neg` do not get this, since their overflow/carry genuinely depends on the
-operands. `inc`/`dec` are a partial exception: real x86 never touches the carry flag for `inc`/
-`dec` at all (only the overflow/zero/sign flags change), so a carry-flag guarantee from an
-earlier `and`/`or`/`xor`/`test` survives an `inc`/`dec` in between, while the overflow-flag
-guarantee correctly does not (it genuinely can be set at the signed range boundary). `jae`/`jnb`/
-`jnc`, `jb`/`jc`/`jnae`, and `jo`/`jno` resolve from their single relevant flag guarantee alone —
-each of those conditions is purely "that one flag is 0" or "is 1", so the outcome is fixed
-regardless of whether the actual result is even known; `ja`/`jbe` and their aliases also depend
-on the zero flag, so they still need a known value. `jp`/`jpe`/`jnp`/`jpo` (parity) resolve
-directly from a known concrete result's low byte, the same way `jz`/`js` already do, needing no
-flag guarantee at all. A shift is masked to the count real x86 actually uses before doing
-anything else — 5 bits for an 8/16/32-bit operand, 6 bits only for a 64-bit one (so e.g.
-`shl eax, 32` is a genuine no-op, not "shift by 32") — and a masked count of `0` is treated as the
-complete no-op it is on real hardware (the Intel SDM: "if the count is 0, the flags are not
-affected") rather than resetting tracking — an obfuscator inserting one specifically to break
-naive flag tracking (e.g. `or reg, 0` then `shl reg, 0` before a relational jump) does not get
-away with it.
-
-**Per-edge value narrowing**: a very common obfuscation trick chains several condition codes
-back to back, separated only by flag-preserving junk (`nop`, a self-move, etc.), so they all
-actually test the *same* underlying result rather than being independent checks. The first test
-in such a chain is often a genuine data-dependent bit check (e.g. `and reg, 1` on a caller-
-supplied value, then `jz`) — correctly real on both sides, since the caller's input decides which
-way it goes. But having taken the "nonzero" side of a *single-bit* `and reg, mask` test, `reg` is
-now provably exactly `mask` on that specific path — not just "some unknown nonzero value" —
-regardless of what the original input actually was. The pass carries this forward: a subsequent
-relational jump reached via flag-preserving instructions only, with no intervening comparison,
-resolves against that narrowed concrete value instead of continuing to treat it as external. This
-is deliberately narrow (one bit, `and` specifically, only through `jz`/`je`/`jnz`/`jne`) rather
-than a general value-range/constraint solver — anything wider still falls back to the LLM.
-
-A second, more general per-edge narrowing covers a different, equally common trick: testing the
-*same* flag twice with opposite senses through flag-preserving junk in between, both sides landing
-on the same target — e.g. `js target; nop; jns target`. Neither half looks resolvable in isolation
-if the underlying flag is genuinely data-dependent, but the pair is a tautology: reaching the
-second test at all already proves what its own condition's outcome must be (SF was 0 to fall
-through the first, so the second — testing SF=0 — is unconditionally taken), regardless of what
-determined the flag or how the first branch's own verdict was reached (constant propagation or the
-LLM). This applies to any of the standard condition-code pairs (`jz`/`jnz`, `ja`/`jbe`, `jg`/`jle`,
-`jo`/`jno`, etc.), not just `js`/`jns`, and is invalidated automatically the moment anything between
-the two actually changes the flags — no separate bookkeeping needed to "remember" that.
-
-Disable "Resolve CFG trace branches via constant propagation" in Settings to force every
-decision point through the LLM as before.
+Results are cached for the session (**Load Cached Result**), and any in-place/rebuild patch is revertible with **Undo Patches**. Opt-in *Enumerate ARM64 computed jump tables* (experimental) recovers `*(base + i*stride + field)` dispatch handlers.
 
 ## Configuration
 
-Open **Edit → Plugins → LLM Explainer** to configure:
+**Edit → Plugins → LLM Explainer.** Persisted as `llm_explainer.cfg.json` in your IDA user dir. Key settings:
 
 | Setting | Default | Notes |
 |---|---|---|
-| Server base URL(s) | `http://127.0.0.1:8080` | One `llama-server` endpoint per line, in priority order, with an optional `# name` comment (e.g. `http://127.0.0.1:8080  # Home GPU`) shown in status/log messages instead of the raw URL; batch/recursive explain distributes work across all of them concurrently, and any single request automatically falls back to the next server on connection failure |
-| Model name | *(blank)* | Only needed if your server hosts multiple models |
-| API key | *(blank)* | Optional bearer token |
-| Temperature | `0.2` | |
-| Max tokens | `16384` | Reasoning models can spend thousands of tokens thinking before answering — keep this generous |
-| Request timeout (s) | `300` | Per-chunk socket timeout, not a total-generation cap |
-| Max context chars | `12000` | Per-function truncation budget |
-| Include called-function names | on | |
-| Max callees listed | `20` | |
-| Include referenced strings/globals | on | |
-| Max data refs listed | `20` | |
-| Max string length shown | `150` | |
-| Follow calls depth | `0` | `0` = target function only; `N>0` eagerly includes N levels of callee code |
-| Max total context chars | `40000` | Overall budget when following calls |
-| Max on-demand code requests | `5` | Cap on automatic `REQUEST_CODE` round-trips per conversation |
-| Max recursive callees | `10` | Cap on direct callees processed by the recursive auto-accept action |
-| Explain hotkey | `Ctrl-Alt-E` | |
-| System prompt | *(editable)* | Governs the whole protocol below |
-| Max CFG trace blocks | `200` | Safety cap on blocks decoded per CFG trace run; hitting it stops with a partial result |
-| Resolve CFG trace branches via constant propagation | on | Tries a fast, deterministic symbolic pass (x86/x64 only) before asking the LLM at each decision point; disable to always ask the LLM |
-| CFG trace colors | green / red / amber | Disassembly background colors for REAL / DEAD / UNRESOLVED blocks (`#RRGGBB`) |
-| CFG trace system prompt | *(editable)* | Governs the REAL_TARGET/DEAD_TARGET/UNRESOLVED_TARGET protocol used by CFG tracing |
+| Server base URL(s) | `http://127.0.0.1:8080` | One endpoint per line, priority order, optional `# name`; batch runs across all, with failover |
+| Model / API key | *(blank)* | Only if your server needs them |
+| Temperature / Max tokens | `0.2` / `16384` | Keep tokens generous for reasoning models |
+| Follow calls depth | `0` | `N>0` eagerly includes N levels of callee code |
+| Max recursive callees | `10` | Cap for the recursive auto-accept action |
+| System prompt(s) | *(editable)* | Explain + CFG-trace protocols |
+| Resolve branches via constant propagation | on | Fast deterministic pass before the LLM (disable to always ask) |
+| Enumerate ARM64 computed jump tables | off | Experimental; see above |
+| CFG trace colors / Max blocks | green/red/amber, `200` | REAL / DEAD / UNRESOLVED |
 
-A **Restore Defaults** button resets the form (not saved until you click OK). Settings persist
-as JSON under your IDA user directory (`llm_explainer.cfg.json`).
+Saved prompts auto-update to the current default when you haven't customized them, so plugin updates take effect without editing the config.
 
-## The prompt protocol
+## Prompt protocol
 
-The system prompt teaches the model a small text protocol so the plugin can parse structured
-suggestions out of an otherwise free-form answer:
+The system prompt asks the model to emit structured lines the plugin parses out of its free-form answer:
 
-- `REQUEST_CODE: <function name or address>` — ask for a called function's code before
-  answering (handled automatically, looping up to the configured limit).
-- `SUGGESTED_NAME: <name>` — a proposed function name.
-- `SUGGESTED_SIGNATURE: <C declaration>` — a proposed return type + argument types/names
-  (Hex-Rays pseudocode only).
-- `SUGGESTED_VAR: <old> -> <new>` — a proposed local variable rename (Hex-Rays pseudocode only,
-  one per line).
-- `SUGGESTED_CALLEE_NAME: <name-or-address> -> <new name>` — a proposed rename for a *called*
-  function, only accepted if its code was actually shown to the model this conversation and its
-  current name still looks auto-generated (`sub_`/`loc_`/`j_...`).
-- `SUGGESTED_STRUCT: <C struct declaration>` — a proposed structure type (Hex-Rays pseudocode
-  only), registered into the local types library on Accept.
-- `SUGGESTED_VAR_TYPE: <var> <type expression>` — applies a type (e.g. a newly suggested struct
-  pointer) to a local variable; for function arguments, the type is folded directly into
-  `SUGGESTED_SIGNATURE` instead.
+| Marker | Purpose |
+|---|---|
+| `REQUEST_CODE: <fn>` | fetch a callee's code before answering (automatic) |
+| `SUGGESTED_NAME: <name>` | function name |
+| `SUGGESTED_SIGNATURE: <decl>` | prototype (Hex-Rays only) |
+| `SUGGESTED_VAR: <old> -> <new>` | local rename (Hex-Rays only) |
+| `SUGGESTED_CALLEE_NAME: <fn> -> <new>` | rename a callee whose code was shown |
+| `SUGGESTED_GLOBAL_NAME: <g> -> <new>` | rename a referenced global/data variable |
+| `SUGGESTED_REANALYZE: <fn> - <why>` | flag an already-named callee for re-analysis (recursive scan) |
+| `SUGGESTED_STRUCT: <decl>` | define + register a struct type |
+| `SUGGESTED_VAR_TYPE: <var> <type>` | apply a type to a local |
 
-The final answer itself is kept to one short sentence, since it's written verbatim into the
-function's comment.
+The prose answer itself is kept to one sentence — it becomes the function comment.
+
+![Trace/Recover CFG live view](tracer.png)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Copyright
-
-© 2026 Peter Garba
+MIT — see [LICENSE](LICENSE). © 2026 Peter Garba

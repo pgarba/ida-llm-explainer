@@ -4,7 +4,7 @@
   "plugin": {
     "name": "llm-explainer",
     "entryPoint": "llm_explainer.py",
-    "version": "1.3.0",
+    "version": "1.6.0",
     "idaVersions": ["9.3"],
     "description": "Explains functions using a local llama.cpp LLM - proposes renames, types, and structs, all human-reviewed before anything is written.",
     "license": "MIT",
