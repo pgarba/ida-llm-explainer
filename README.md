@@ -33,7 +33,7 @@ Copy `llm_explainer.py` into `<IDA user dir>\plugins\` (Windows: `%APPDATA%\Hex-
 
 ![Batch mode with a local Qwen model](qwen_ida.png)
 
-*Batch mode with auto-apply working through a heavily protected x64 binary, powered by a local Qwen model: stub after stub is named, typed and commented the moment it finishes, while llama.cpp's speculative decoding (~94% draft acceptance, ~200 tokens/s) keeps the queue moving.*
+*Batch mode with auto-apply working through a heavily protected x64 binary, powered by a local Qwen model: stub after stub is named, typed and commented the moment it finishes, while llama.cpp's speculative decoding (~94% draft acceptance, ~200 tokens/s) keeps the queue moving — all on consumer hardware (Ryzen 9 9950X, 64 GB DDR5-6000, Radeon RX 7900 XTX 24 GB).*
 
 ## CFG patching modes
 
