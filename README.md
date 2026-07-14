@@ -31,6 +31,10 @@ Copy `llm_explainer.py` into `<IDA user dir>\plugins\` (Windows: `%APPDATA%\Hex-
 - **Recursive** — right-click → *Explain function with LLM (recursively)…*. Auto-applies; capped by *Max recursive callees*; writes unattended, so use with care.
 - **CFG recovery** — disassembly view → *Trace/Recover CFG…*, pick a start address, watch the live transcript/graph, then review each block and pick an **On Accept** mode.
 
+![Batch mode with a local Qwen model](qwen_ida.png)
+
+*Batch mode with auto-apply working through a heavily protected x64 binary, powered by a local Qwen model: stub after stub is named, typed and commented the moment it finishes, while llama.cpp's speculative decoding (~94% draft acceptance, ~200 tokens/s) keeps the queue moving.*
+
 ## CFG patching modes
 
 Chosen on the review screen (all re-verify actual bytes before touching anything, and refuse rather than guess):
