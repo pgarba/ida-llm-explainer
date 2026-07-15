@@ -173,7 +173,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.7.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -227,6 +227,18 @@ DEFAULT_SYSTEM_PROMPT = (
     "would not change your answer, such as a bare logging call) - not "
     "merely because you have a plausible guess. Never request the same "
     "function twice.\n\n"
+    "You may also ask to see the target function's own CALLERS when its "
+    "parameter types or purpose are ambiguous from the body alone but would "
+    "be obvious from the concrete arguments passed at a real call site (a "
+    "string literal, a length constant, a specific struct pointer, etc.). "
+    "Reply with a line of the exact form\n"
+    "REQUEST_CALLERS\n"
+    "(optionally REQUEST_CALLERS: <function name or address> to inspect the "
+    "callers of some other function instead of the current one), and nothing "
+    "else in that reply. You will be given a few callers' code and can then "
+    "give a much better SUGGESTED_SIGNATURE. This counts against the same "
+    "request budget as REQUEST_CODE, so ask only when the call site would "
+    "genuinely resolve the ambiguity.\n\n"
     "Once you have enough information, work through ALL FIVE of the "
     "following steps before writing your final answer. These are a "
     "required part of a thorough analysis, not optional extras to drop "
@@ -245,6 +257,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "exact form\n"
     "SUGGESTED_SIGNATURE: <full C declaration>\n"
     "e.g. SUGGESTED_SIGNATURE: int __cdecl parse_header(char *buf, int len)\n"
+    "Give ONLY the single new declaration on this line - not the old one, "
+    "and never a 'before -> after' pair; do not write an arrow (->) on the "
+    "SUGGESTED_SIGNATURE line. "
     "This prototype is the AUTHORITATIVE source for every ARGUMENT's type, "
     "so give each argument a specific, correct type inferred from how the "
     "code actually uses it - a string pointer as char *, a raw byte buffer "
@@ -254,6 +269,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "(e.g. __int128 * or _OWORD * for what is really a char * or a struct "
     "pointer, or a bare __int64 for what is really a pointer or handle); "
     "correct those to the real type in this signature. "
+    "Decisive rule: any argument that is used in ADDRESS arithmetic (e.g. "
+    "arg + n or arg - other to form an address), dereferenced, indexed, or "
+    "stored into a pointer slot IS a pointer - never leave such an argument "
+    "as __int64/int64_t. Type it as char * when it points at text (in "
+    "particular when a caller passes a string literal for it - use "
+    "REQUEST_CALLERS to check the call sites if you are unsure whether an "
+    "opaque integer argument is really a string or struct pointer), as a "
+    "struct * when it points at a structure, or as void */BYTE * for a raw "
+    "byte buffer; a value used only as a size or count is size_t or int. "
     "and propose a rename for EVERY local variable (not arguments) whose "
     "default compiler-generated name (e.g. v1, v2, a1) could be more "
     "descriptive - go through each local variable in the code one by one "
@@ -336,15 +360,32 @@ DEFAULT_SYSTEM_PROMPT = (
     "line per local variable of the exact form\n"
     "SUGGESTED_VAR_TYPE: <current_variable_name> <type expression>\n"
     "e.g. SUGGESTED_VAR_TYPE: v3 tagPOINT *\n\n"
+    "6. If a small helper copies or returns a FIXED number of bytes taken "
+    "from a larger packed string blob - e.g. get_partial_string(dst, blob, "
+    "6) that carves \"REFLEX\" out of the front of one big concatenated "
+    "string literal, the classic obfuscated/merged string-table pattern "
+    "where many short strings share one blob and each call passes a pointer "
+    "into it plus a length - identify that helper and which of its "
+    "arguments is the source POINTER and which is the byte COUNT (1-based "
+    "positions, counting the leftmost argument as 1). Add one line of the "
+    "exact form\n"
+    "SUGGESTED_STRING_EXTRACTOR: <helper name or address> ptr=<n> len=<m>\n"
+    "e.g. SUGGESTED_STRING_EXTRACTOR: get_partial_string ptr=2 len=3 (the "
+    "pointer is argument 2, the length is argument 3). Emit this ONCE per "
+    "such helper, not once per call - the plugin then reads the constant "
+    "pointer and length from every call site itself and defines each carved "
+    "substring as a string. Only do this when the helper really does slice "
+    "a fixed-length chunk out of a shared string blob; do not use it for an "
+    "ordinary strcpy/memcpy of a whole, individually-defined string.\n\n"
     "Only propose something you are reasonably confident about from the "
     "code itself, never a guess. Steps 2 and 5 (SUGGESTED_SIGNATURE, "
     "SUGGESTED_VAR, SUGGESTED_LABEL, SUGGESTED_STRUCT, SUGGESTED_VAR_TYPE) require the "
     "target function's own code to have been given as Hex-Rays "
     "pseudocode - skip them entirely when you were given plain "
-    "disassembly instead. Steps 1, 3 and 4 (SUGGESTED_NAME, "
-    "SUGGESTED_CALLEE_NAME, SUGGESTED_GLOBAL_NAME) apply to disassembly "
-    "too. Otherwise, do not leave a step out merely to save effort or "
-    "keep the response short.\n\n"
+    "disassembly instead. Steps 1, 3, 4 and 6 (SUGGESTED_NAME, "
+    "SUGGESTED_CALLEE_NAME, SUGGESTED_GLOBAL_NAME, SUGGESTED_STRING_EXTRACTOR) "
+    "apply to disassembly too. Otherwise, do not leave a step out merely to "
+    "save effort or keep the response short.\n\n"
     "Finally, give your final answer as exactly ONE short sentence (no "
     "more than ~20 words) stating precisely what the target function does "
     "- its core purpose only, not a step-by-step walkthrough. Do not "
@@ -352,7 +393,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "or bullet points. This sentence will be written verbatim into an IDA "
     "function comment, so keep it self-contained and free of REQUEST_CODE "
     "lines. Keeping this sentence short does NOT mean doing less of steps "
-    "1-5 above - list every SUGGESTED_* line that applies below your "
+    "1-6 above - list every SUGGESTED_* line that applies below your "
     "one-sentence answer; only the prose explanation itself needs to be "
     "brief. If asked for more detail in a follow-up, you may then answer "
     "at greater length."
@@ -523,6 +564,7 @@ DEFAULT_CONFIG = {
     "follow_calls_depth": 0,
     "max_total_context_chars": 40000,
     "max_auto_fetch": 5,
+    "max_caller_refs": 3,
     "include_data_refs": True,
     "max_data_refs": 20,
     "max_string_len": 150,
@@ -592,6 +634,11 @@ ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
 _MAX_EAGER_FUNCTIONS = 40
 
 _REQUEST_CODE_RE = re.compile(r"(?im)^\s*REQUEST_CODE:\s*(.+?)\s*$")
+# REQUEST_CALLERS[: <optional function name/address>] - fetch the pseudocode
+# of functions that CALL the target (default: the function being explained),
+# so the model can see the concrete argument values passed at real call
+# sites and infer parameter types/purpose it can't tell from the body alone.
+_REQUEST_CALLERS_RE = re.compile(r"(?im)^\s*REQUEST_CALLERS\b:?[ \t]*(.*?)\s*$")
 _SUGGESTED_NAME_RE = re.compile(r"(?im)^\s*SUGGESTED_NAME:\s*(.+?)\s*$")
 _SUGGESTED_SIGNATURE_RE = re.compile(r"(?im)^\s*SUGGESTED_SIGNATURE:\s*(.+?)\s*$")
 _SUGGESTED_VAR_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR:\s*([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*$")
@@ -604,6 +651,17 @@ _SUGGESTED_GLOBAL_NAME_RE = re.compile(
 )
 _SUGGESTED_STRUCT_RE = re.compile(r"(?im)^\s*SUGGESTED_STRUCT:\s*(.+?)\s*$")
 _SUGGESTED_VAR_TYPE_RE = re.compile(r"(?im)^\s*SUGGESTED_VAR_TYPE:\s*([A-Za-z_]\w*)\s+(.+?)\s*$")
+# SUGGESTED_STRING_EXTRACTOR: <helper name or address> ptr=<n> len=<m> - the
+# model recognized a helper that copies a fixed number of bytes out of a
+# packed string blob (e.g. get_partial_string(dst, blob, 6) -> "REFLEX"),
+# where argument #n (1-based) is the source pointer and #m is the byte
+# count. The plugin then reads the constant pointer/length from EVERY call
+# site and defines the carved substring as a string literal. The ptr=/len=
+# tokens may appear in either order; the rest of the line is the helper
+# query. See _extract_partial_strings.
+_SUGGESTED_STRING_EXTRACTOR_RE = re.compile(r"(?im)^\s*SUGGESTED_STRING_EXTRACTOR:\s*(.+?)\s*$")
+_STRING_EXTRACTOR_PTR_RE = re.compile(r"(?i)\bptr\s*=\s*(\d+)")
+_STRING_EXTRACTOR_LEN_RE = re.compile(r"(?i)\blen\s*=\s*(\d+)")
 # SUGGESTED_REANALYZE: <callee name or address> [- <why>] - the model
 # believes an already-named callee's current name is likely wrong/stale
 # and wants it re-examined. Only acted on by the recursive scan (it queues
@@ -927,12 +985,19 @@ def _resolve_func(ctx):
 
 def _dedupe_name(desired, taken):
     """Return `desired` if it isn't in the `taken` set, otherwise the first
-    of desired_1, desired_2, ... that is free. Used so two locals the
-    model wants to give the same descriptive name to (or a name that
-    collides with an existing local it left alone) don't fail the second
-    rename outright - IDA forbids two locals sharing a name."""
+    free variant. Used so two locals the model wants to give the same
+    descriptive name to (or a name that collides with an existing local it
+    left alone) don't fail the second rename outright - IDA forbids two
+    locals sharing a name.
+
+    The first fallback is a single trailing underscore (req_ctx ->
+    req_ctx_): the conventional "this name is already taken" tweak, and
+    tidier than a number for the common single-collision case. Only if that
+    is also taken does it fall back to desired_1, desired_2, ..."""
     if desired not in taken:
         return desired
+    if (desired + "_") not in taken:
+        return desired + "_"
     i = 1
     while ("%s_%d" % (desired, i)) in taken:
         i += 1
@@ -1183,6 +1248,83 @@ def _tinfo_is_empty(tif):
         return True
 
 
+def _lvar_loc_is_concrete(loc):
+    """True if a vdloc_t names a real, rematchable storage location - a
+    stack slot, a register, a scattered location, etc. An empty/unset
+    location (atype ALOC_NONE == 0) - the kind that prints as 'at ?' in
+    Hex-Rays' "variable defea=... could not be found" warning - returns
+    False. This matters for orphan detection: two empty locations compare
+    equal, so without this guard a genuinely dead saved entry would
+    spuriously 'match' some current local that also has no location and be
+    kept forever. Any binding quirk is treated as non-concrete."""
+    try:
+        return loc.atype() != 0
+    except Exception:
+        return False
+
+
+def _prune_orphaned_user_lvars(func_ea):
+    """Remove saved user-lvar name/type overrides whose variable no longer
+    exists in the current decompilation. Applying a new prototype or lvar
+    type re-decomposes the locals, so an override saved by an earlier run
+    against the old layout can end up pointing at a definition site (defea)
+    and location that are both gone. Hex-Rays then prints
+    "<ea>: variable defea=... at ? could not be found" on every subsequent
+    decompile. Dropping the dead entries silences that and stops them
+    accumulating in the database.
+
+    Conservative on purpose: an entry is dropped only when its defea is
+    absent AND it has no CONCRETE location matching a current local. A live
+    override whose defea merely shifted while its stack/register slot stayed
+    put - which Hex-Rays still resolves by location (e.g. a renamed BYREF
+    stack array after a prototype change) - is therefore preserved. Runs on
+    every apply, not just when a signature changes, so orphans left by
+    earlier plugin versions or past sessions also get cleaned up."""
+    if ida_hexrays is None:
+        return
+    # Best-effort cleanup - must never raise back into the apply flow.
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return
+        ida_hexrays.mark_cfunc_dirty(func_ea)
+        cfunc = ida_hexrays.decompile(func_ea)
+        if cfunc is None:
+            return
+        lvars = cfunc.get_lvars()
+        current_defeas = {lv.defea for lv in lvars}
+        current_locs = [lv.location for lv in lvars if _lvar_loc_is_concrete(lv.location)]
+
+        lvinf = ida_hexrays.lvar_uservec_t()
+        if not ida_hexrays.restore_user_lvar_settings(lvinf, func_ea):
+            return  # nothing saved -> nothing to prune
+        old = lvinf.lvvec
+        new_vec = ida_hexrays.lvar_saved_infos_t()
+        dropped = 0
+        for i in range(old.size()):
+            si = old.at(i)
+            # A BADADDR defea is a location-only wildcard Hex-Rays resolves
+            # by location alone, so it's never considered orphaned here.
+            defea_ok = si.ll.defea == idaapi.BADADDR or si.ll.defea in current_defeas
+            loc_ok = _lvar_loc_is_concrete(si.ll.location) and any(
+                si.ll.location == loc for loc in current_locs
+            )
+            if not defea_ok and not loc_ok:
+                dropped += 1
+                continue
+            new_vec.push_back(si)
+        if not dropped:
+            return
+        lvinf.lvvec = new_vec
+        ida_hexrays.save_user_lvar_settings(func_ea, lvinf)
+        ida_hexrays.mark_cfunc_dirty(func_ea)
+    except Exception:
+        import traceback
+        ida_kernwin.msg(
+            "[%s] Could not prune orphaned lvar settings:\n%s\n"
+            % (PLUGIN_NAME, traceback.format_exc())
+        )
+
+
 def _clear_arg_type_overrides(func_ea):
     """Drop any saved user-defined TYPE override on the function's
     ARGUMENTS, so a freshly applied prototype's argument types are what the
@@ -1272,6 +1414,50 @@ def _set_lvar_type(func_ea, var_name, type_str):
     return ida_hexrays.modify_user_lvar_info(func_ea, ida_hexrays.MLI_TYPE, info)
 
 
+def _apply_function_signature(func_ea, signature):
+    """Apply a C prototype to func_ea, returning True on success. Tries
+    idc.SetType first (handles most declarations), then falls back to an
+    explicit parse_decl + apply_tinfo, which accepts some prototypes
+    SetType's terse path rejects and, more importantly, surfaces the
+    concrete reason a declaration failed instead of silently echoing it
+    back."""
+    decl = (signature or "").strip()
+    if not decl:
+        return False
+    if not decl.endswith(";"):
+        decl += ";"
+    try:
+        if idc.SetType(func_ea, decl):
+            return True
+    except Exception as exc:
+        ida_kernwin.msg("[%s] SetType raised for '%s': %s\n" % (PLUGIN_NAME, signature, exc))
+
+    # Fallback: parse the declaration ourselves and apply the resulting type.
+    try:
+        tif = ida_typeinf.tinfo_t()
+        parsed = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+        if parsed is None:
+            ida_kernwin.msg(
+                "[%s] Could not apply signature - '%s' is not a valid C "
+                "declaration (a type name it uses may be undefined).\n"
+                % (PLUGIN_NAME, decl)
+            )
+            return False
+        if not tif.is_func():
+            ida_kernwin.msg(
+                "[%s] Could not apply signature - '%s' did not parse as a "
+                "function prototype.\n" % (PLUGIN_NAME, decl)
+            )
+            return False
+        if ida_typeinf.apply_tinfo(func_ea, tif, ida_typeinf.TINFO_DEFINITE):
+            return True
+        ida_kernwin.msg("[%s] apply_tinfo rejected signature '%s'.\n" % (PLUGIN_NAME, decl))
+        return False
+    except Exception as exc:
+        ida_kernwin.msg("[%s] Failed to apply signature '%s': %s\n" % (PLUGIN_NAME, signature, exc))
+        return False
+
+
 def _apply_var_types(func_ea, var_types):
     if not var_types or ida_hexrays is None:
         return
@@ -1293,9 +1479,199 @@ def _apply_var_types(func_ea, var_types):
             )
 
 
+def _callexpr_target_ea(call_expr):
+    """The function address a cot_call targets, or BADADDR if it's not a
+    plain direct call to a known address (an indirect/register call)."""
+    x = call_expr.x
+    while x is not None and x.op == ida_hexrays.cot_cast:
+        x = x.x
+    if x is not None and x.op == ida_hexrays.cot_obj:
+        return x.obj_ea
+    return idaapi.BADADDR
+
+
+def _expr_const_int(e):
+    """Constant integer value of a ctree expression (through casts), or None
+    if it isn't a compile-time constant."""
+    while e is not None and e.op == ida_hexrays.cot_cast:
+        e = e.x
+    if e is not None and e.op == ida_hexrays.cot_num:
+        try:
+            return e.numval()
+        except Exception:
+            return None
+    return None
+
+
+def _expr_effective_addr(e):
+    """Resolve a pointer-valued call argument to the data address it points
+    at, for the constant forms these string-table helpers are called with:
+    &global, a decayed array, &array[k], or base + k. Returns None for
+    anything non-constant (a computed/register pointer we can't carve).
+
+    cot_idx/cot_add offsets are treated as BYTE offsets - correct for the
+    char blobs these helpers index; a wider element type would need scaling
+    that these packed-string tables never use."""
+    if e is None:
+        return None
+    op = e.op
+    if op == ida_hexrays.cot_cast or op == ida_hexrays.cot_ref:
+        return _expr_effective_addr(e.x)
+    if op == ida_hexrays.cot_obj:
+        return e.obj_ea
+    if op in (ida_hexrays.cot_add, ida_hexrays.cot_idx):
+        base = _expr_effective_addr(e.x)
+        off = _expr_const_int(e.y)
+        if base is not None and off is not None:
+            return base + off
+        if op == ida_hexrays.cot_add:  # commutative: try base + offset swapped
+            base = _expr_effective_addr(e.y)
+            off = _expr_const_int(e.x)
+            if base is not None and off is not None:
+                return base + off
+    return None
+
+
+def _make_partial_string(ea, length):
+    """Define a length-byte C string literal at ea and attach the decoded
+    text as a repeatable comment (so it shows inline in both disassembly and
+    pseudocode). Returns (ea, length, text) or None if the bytes aren't
+    available. Keeps the comment even when create_strlit fails (e.g. the
+    range overlaps an existing item)."""
+    if not ida_bytes.is_loaded(ea):
+        return None
+    raw = ida_bytes.get_bytes(ea, length)
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace")
+    try:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, length)
+    except Exception:
+        pass
+    try:
+        ida_bytes.create_strlit(ea, length, ida_nalt.STRTYPE_C)
+    except Exception:
+        pass
+    try:
+        ida_bytes.set_cmt(ea, text, 1)  # 1 == repeatable
+    except Exception:
+        pass
+    return (ea, length, text)
+
+
+def _extract_partial_strings(helper_ea, ptr_idx, len_idx, max_len=4096):
+    """Walk every call to the substring-extractor helper at helper_ea and,
+    wherever the source pointer (1-based argument ptr_idx) and byte count
+    (argument len_idx) are both compile-time constants, define the carved
+    substring as a string literal. Returns the list of (ea, length, text)
+    actually created, de-duplicated by (address, length)."""
+    created = []
+    if ida_hexrays is None:
+        return created
+    try:
+        if not ida_hexrays.init_hexrays_plugin():
+            return created
+    except Exception:
+        return created
+    pi, li = ptr_idx - 1, len_idx - 1
+    if pi < 0 or li < 0:
+        return created
+
+    caller_eas = set()
+    try:
+        for xref in idautils.XrefsTo(helper_ea, 0):
+            if xref.iscode:
+                caller = ida_funcs.get_func(xref.frm)
+                if caller is not None:
+                    caller_eas.add(caller.start_ea)
+    except Exception:
+        pass
+
+    class _CallSiteCollector(ida_hexrays.ctree_visitor_t):
+        def __init__(self):
+            ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+            self.calls = []
+
+        def visit_expr(self, e):
+            if e.op == ida_hexrays.cot_call and _callexpr_target_ea(e) == helper_ea:
+                self.calls.append(e)
+            return 0
+
+    seen = set()
+    for caller_ea in sorted(caller_eas):
+        try:
+            cfunc = ida_hexrays.decompile(caller_ea)
+        except Exception:
+            cfunc = None
+        if cfunc is None:
+            continue
+        collector = _CallSiteCollector()
+        try:
+            collector.apply_to(cfunc.body, None)
+        except Exception:
+            continue
+        made_here = False
+        for call_expr in collector.calls:
+            args = call_expr.a
+            if args is None or args.size() <= max(pi, li):
+                continue
+            ptr_ea = _expr_effective_addr(args[pi])
+            length = _expr_const_int(args[li])
+            if ptr_ea is None or ptr_ea == idaapi.BADADDR:
+                continue
+            if length is None or length <= 0 or length > max_len:
+                continue
+            if (ptr_ea, length) in seen:
+                continue
+            seen.add((ptr_ea, length))
+            made = _make_partial_string(ptr_ea, length)
+            if made is not None:
+                created.append(made)
+                made_here = True
+        # This caller was decompiled from its PRE-carve bytes above and
+        # cached; invalidate it so its pseudocode re-renders the now-shortened
+        # string literals (disassembly/Strings view read the DB directly and
+        # already show them - only Hex-Rays serves from the cfunc cache).
+        if made_here:
+            try:
+                ida_hexrays.mark_cfunc_dirty(caller_ea)
+            except Exception:
+                pass
+    return created
+
+
+def _apply_string_extractors(extractors):
+    """extractors: list of (helper_ea, ptr_idx, len_idx). Materializes the
+    carved strings for each and logs a short summary. Returns the total
+    number of strings created."""
+    if not extractors:
+        return 0
+    total = 0
+    for helper_ea, ptr_idx, len_idx in extractors:
+        try:
+            created = _extract_partial_strings(helper_ea, ptr_idx, len_idx)
+        except Exception as exc:
+            ida_kernwin.msg(
+                "[%s] String extractor at %#x failed: %s\n" % (PLUGIN_NAME, helper_ea, exc)
+            )
+            continue
+        total += len(created)
+        name = ida_funcs.get_func_name(helper_ea) or ("sub_%X" % helper_ea)
+        ida_kernwin.msg(
+            "[%s] String-table extractor %s (ptr=arg%d, len=arg%d): carved %d string(s).\n"
+            % (PLUGIN_NAME, name, ptr_idx, len_idx, len(created))
+        )
+        for ea, length, text in created:
+            preview = text if len(text) <= 48 else text[:48] + "..."
+            preview = preview.replace("\r", "\\r").replace("\n", "\\n")
+            ida_kernwin.msg("        %#x  (%d)  \"%s\"\n" % (ea, length, preview))
+    return total
+
+
 def _apply_suggestions_and_refresh(
     func_ea, comment, new_name=None, signature=None, var_renames=None, callee_renames=None,
     struct_decl=None, var_types=None, global_renames=None, label_renames=None,
+    string_extractors=None,
 ):
     # Struct creation must happen first: the signature and/or variable
     # types below may reference the new type by name, and need it to
@@ -1336,18 +1712,10 @@ def _apply_suggestions_and_refresh(
         ida_kernwin.msg("[%s] Failed to set comment: %s\n" % (PLUGIN_NAME, exc))
 
     if signature:
-        try:
-            decl = signature.strip()
-            if not decl.endswith(";"):
-                decl += ";"
-            if idc.SetType(func_ea, decl):
-                # The prototype owns argument types; make sure no stale user
-                # lvar type override shadows them in the pseudocode view.
-                _clear_arg_type_overrides(func_ea)
-            else:
-                ida_kernwin.msg("[%s] Failed to apply signature: %s\n" % (PLUGIN_NAME, signature))
-        except Exception as exc:
-            ida_kernwin.msg("[%s] Failed to apply signature '%s': %s\n" % (PLUGIN_NAME, signature, exc))
+        if _apply_function_signature(func_ea, signature):
+            # The prototype owns argument types; make sure no stale user
+            # lvar type override shadows them in the pseudocode view.
+            _clear_arg_type_overrides(func_ea)
 
     if new_name:
         try:
@@ -1383,6 +1751,19 @@ def _apply_suggestions_and_refresh(
                     )
             except Exception as exc:
                 ida_kernwin.msg("[%s] Failed to rename global variable: %s\n" % (PLUGIN_NAME, exc))
+
+    # Carve packed-string-table substrings out at every call site of any
+    # helper the model flagged. Independent of this function's own edits -
+    # it defines string literals across the callers of the helper.
+    if string_extractors:
+        _apply_string_extractors(string_extractors)
+
+    # Now that every name/type/signature change is in, drop any saved lvar
+    # override whose variable no longer exists - otherwise Hex-Rays nags
+    # "variable defea=... could not be found" on every later decompile.
+    # Runs unconditionally (not just when a signature changed) so orphans
+    # from earlier runs/sessions get swept up too.
+    _prune_orphaned_user_lvars(func_ea)
 
     try:
         if ida_hexrays is not None and ida_hexrays.init_hexrays_plugin():
@@ -3457,6 +3838,10 @@ class PluginConfig(object):
             self.max_auto_fetch = max(0, int(self.max_auto_fetch))
         except (TypeError, ValueError):
             self.max_auto_fetch = DEFAULT_CONFIG["max_auto_fetch"]
+        try:
+            self.max_caller_refs = max(0, int(self.max_caller_refs))
+        except (TypeError, ValueError):
+            self.max_caller_refs = DEFAULT_CONFIG["max_caller_refs"]
         self.include_data_refs = bool(self.include_data_refs)
         try:
             self.max_data_refs = max(0, int(self.max_data_refs))
@@ -3701,6 +4086,7 @@ ConversationResult = namedtuple("ConversationResult", [
     "text", "reasoning_text", "suggested_name", "suggested_signature",
     "suggested_vars", "suggested_labels", "suggested_callee_renames", "suggested_struct",
     "suggested_var_types", "suggested_global_renames", "suggested_reanalyze",
+    "suggested_string_extractors",
     "root_is_pseudocode", "error",
 ])
 
@@ -3844,7 +4230,7 @@ class ConversationRunner(object):
                 suggested_signature=None, suggested_vars=[], suggested_labels=[],
                 suggested_callee_renames=[],
                 suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
-                suggested_reanalyze=[],
+                suggested_reanalyze=[], suggested_string_extractors=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
             ))
             return 0
@@ -3852,11 +4238,17 @@ class ConversationRunner(object):
         self.messages.append({"role": "assistant", "content": text})
 
         requests = _REQUEST_CODE_RE.findall(text)
-        if requests and not self._forced_final:
+        caller_requests = _REQUEST_CALLERS_RE.findall(text)
+        if (requests or caller_requests) and not self._forced_final:
             if self._auto_fetch_rounds < self.config.max_auto_fetch:
                 self._auto_fetch_rounds += 1
-                self._on_status("Fetching requested code (%s)..." % ", ".join(requests))
-                self._handle_code_requests(requests)
+                bits = []
+                if requests:
+                    bits.append("code (%s)" % ", ".join(requests))
+                if caller_requests:
+                    bits.append("callers")
+                self._on_status("Fetching requested %s..." % "; ".join(bits))
+                self._handle_code_requests(requests, caller_requests)
                 return 0
             self._forced_final = True
             self.messages.append({
@@ -3883,6 +4275,13 @@ class ConversationRunner(object):
         if sig_matches:
             text = _SUGGESTED_SIGNATURE_RE.sub("", text).strip()
             candidate = sig_matches[-1].strip()
+            # Some models phrase this as "<current decl> -> <new decl>"
+            # (especially after seeing callers). A C declaration never
+            # contains ->, so anything before the last arrow is the old
+            # prototype the model is transforming from - keep only the new
+            # one, otherwise SetType is handed a non-parseable string.
+            if "->" in candidate:
+                candidate = candidate.rsplit("->", 1)[-1].strip()
             if candidate and self._root_is_pseudocode:
                 suggested_signature = candidate
 
@@ -3931,6 +4330,15 @@ class ConversationRunner(object):
                     continue
                 callee_ea = callee_func.start_ea
                 if callee_ea == self.func_ea or callee_ea in seen_callee_eas:
+                    continue
+                # No-op: the model re-proposed the name the callee already
+                # has (common when it echoes back every callee it understood,
+                # renamed or not). Nothing to apply and nothing worth warning
+                # about - skip it silently before the "code not requested"
+                # gate below, which would otherwise nag about a rename that
+                # wouldn't change anything anyway.
+                if ida_funcs.get_func_name(callee_ea) == callee_new_name:
+                    seen_callee_eas.add(callee_ea)
                     continue
                 # Only allow renaming functions whose code the model actually
                 # saw (eagerly included or fetched via REQUEST_CODE this
@@ -4025,6 +4433,39 @@ class ConversationRunner(object):
                 seen_reanalyze_eas.add(target_ea)
                 suggested_reanalyze.append((target_ea, (reason or "").strip()))
 
+        suggested_string_extractors = []
+        extractor_matches = _SUGGESTED_STRING_EXTRACTOR_RE.findall(text)
+        if extractor_matches:
+            text = _SUGGESTED_STRING_EXTRACTOR_RE.sub("", text).strip()
+            seen_helper_eas = set()
+            for spec in extractor_matches:
+                pm = _STRING_EXTRACTOR_PTR_RE.search(spec)
+                lm = _STRING_EXTRACTOR_LEN_RE.search(spec)
+                if not pm or not lm:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_STRING_EXTRACTOR '%s': expected "
+                        "ptr=<n> and len=<m> argument positions.\n" % (PLUGIN_NAME, spec.strip())
+                    )
+                    continue
+                # Whatever remains once the ptr=/len= tokens are removed is
+                # the helper's name-or-address query.
+                query = _STRING_EXTRACTOR_PTR_RE.sub("", _STRING_EXTRACTOR_LEN_RE.sub("", spec))
+                query = query.strip().strip(",").strip()
+                helper = resolve_function_query(query)
+                if helper is None:
+                    ida_kernwin.msg(
+                        "[%s] Ignored SUGGESTED_STRING_EXTRACTOR: could not "
+                        "resolve '%s' to a function.\n" % (PLUGIN_NAME, query)
+                    )
+                    continue
+                if helper.start_ea in seen_helper_eas:
+                    continue
+                seen_helper_eas.add(helper.start_ea)
+                suggested_string_extractors.append(
+                    (helper.start_ea, int(pm.group(1)), int(lm.group(1)))
+                )
+
+        text = _REQUEST_CALLERS_RE.sub("", text)
         text = strip_markdown_fences(_REQUEST_CODE_RE.sub("", text).strip())
 
         self._on_result_cb(ConversationResult(
@@ -4035,21 +4476,26 @@ class ConversationRunner(object):
             suggested_struct=suggested_struct, suggested_var_types=suggested_var_types,
             suggested_global_renames=suggested_global_renames,
             suggested_reanalyze=suggested_reanalyze,
+            suggested_string_extractors=suggested_string_extractors,
             root_is_pseudocode=self._root_is_pseudocode,
             error=None,
         ))
         return 0
 
-    def _handle_code_requests(self, requests):
+    def _handle_code_requests(self, requests, caller_requests=None):
         reply_parts = []
-        queried = []
+        # Track whether this round actually surfaced anything NEW. If the
+        # model only re-asks for code/callers it already has (or things that
+        # don't resolve), re-feeding them just invites it to ask again - a
+        # perceived "endless loop". In that case we force the final answer
+        # this turn instead of granting another fetch-capable round.
+        made_progress = False
         seen_this_round = set()
         for query in requests:
             query = query.strip()
             if not query or query in seen_this_round:
                 continue
             seen_this_round.add(query)
-            queried.append(query)
             func = resolve_function_query(query)
             if func is None:
                 reply_parts.append("No function found matching '%s'." % query)
@@ -4064,11 +4510,88 @@ class ConversationRunner(object):
                 reply_parts.append("Failed to retrieve code for '%s': %s" % (query, exc))
                 continue
             self._fetched_eas.add(func.start_ea)
+            made_progress = True
             reply_parts.append(format_function_block("Requested function", func.start_ea, ctx, self.config))
+
+        seen_caller_targets = set()
+        for target_query in (caller_requests or []):
+            target_query = target_query.strip()
+            if target_query in seen_caller_targets:
+                continue
+            seen_caller_targets.add(target_query)
+            block, progressed = self._gather_callers_reply(target_query)
+            reply_parts.append(block)
+            made_progress = made_progress or progressed
+
+        if not made_progress:
+            self._forced_final = True
+            reply_parts.append(
+                "You already have all of the above and no new code is "
+                "available. Do NOT request any more code or callers - give "
+                "your final one-sentence answer and every applicable "
+                "SUGGESTED_* line now."
+            )
 
         reply_text = "\n\n".join(reply_parts) if reply_parts else "No additional code available."
         self.messages.append({"role": "user", "content": reply_text})
         self._issue_request()
+
+    def _gather_callers_reply(self, target_query):
+        """Reply for a REQUEST_CALLERS: up to config.max_caller_refs callers
+        of the target (default: the function being explained), each as a full
+        pseudocode/disassembly block so the model can read the concrete
+        argument values passed at the call site. Callers are added to
+        _fetched_eas so a follow-on SUGGESTED_CALLEE_NAME may rename them.
+        Returns (reply_text, made_progress) - made_progress is True only when
+        at least one NOT-already-seen caller was actually included, so the
+        request loop knows whether this round added anything new."""
+        target = resolve_function_query(target_query) if target_query else self.func
+        if target is None:
+            return ("No function found matching '%s'." % target_query, False)
+        target_ea = target.start_ea
+        target_name = ida_funcs.get_func_name(target_ea) or ("sub_%X" % target_ea)
+
+        caller_eas = []
+        seen = set()
+        try:
+            for xref in idautils.XrefsTo(target_ea, 0):
+                if not xref.iscode:
+                    continue
+                caller = ida_funcs.get_func(xref.frm)
+                if caller is None or caller.start_ea == target_ea:
+                    continue  # skip non-function refs and direct recursion
+                if caller.start_ea in seen:
+                    continue
+                seen.add(caller.start_ea)
+                caller_eas.append(caller.start_ea)
+        except Exception:
+            pass
+
+        if not caller_eas:
+            return ("No callers of %s were found in the database." % target_name, False)
+
+        limit = max(1, int(self.config.max_caller_refs))
+        blocks = []
+        made_progress = False
+        for caller_ea in caller_eas[:limit]:
+            if caller_ea in self._fetched_eas:
+                caller_name = ida_funcs.get_func_name(caller_ea) or ("sub_%X" % caller_ea)
+                blocks.append("You already have the code for caller %s (see above)." % caller_name)
+                continue
+            caller_func = ida_funcs.get_func(caller_ea)
+            if caller_func is None:
+                continue
+            try:
+                ctx = gather_function_context(caller_func)
+            except Exception:
+                continue
+            self._fetched_eas.add(caller_ea)
+            made_progress = True
+            blocks.append(format_function_block("Caller of %s" % target_name, caller_ea, ctx, self.config))
+
+        header = "Found %d caller(s) of %s; showing up to %d:" % (
+            len(caller_eas), target_name, limit)
+        return (header + "\n\n" + "\n\n".join(blocks), made_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -4091,6 +4614,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._suggested_callee_renames = []
         self._suggested_var_types = []
         self._suggested_global_renames = []
+        self._suggested_string_extractors = []
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
         self.resize(560, 620)
@@ -4194,6 +4718,16 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.vartype_label.setEnabled(False)
         vartype_layout.addWidget(self.vartype_label, 1)
         layout.addLayout(vartype_layout)
+
+        stringextract_layout = QtWidgets.QHBoxLayout()
+        self.stringextract_check = QtWidgets.QCheckBox("Carve packed-string table(s):")
+        self.stringextract_check.setEnabled(False)
+        stringextract_layout.addWidget(self.stringextract_check)
+        self.stringextract_label = QtWidgets.QLineEdit()
+        self.stringextract_label.setReadOnly(True)
+        self.stringextract_label.setEnabled(False)
+        stringextract_layout.addWidget(self.stringextract_label, 1)
+        layout.addLayout(stringextract_layout)
 
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch(1)
@@ -4344,6 +4878,17 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.vartype_label.setEnabled(True)
             self.vartype_check.setChecked(True)
 
+        if result.suggested_string_extractors:
+            self._suggested_string_extractors = result.suggested_string_extractors
+            extractor_labels = []
+            for helper_ea, ptr_idx, len_idx in result.suggested_string_extractors:
+                helper_name = ida_funcs.get_func_name(helper_ea) or ("sub_%X" % helper_ea)
+                extractor_labels.append("%s (ptr=arg%d, len=arg%d)" % (helper_name, ptr_idx, len_idx))
+            self.stringextract_label.setText(", ".join(extractor_labels))
+            self.stringextract_check.setEnabled(True)
+            self.stringextract_label.setEnabled(True)
+            self.stringextract_check.setChecked(True)
+
         self._last_answer_text = result.text
         self.status_label.setText("Done.")
         self.reason_button.setEnabled(True)
@@ -4387,6 +4932,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         # passes through that cleanup.
         comment = strip_markdown_fences(text)
         comment = _REQUEST_CODE_RE.sub("", comment)
+        comment = _REQUEST_CALLERS_RE.sub("", comment)
         comment = _SUGGESTED_NAME_RE.sub("", comment)
         comment = _SUGGESTED_SIGNATURE_RE.sub("", comment)
         comment = _SUGGESTED_VAR_RE.sub("", comment)
@@ -4395,6 +4941,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         comment = _SUGGESTED_GLOBAL_NAME_RE.sub("", comment)
         comment = _SUGGESTED_REANALYZE_RE.sub("", comment)
         comment = _SUGGESTED_STRUCT_RE.sub("", comment)
+        comment = _SUGGESTED_STRING_EXTRACTOR_RE.sub("", comment)
         comment = _SUGGESTED_VAR_TYPE_RE.sub("", comment).strip()
 
         new_name = None
@@ -4432,11 +4979,16 @@ class ExplainResultDialog(QtWidgets.QDialog):
             if (self.vartype_check.isChecked() and self._suggested_var_types) else None
         )
 
+        string_extractors = (
+            list(self._suggested_string_extractors)
+            if (self.stringextract_check.isChecked() and self._suggested_string_extractors) else None
+        )
+
         ida_kernwin.execute_sync(
             functools.partial(
                 _apply_suggestions_and_refresh, self.func_ea, comment, new_name, signature,
                 var_renames, callee_renames, struct_decl, var_types, global_renames,
-                label_renames,
+                label_renames, string_extractors,
             ),
             ida_kernwin.MFF_WRITE,
         )
@@ -4586,6 +5138,15 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Max on-demand code requests:", self.max_auto_fetch_spin)
 
+        self.max_caller_refs_spin = QtWidgets.QSpinBox()
+        self.max_caller_refs_spin.setRange(0, 20)
+        self.max_caller_refs_spin.setToolTip(
+            "How many caller functions to include when the model asks to see "
+            "the target's call sites (REQUEST_CALLERS), to infer argument "
+            "types from the concrete values passed in."
+        )
+        form.addRow("Max callers shown per request:", self.max_caller_refs_spin)
+
         self.max_recursive_callees_spin = QtWidgets.QSpinBox()
         self.max_recursive_callees_spin.setRange(1, 100)
         self.max_recursive_callees_spin.setToolTip(
@@ -4708,6 +5269,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.follow_calls_spin.setValue(config.follow_calls_depth)
         self.max_total_context_spin.setValue(config.max_total_context_chars)
         self.max_auto_fetch_spin.setValue(config.max_auto_fetch)
+        self.max_caller_refs_spin.setValue(config.max_caller_refs)
         self.max_recursive_callees_spin.setValue(config.max_recursive_callees)
         self.hotkey_edit.setText(config.explain_hotkey)
         self.system_prompt_edit.setPlainText(config.system_prompt)
@@ -4761,6 +5323,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.follow_calls_depth = self.follow_calls_spin.value()
         cfg.max_total_context_chars = self.max_total_context_spin.value()
         cfg.max_auto_fetch = self.max_auto_fetch_spin.value()
+        cfg.max_caller_refs = self.max_caller_refs_spin.value()
         cfg.max_recursive_callees = self.max_recursive_callees_spin.value()
         cfg.explain_hotkey = self.hotkey_edit.text().strip()
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
@@ -4955,6 +5518,7 @@ BatchItemResult = namedtuple("BatchItemResult", [
     "suggested_name", "suggested_signature", "suggested_vars", "suggested_labels",
     "suggested_callee_renames", "suggested_struct", "suggested_var_types",
     "suggested_global_renames", "suggested_reanalyze", "root_is_pseudocode",
+    "suggested_string_extractors",
 ])
 
 
@@ -4983,8 +5547,11 @@ def _compute_apply_args(item, allow_rename_named=False):
     struct_decl = item.suggested_struct if item.root_is_pseudocode else None
     var_types = item.suggested_var_types if (item.root_is_pseudocode and item.suggested_var_types) else None
     global_renames = item.suggested_global_renames or None
+    # String-table carving is a global, data-level action, not tied to the
+    # root being pseudocode - keep it whenever the model flagged an extractor.
+    string_extractors = item.suggested_string_extractors or None
     return (item.func_ea, item.comment, new_name, signature, var_renames, callee_renames,
-            struct_decl, var_types, global_renames, label_renames)
+            struct_decl, var_types, global_renames, label_renames, string_extractors)
 
 
 class BatchController(object):
@@ -5112,7 +5679,8 @@ class BatchController(object):
         label = self.config.server_label(server_url)
         if result.error:
             item = BatchItemResult(func.start_ea, orig_name, False, result.error,
-                                    None, None, None, [], [], [], None, [], [], [], result.root_is_pseudocode)
+                                    None, None, None, [], [], [], None, [], [], [],
+                                    result.root_is_pseudocode, [])
             self._on_row_update(index, "Error", "[%s] %s" % (label, result.error))
         else:
             item = BatchItemResult(func.start_ea, orig_name, True, None, result.text,
@@ -5121,28 +5689,29 @@ class BatchController(object):
                                     result.suggested_callee_renames,
                                     result.suggested_struct, result.suggested_var_types,
                                     result.suggested_global_renames, result.suggested_reanalyze,
-                                    result.root_is_pseudocode)
+                                    result.root_is_pseudocode, result.suggested_string_extractors)
             self._on_row_update(index, "Done", "[%s] %s" % (label, result.text[:120]))
         self._record_and_advance(item, server_url)
 
     def _on_error(self, index, func, server_url, message):
         orig_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
         item = BatchItemResult(func.start_ea, orig_name, False, message,
-                                None, None, None, [], [], [], None, [], [], [], False)
+                                None, None, None, [], [], [], None, [], [], [], False, [])
         self._on_row_update(index, "Error", "[%s] %s" % (self.config.server_label(server_url), message))
         self._record_and_advance(item, server_url)
 
 
 def _apply_batch_and_refresh(items):
     """items: list of (func_ea, comment, new_name, signature, var_renames,
-    callee_renames, struct_decl, var_types, global_renames, label_renames).
-    One execute_sync/MFF_WRITE round-trip for the whole batch instead of N.
+    callee_renames, struct_decl, var_types, global_renames, label_renames,
+    string_extractors). One execute_sync/MFF_WRITE round-trip for the whole
+    batch instead of N.
     """
     for (func_ea, comment, new_name, signature, var_renames, callee_renames,
-         struct_decl, var_types, global_renames, label_renames) in items:
+         struct_decl, var_types, global_renames, label_renames, string_extractors) in items:
         _apply_suggestions_and_refresh(
             func_ea, comment, new_name, signature, var_renames, callee_renames,
-            struct_decl, var_types, global_renames, label_renames,
+            struct_decl, var_types, global_renames, label_renames, string_extractors,
         )
     return 1
 

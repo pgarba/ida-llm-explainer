@@ -14,7 +14,8 @@ the Hex-Rays or the disassembly view.
 - **Human in the loop** — every suggestion is a separate, editable checkbox. Accept / Reason More / Cancel. The model never writes on its own.
 - **Rename & retype** — proposes a function name, full C signature, local-variable renames, **code-label** renames (`LABEL_5` → `cleanup_and_return`), **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names).
 - **Struct detection** — infers an undefined struct from pointer-offset access patterns and applies it.
-- **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer.
+- **Packed-string-table recovery** — spots a helper that slices fixed-length substrings out of one merged string blob (a common obfuscation), then reads the pointer/length constants at every call site and defines each carved string (`get_partial_string(dst, blob, 6)` → `"REFLEX"`).
+- **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer, or pull in the target's own **callers** to read the concrete arguments passed at real call sites (sharpens inferred parameter types).
 - **Batch mode** — explain a checklist of functions, review (incl. each proposed new name), apply in bulk.
 - **Recursive auto-accept** — explains a function + its *undiscovered* (`sub_…`) callees and applies automatically; can re-analyze an already-named callee the model flags as misnamed.
 - **Multi-server** — list several `llama-server` endpoints for ~Nx parallel batch throughput, with priority order + automatic failover.
@@ -55,6 +56,8 @@ Results are cached for the session (**Load Cached Result**), and any in-place/re
 | Model / API key | *(blank)* | Only if your server needs them |
 | Temperature / Max tokens | `0.2` / `16384` | Keep tokens generous for reasoning models |
 | Follow calls depth | `0` | `N>0` eagerly includes N levels of callee code |
+| Max on-demand code requests | `5` | Cap on the model's `REQUEST_CODE`/`REQUEST_CALLERS` round-trips per conversation |
+| Max callers shown per request | `3` | How many call sites `REQUEST_CALLERS` returns for argument-type inference |
 | Max recursive callees | `10` | Cap for the recursive auto-accept action |
 | System prompt(s) | *(editable)* | Explain + CFG-trace protocols |
 | Resolve branches via constant propagation | on | Fast deterministic pass before the LLM (disable to always ask) |
@@ -70,6 +73,7 @@ The system prompt asks the model to emit structured lines the plugin parses out 
 | Marker | Purpose |
 |---|---|
 | `REQUEST_CODE: <fn>` | fetch a callee's code before answering (automatic) |
+| `REQUEST_CALLERS[: <fn>]` | fetch a few of the target's callers to read the concrete arguments passed in (automatic) |
 | `SUGGESTED_NAME: <name>` | function name |
 | `SUGGESTED_SIGNATURE: <decl>` | prototype (Hex-Rays only) |
 | `SUGGESTED_VAR: <old> -> <new>` | local rename (Hex-Rays only) |
@@ -79,6 +83,7 @@ The system prompt asks the model to emit structured lines the plugin parses out 
 | `SUGGESTED_REANALYZE: <fn> - <why>` | flag an already-named callee for re-analysis (recursive scan) |
 | `SUGGESTED_STRUCT: <decl>` | define + register a struct type |
 | `SUGGESTED_VAR_TYPE: <var> <type>` | apply a type to a local |
+| `SUGGESTED_STRING_EXTRACTOR: <fn> ptr=<n> len=<m>` | flag a helper that slices fixed-length substrings out of a packed string blob; the plugin reads the pointer/length constants at every call site and defines each carved string |
 
 The prose answer itself is kept to one sentence — it becomes the function comment.
 
