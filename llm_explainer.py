@@ -173,7 +173,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.7.3"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -235,10 +235,14 @@ DEFAULT_SYSTEM_PROMPT = (
     "REQUEST_CALLERS\n"
     "(optionally REQUEST_CALLERS: <function name or address> to inspect the "
     "callers of some other function instead of the current one), and nothing "
-    "else in that reply. You will be given a few callers' code and can then "
-    "give a much better SUGGESTED_SIGNATURE. This counts against the same "
-    "request budget as REQUEST_CODE, so ask only when the call site would "
-    "genuinely resolve the ambiguity.\n\n"
+    "else in that reply. You will be given a short call-site snippet from a "
+    "few callers - the call expression itself plus each argument's inferred "
+    "type, NOT the caller's full code - and can then give a much better "
+    "SUGGESTED_SIGNATURE. If a snippet alone is not enough (e.g. an argument "
+    "is some other local variable whose own origin you need to trace), "
+    "REQUEST_CODE that caller by name to get its full body. This counts "
+    "against the same request budget as REQUEST_CODE, so ask only when the "
+    "call site would genuinely resolve the ambiguity.\n\n"
     "Once you have enough information, work through ALL FIVE of the "
     "following steps before writing your final answer. These are a "
     "required part of a thorough analysis, not optional extras to drop "
@@ -247,6 +251,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "1. Propose a better name for the target function, unless it is "
     "already named descriptively, as one line of the exact form\n"
     "SUGGESTED_NAME: <name>\n"
+    "Give ONLY the single new name on this line - not the old one, and "
+    "never a 'before -> after' pair; do not write an arrow (->) on the "
+    "SUGGESTED_NAME line. "
     "The name must be a valid C identifier: letters, digits and "
     "underscores only, not starting with a digit, no spaces. Prefer "
     "short, conventional reverse-engineering style names (e.g. "
@@ -1530,6 +1537,109 @@ def _expr_effective_addr(e):
             if base is not None and off is not None:
                 return base + off
     return None
+
+
+def _call_arg_type_str(arg_expr):
+    """Best-effort C type string for a ctree call argument (through
+    Hex-Rays' own type inference for that expression), for hinting at a
+    parameter's likely type without needing the caller's full body. None if
+    Hex-Rays has no usable type for it."""
+    try:
+        tif = arg_expr.type
+    except Exception:
+        return None
+    if tif is None or _tinfo_is_empty(tif):
+        return None
+    try:
+        text = tif.dstr()
+    except Exception:
+        return None
+    return text or None
+
+
+def gather_call_site_snippets(caller_func, target_ea, max_sites=3):
+    """Up to max_sites call expressions in caller_func that target `target_ea`
+    directly (through casts), each rendered as ONE line - the call
+    expression itself plus a per-argument inferred-type annotation - rather
+    than the caller's entire pseudocode. REQUEST_CALLERS exists so the model
+    can read the concrete arguments passed at a real call site; the rest of
+    the caller's body is normally irrelevant to that and, for a large
+    caller, can burn most of the context budget for zero benefit. Falls
+    back to a short disassembly window around each `call` instruction when
+    Hex-Rays isn't available or the caller doesn't decompile. Returns a list
+    of (ea, text) tuples in first-seen order (empty if none found)."""
+    if ida_hexrays is not None:
+        cfunc = None
+        try:
+            if ida_hexrays.init_hexrays_plugin():
+                cfunc = ida_hexrays.decompile(caller_func)
+        except Exception:
+            cfunc = None
+        if cfunc is not None:
+            class _CallSiteCollector(ida_hexrays.ctree_visitor_t):
+                def __init__(self):
+                    ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+                    self.calls = []
+
+                def visit_expr(self, e):
+                    if e.op == ida_hexrays.cot_call and _callexpr_target_ea(e) == target_ea:
+                        self.calls.append(e)
+                    return 0
+
+            collector = _CallSiteCollector()
+            try:
+                collector.apply_to(cfunc.body, None)
+            except Exception:
+                pass
+            snippets = []
+            for call in collector.calls[:max_sites]:
+                try:
+                    call_text = ida_lines.tag_remove(call.print1(None))
+                except Exception:
+                    continue
+                arg_notes = []
+                try:
+                    for i, arg in enumerate(call.a):
+                        type_text = _call_arg_type_str(arg)
+                        if type_text:
+                            arg_notes.append("arg%d: %s" % (i + 1, type_text))
+                except Exception:
+                    pass
+                if arg_notes:
+                    call_text += "   // " + ", ".join(arg_notes)
+                snippets.append((call.ea, call_text))
+            if snippets:
+                return snippets
+
+    # Disassembly fallback: a short window of raw instructions ending at
+    # each `call target_ea` site, wide enough to usually catch the
+    # immediate mov/lea/push setup feeding register or stack arguments.
+    snippets = []
+    try:
+        for ea in idautils.FuncItems(caller_func.start_ea):
+            if target_ea not in idautils.CodeRefsFrom(ea, 0):
+                continue
+            window = []
+            cur = ea
+            for _ in range(6):
+                prev = idc.prev_head(cur, caller_func.start_ea)
+                if prev == idaapi.BADADDR or prev < caller_func.start_ea:
+                    break
+                cur = prev
+            walk = cur
+            while walk != idaapi.BADADDR and walk <= ea:
+                try:
+                    line = idc.generate_disasm_line(walk, idc.GENDSM_REMOVE_TAGS)
+                except Exception:
+                    line = idc.GetDisasm(walk)
+                window.append("%#010x  %s" % (walk, ida_lines.tag_remove(line or "")))
+                walk = idc.next_head(walk, caller_func.end_ea)
+            snippets.append((ea, "\n".join(window)))
+            if len(snippets) >= max_sites:
+                break
+    except Exception:
+        pass
+    return snippets
 
 
 def _make_partial_string(ea, length):
@@ -4088,6 +4198,14 @@ ConversationResult = namedtuple("ConversationResult", [
     "suggested_var_types", "suggested_global_renames", "suggested_reanalyze",
     "suggested_string_extractors",
     "root_is_pseudocode", "error",
+    # (callee_ea, proposed_name) pairs whose SUGGESTED_CALLEE_NAME was
+    # dropped only because the model never actually requested/received that
+    # function's code this conversation - i.e. exactly the ones logged as
+    # "Ignored SUGGESTED_CALLEE_NAME ... the model never actually
+    # requested/received this function's code". Lets the UI offer to fetch
+    # that code and ask the model to reconsider, instead of the rename
+    # silently vanishing. See ExplainResultDialog's "Investigate" action.
+    "rejected_callee_renames",
 ])
 
 
@@ -4117,6 +4235,12 @@ class ConversationRunner(object):
         self._on_reasoning_delta = on_reasoning_delta or (lambda piece: None)
         self._on_status = on_status or (lambda text: None)
         self._fetched_eas = set()
+        # Callers shown only as a REQUEST_CALLERS call-site snippet, not
+        # their full body - kept separate from _fetched_eas (which means
+        # "the full code is already above") so a later REQUEST_CODE for the
+        # same function still fetches its full body instead of being
+        # treated as a duplicate.
+        self._snippeted_eas = set()
         self._auto_fetch_rounds = 0
         self._forced_final = False
         self._root_is_pseudocode = False
@@ -4164,6 +4288,52 @@ class ConversationRunner(object):
         self.messages.append({"role": "user", "content": user_text})
         self._forced_final = False
         self._issue_request()
+
+    def investigate_rejected_callees(self, rejected, on_result, on_error):
+        """Interactive-only: used by ExplainResultDialog's "Investigate"
+        action. `rejected` is a list of (callee_ea, proposed_name) pairs
+        from a previous result's rejected_callee_renames - names the model
+        proposed for a callee whose code it never actually requested, so
+        the rename was dropped (see the _fetched_eas gate in
+        _on_worker_done). Rather than making the user manually type
+        "REQUEST_CODE: <fn>" into the follow-up box, this fetches each
+        flagged callee's code directly, adds it to _fetched_eas (so the
+        gate now allows the rename), and asks the model to reconsider each
+        name now that it can actually see the code - repeat, revise, or
+        drop it. Same conversation/messages as a normal follow-up, so it
+        goes through the usual on_result parsing and rejected_callee_renames
+        gate; this just skips the round-trip where the model has to ask."""
+        parts = []
+        for callee_ea, proposed_name in rejected:
+            callee_func = ida_funcs.get_func(callee_ea)
+            if callee_func is None:
+                continue
+            name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
+            try:
+                ctx = gather_function_context(callee_func)
+            except Exception:
+                continue
+            self._fetched_eas.add(callee_ea)
+            parts.append(
+                "You previously proposed SUGGESTED_CALLEE_NAME: %s -> %s "
+                "but had not requested its code yet, so that rename was not "
+                "applied. Its code:" % (name, proposed_name)
+            )
+            parts.append(format_function_block("Requested function", callee_ea, ctx, self.config))
+        if not parts:
+            on_error("None of the flagged functions could be found or decompiled.")
+            return
+        parts.append(
+            "Now that you can see the actual code for each function above, "
+            "reconsider its name: repeat the same SUGGESTED_CALLEE_NAME if "
+            "it still looks right, propose a different one if the code "
+            "suggests something better, or omit it entirely if the "
+            "function's current name is already fine. One line per "
+            "function of the exact form\n"
+            "SUGGESTED_CALLEE_NAME: <function name or address> -> <new name>\n"
+            "and nothing else in this reply."
+        )
+        self.send_followup("\n\n".join(parts), on_result, on_error)
 
     def cancel(self):
         self._closed = True
@@ -4232,6 +4402,7 @@ class ConversationRunner(object):
                 suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
                 suggested_reanalyze=[], suggested_string_extractors=[],
                 root_is_pseudocode=self._root_is_pseudocode, error=msg,
+                rejected_callee_renames=[],
             ))
             return 0
 
@@ -4268,7 +4439,17 @@ class ConversationRunner(object):
         name_matches = _SUGGESTED_NAME_RE.findall(text)
         if name_matches:
             text = _SUGGESTED_NAME_RE.sub("", text).strip()
-            suggested_name = sanitize_suggested_name(name_matches[-1])
+            candidate = name_matches[-1].strip()
+            # Some models phrase this as "<current name> -> <new name>"
+            # (mirroring SUGGESTED_VAR/SUGGESTED_CALLEE_NAME's old->new
+            # form) despite being told to give only the new name. A valid
+            # C identifier never contains "->", so anything before the
+            # last arrow is the old name - keep only the new one, otherwise
+            # sanitize_suggested_name rejects the whole thing as invalid
+            # and the rename silently never becomes available in the UI.
+            if "->" in candidate:
+                candidate = candidate.rsplit("->", 1)[-1].strip()
+            suggested_name = sanitize_suggested_name(candidate)
 
         suggested_signature = None
         sig_matches = _SUGGESTED_SIGNATURE_RE.findall(text)
@@ -4308,6 +4489,7 @@ class ConversationRunner(object):
                         suggested_labels.append((old_label, new_label))
 
         suggested_callee_renames = []
+        rejected_callee_renames = []
         callee_matches = _SUGGESTED_CALLEE_NAME_RE.findall(text)
         if callee_matches:
             text = _SUGGESTED_CALLEE_NAME_RE.sub("", text).strip()
@@ -4363,6 +4545,8 @@ class ConversationRunner(object):
                         "first if you want this considered.\n"
                         % (PLUGIN_NAME, query, callee_new_name)
                     )
+                    seen_callee_eas.add(callee_ea)
+                    rejected_callee_renames.append((callee_ea, callee_new_name))
                     continue
                 seen_callee_eas.add(callee_ea)
                 suggested_callee_renames.append((callee_ea, callee_new_name))
@@ -4479,6 +4663,7 @@ class ConversationRunner(object):
             suggested_string_extractors=suggested_string_extractors,
             root_is_pseudocode=self._root_is_pseudocode,
             error=None,
+            rejected_callee_renames=rejected_callee_renames,
         ))
         return 0
 
@@ -4538,13 +4723,20 @@ class ConversationRunner(object):
 
     def _gather_callers_reply(self, target_query):
         """Reply for a REQUEST_CALLERS: up to config.max_caller_refs callers
-        of the target (default: the function being explained), each as a full
-        pseudocode/disassembly block so the model can read the concrete
-        argument values passed at the call site. Callers are added to
-        _fetched_eas so a follow-on SUGGESTED_CALLEE_NAME may rename them.
-        Returns (reply_text, made_progress) - made_progress is True only when
-        at least one NOT-already-seen caller was actually included, so the
-        request loop knows whether this round added anything new."""
+        of the target (default: the function being explained), each as a
+        compact call-site snippet (see gather_call_site_snippets) - the call
+        expression plus each argument's inferred type - rather than the
+        caller's entire body. The point of REQUEST_CALLERS is the concrete
+        arguments passed in at a real call site, and a caller can easily be
+        much larger than the target itself, so sending its full pseudocode
+        for that purpose burns context fast for little benefit. Snippeted
+        callers go into _snippeted_eas, NOT _fetched_eas - _fetched_eas means
+        "the model has seen this function's own code", which a call-site
+        snippet does not provide, so a SUGGESTED_CALLEE_NAME for one of
+        these callers is correctly still rejected (see its gate) unless the
+        model separately REQUEST_CODEs that caller's full body. Returns
+        (reply_text, made_progress) - made_progress is True only when at
+        least one NOT-already-shown caller actually yielded a snippet."""
         target = resolve_function_query(target_query) if target_query else self.func
         if target is None:
             return ("No function found matching '%s'." % target_query, False)
@@ -4574,22 +4766,34 @@ class ConversationRunner(object):
         blocks = []
         made_progress = False
         for caller_ea in caller_eas[:limit]:
+            caller_name = ida_funcs.get_func_name(caller_ea) or ("sub_%X" % caller_ea)
             if caller_ea in self._fetched_eas:
-                caller_name = ida_funcs.get_func_name(caller_ea) or ("sub_%X" % caller_ea)
-                blocks.append("You already have the code for caller %s (see above)." % caller_name)
+                blocks.append("You already have the full code for caller %s (see above)." % caller_name)
+                continue
+            if caller_ea in self._snippeted_eas:
+                blocks.append(
+                    "Already showed a call-site snippet for caller %s (see "
+                    "above); REQUEST_CODE: %s for its full body if that "
+                    "isn't enough." % (caller_name, caller_name)
+                )
                 continue
             caller_func = ida_funcs.get_func(caller_ea)
             if caller_func is None:
                 continue
             try:
-                ctx = gather_function_context(caller_func)
+                sites = gather_call_site_snippets(caller_func, target_ea)
             except Exception:
+                sites = []
+            if not sites:
                 continue
-            self._fetched_eas.add(caller_ea)
+            self._snippeted_eas.add(caller_ea)
             made_progress = True
-            blocks.append(format_function_block("Caller of %s" % target_name, caller_ea, ctx, self.config))
+            site_lines = "\n".join(text for _, text in sites)
+            blocks.append(
+                "--- Call site(s) in caller %s @ %#010x ---\n%s" % (caller_name, caller_ea, site_lines)
+            )
 
-        header = "Found %d caller(s) of %s; showing up to %d:" % (
+        header = "Found %d caller(s) of %s; showing call-site snippet(s) for up to %d:" % (
             len(caller_eas), target_name, limit)
         return (header + "\n\n" + "\n\n".join(blocks), made_progress)
 
@@ -4615,6 +4819,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._suggested_var_types = []
         self._suggested_global_renames = []
         self._suggested_string_extractors = []
+        self._rejected_callee_renames = []
 
         self.setWindowTitle("%s - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
         self.resize(560, 620)
@@ -4689,6 +4894,27 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self.calleerename_label.setEnabled(False)
         calleerename_layout.addWidget(self.calleerename_label, 1)
         layout.addLayout(calleerename_layout)
+
+        investigate_layout = QtWidgets.QHBoxLayout()
+        self.investigate_label = QtWidgets.QLineEdit()
+        self.investigate_label.setReadOnly(True)
+        self.investigate_label.setEnabled(False)
+        self.investigate_label.setPlaceholderText(
+            "Callee name(s) the model proposed without seeing their code..."
+        )
+        investigate_layout.addWidget(self.investigate_label, 1)
+        self.investigate_button = QtWidgets.QPushButton("Investigate && Reconsider Name(s)")
+        self.investigate_button.setToolTip(
+            "Fetch the code for each called function above and ask the "
+            "model to reconsider its name now that it can actually see "
+            "what the function does, instead of the rename silently being "
+            "dropped."
+        )
+        self.investigate_button.clicked.connect(self.on_investigate_callees)
+        self.investigate_button.setEnabled(False)
+        self.investigate_button.setVisible(False)
+        investigate_layout.addWidget(self.investigate_button)
+        layout.addLayout(investigate_layout)
 
         globalrename_layout = QtWidgets.QHBoxLayout()
         self.globalrename_check = QtWidgets.QCheckBox("Rename global variable(s):")
@@ -4844,15 +5070,8 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self.labelrename_check.setChecked(True)
 
         if result.suggested_callee_renames:
-            self._suggested_callee_renames = result.suggested_callee_renames
-            labels = []
-            for callee_ea, callee_new_name in result.suggested_callee_renames:
-                old_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
-                labels.append("%s -> %s" % (old_callee_name, callee_new_name))
-            self.calleerename_label.setText(", ".join(labels))
-            self.calleerename_check.setEnabled(True)
-            self.calleerename_label.setEnabled(True)
-            self.calleerename_check.setChecked(True)
+            self._merge_suggested_callee_renames(result.suggested_callee_renames)
+        self._merge_rejected_callee_renames(result.rejected_callee_renames)
 
         if result.suggested_global_renames:
             self._suggested_global_renames = result.suggested_global_renames
@@ -4904,6 +5123,50 @@ class ExplainResultDialog(QtWidgets.QDialog):
         partial = "".join(self._buffer).strip()
         self.accept_button.setEnabled(bool(partial or self._last_answer_text.strip()))
 
+    # -- callee-rename bookkeeping, shared by the main result and the
+    # "Investigate" follow-up (see on_investigate_callees) -----------------
+
+    def _merge_suggested_callee_renames(self, new_renames):
+        merged = dict(self._suggested_callee_renames)
+        merged.update(new_renames)
+        self._suggested_callee_renames = list(merged.items())
+        labels = []
+        for callee_ea, callee_new_name in self._suggested_callee_renames:
+            old_callee_name = ida_funcs.get_func_name(callee_ea) or ("sub_%X" % callee_ea)
+            labels.append("%s -> %s" % (old_callee_name, callee_new_name))
+        self.calleerename_label.setText(", ".join(labels))
+        self.calleerename_check.setEnabled(True)
+        self.calleerename_label.setEnabled(True)
+        self.calleerename_check.setChecked(True)
+
+    def _merge_rejected_callee_renames(self, new_rejections):
+        """Accumulates (callee_ea, proposed_name) pairs across the whole
+        conversation - not just the latest turn - so a name proposed and
+        rejected several messages ago still shows up in the "Investigate"
+        row until it's actually resolved (accepted via _fetched_eas, or
+        cleared by on_investigate_callees)."""
+        pending = dict(self._rejected_callee_renames)
+        for ea, name in new_rejections:
+            pending[ea] = name
+        for ea, _ in self._suggested_callee_renames:
+            pending.pop(ea, None)
+        self._rejected_callee_renames = list(pending.items())
+        self._update_investigate_row()
+
+    def _update_investigate_row(self):
+        if self._rejected_callee_renames:
+            labels = []
+            for ea, name in self._rejected_callee_renames:
+                old_name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
+                labels.append("%s -> %s" % (old_name, name))
+            self.investigate_label.setText(", ".join(labels))
+            self.investigate_button.setVisible(True)
+            self.investigate_button.setEnabled(True)
+        else:
+            self.investigate_label.clear()
+            self.investigate_button.setVisible(False)
+            self.investigate_button.setEnabled(False)
+
     # -- button handlers ------------------------------------------------
 
     def on_reason_more(self):
@@ -4919,6 +5182,67 @@ class ExplainResultDialog(QtWidgets.QDialog):
         except RuntimeError:
             pass
         self.runner.send_followup(followup, self._on_conversation_result, self._on_conversation_error)
+
+    def on_investigate_callees(self):
+        """Fetches the code for every callee currently in
+        _rejected_callee_renames (proposed without the model having seen
+        its code - see rejected_callee_renames) and asks the model to
+        reconsider each name now that it can. Cleared optimistically up
+        front so the row doesn't linger mid-request; restored by
+        _on_investigate_error if the round trip fails outright."""
+        if self.runner.worker is not None or not self._rejected_callee_renames:
+            return
+        investigated = list(self._rejected_callee_renames)
+        self._rejected_callee_renames = []
+        self._update_investigate_row()
+        self._begin_request("Fetching callee code and reconsidering name(s)...")
+        try:
+            self.stream_edit.appendPlainText(
+                "\n\n--- Investigating %d callee name(s) ---\n" % len(investigated)
+            )
+        except RuntimeError:
+            pass
+        self.runner.investigate_rejected_callees(
+            investigated,
+            functools.partial(self._on_investigate_result, investigated),
+            functools.partial(self._on_investigate_error, investigated),
+        )
+
+    def _on_investigate_result(self, investigated, result):
+        """Deliberately does NOT touch _last_answer_text/accept_button the
+        way _on_conversation_result does - the point of this action is only
+        to resolve pending callee renames, not to replace the function's
+        already-drafted explanation with whatever short reply the model
+        gives here."""
+        if self._closed:
+            return
+        if result.error:
+            # The ORIGINAL investigated list, not result.rejected_callee_renames
+            # (empty for this "model returned nothing" error path) - otherwise
+            # the pending entries this round was trying to resolve would be
+            # lost instead of restored for a retry.
+            self._on_investigate_error(investigated, result.error)
+            return
+        if result.suggested_callee_renames:
+            self._merge_suggested_callee_renames(result.suggested_callee_renames)
+        self._merge_rejected_callee_renames(result.rejected_callee_renames)
+        self.status_label.setText("Callee name(s) reconsidered.")
+        self.reason_button.setEnabled(True)
+        self.followup_input.setEnabled(True)
+
+    def _on_investigate_error(self, investigated, message):
+        if self._closed:
+            return
+        self.status_label.setText("Investigate failed: %s" % message)
+        self.reason_button.setEnabled(True)
+        self.followup_input.setEnabled(True)
+        # Nothing was resolved - put the pending entries back so the user
+        # can retry (a fresh proposal for the same ea, if any arrived
+        # despite the error, takes priority over the stale one).
+        pending = dict(investigated)
+        pending.update(self._rejected_callee_renames)
+        self._rejected_callee_renames = list(pending.items())
+        self._update_investigate_row()
 
     def on_accept(self):
         text = (self._last_answer_text or "".join(self._buffer)).strip()
@@ -5141,7 +5465,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.max_caller_refs_spin = QtWidgets.QSpinBox()
         self.max_caller_refs_spin.setRange(0, 20)
         self.max_caller_refs_spin.setToolTip(
-            "How many caller functions to include when the model asks to see "
+            "How many caller functions to include a compact call-site "
+            "snippet from (not their full code) when the model asks to see "
             "the target's call sites (REQUEST_CALLERS), to infer argument "
             "types from the concrete values passed in."
         )
@@ -5567,15 +5892,17 @@ class BatchController(object):
     """
 
     def __init__(self, config, funcs, on_row_update, on_finished, on_item_result=None,
-                 on_row_add=None, max_extra=0):
+                 on_row_add=None, max_extra=0, deferred_funcs=None):
         self.config = config
         self.funcs = funcs
         self._on_row_update = on_row_update
         self._on_finished = on_finished
         self._on_item_result = on_item_result or (lambda item: None)
         # Called when a function is appended to the queue AFTER start (a
-        # SUGGESTED_REANALYZE expansion) so the dialog can add a row for it.
-        self._on_row_add = on_row_add or (lambda index, func: None)
+        # SUGGESTED_REANALYZE expansion, or the deferred functions below)
+        # so the dialog can add a row for it. is_deferred distinguishes the
+        # latter, which should NOT be treated as a reanalyze-permitted rename.
+        self._on_row_add = on_row_add or (lambda index, func, is_deferred=False: None)
         self._servers = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
         self._next_index = 0
         self._cancelled = False
@@ -5584,9 +5911,16 @@ class BatchController(object):
         # at most one per server, so this also caps concurrency at len(servers).
         self._active = {}
         self.results = {}
+        # Functions held back until every function currently queued has
+        # finished across ALL servers (see _maybe_finish) - used by the
+        # recursive explain walk so outer/caller functions are only
+        # analyzed once their inner/callee functions have already been
+        # explained and renamed, giving the outer function's prompt
+        # accurate callee names/signatures instead of sub_XXXXXXXX stubs.
+        self._deferred_funcs = list(deferred_funcs or [])
         # Every ea ever in the queue (initial + dynamically added), so a
         # reanalyze request never double-queues a function.
-        self._known_eas = {f.start_ea for f in funcs}
+        self._known_eas = {f.start_ea for f in funcs} | {f.start_ea for f in self._deferred_funcs}
         # Budget for dynamic SUGGESTED_REANALYZE additions, so a chain of
         # reanalyze requests can't make the run grow without bound.
         self._extra_budget = max(0, int(max_extra))
@@ -5665,6 +5999,15 @@ class BatchController(object):
         if self._finished:
             return
         if not self._active and (self._cancelled or self._next_index >= len(self.funcs)):
+            if not self._cancelled and self._deferred_funcs:
+                deferred, self._deferred_funcs = self._deferred_funcs, []
+                for func in deferred:
+                    index = len(self.funcs)
+                    self.funcs.append(func)
+                    self._on_row_add(index, func, True)
+                for server_url in self._servers:
+                    self._dispatch_next(server_url)
+                return
             self._finished = True
             self._on_finished()
 
@@ -5734,7 +6077,10 @@ class BatchProgressDialog(QtWidgets.QDialog):
       manual Apply Selected step uses (see _compute_apply_args) - no
       per-item review, but this dialog still shows live progress and can
       be cancelled mid-run, and the Apply column becomes a read-only
-      "Applied" indicator rather than a checkbox.
+      "Applied" indicator rather than a checkbox. `deferred_funcs` (see
+      BatchController) lets this mode explain inner/callee functions
+      before the outer/target one, so the target benefits from its
+      callees' freshly-discovered names.
 
     No "Reason More" in either mode - close this dialog and use the
     interactive single-function dialog to refine any one function further.
@@ -5742,7 +6088,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
 
     COL_APPLY, COL_FUNC, COL_NEW_NAME, COL_STATUS, COL_PREVIEW = range(5)
 
-    def __init__(self, config, funcs, parent=None, auto_apply=False):
+    def __init__(self, config, funcs, parent=None, auto_apply=False, deferred_funcs=None):
         super().__init__(parent)
         self.auto_apply = auto_apply
         title = "Recursive Explain (auto-accept)" if auto_apply else "Batch Explain Progress"
@@ -5838,6 +6184,7 @@ class BatchProgressDialog(QtWidgets.QDialog):
             # SUGGESTED_REANALYZE, bounded by the same recursive-callee cap.
             on_row_add=self._on_row_add_dynamic if auto_apply else None,
             max_extra=config.max_recursive_callees if auto_apply else 0,
+            deferred_funcs=deferred_funcs,
         )
         self.controller.start()
 
@@ -5907,20 +6254,30 @@ class BatchProgressDialog(QtWidgets.QDialog):
                     remaining * elapsed / finished))
         self.progress_label.setText("   |   ".join(parts))
 
-    def _on_row_add_dynamic(self, index, func):
-        """A SUGGESTED_REANALYZE request appended `func` to the controller's
-        queue (recursive mode only) - add a matching table row so its
-        progress shows, and remember it so its apply may replace an
-        existing non-default name. `index` mirrors the controller's own
-        row index (table rows stay 1:1 with controller.funcs)."""
-        self._reanalysis_eas.add(func.start_ea)
+    def _on_row_add_dynamic(self, index, func, is_deferred=False):
+        """A function appended to the controller's queue after start - add
+        a matching table row so its progress shows. `index` mirrors the
+        controller's own row index (table rows stay 1:1 with
+        controller.funcs). Two sources (recursive mode only):
+        - SUGGESTED_REANALYZE: `func` already has a name and is deliberately
+          allowed to have it replaced, since re-analysis is the whole point.
+        - is_deferred: the walk's own outer/caller function, held back by
+          the controller until every inner/callee function finished first
+          (see BatchController._maybe_finish) - NOT added to
+          _reanalysis_eas, since it should still follow the normal
+          conservative rename rule rather than force-overwriting a name
+          the user gave it manually.
+        """
+        if not is_deferred:
+            self._reanalysis_eas.add(func.start_ea)
         name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        suffix = "" if is_deferred else "  (reanalyze)"
         self.table.insertRow(index)
         check_item = QtWidgets.QTableWidgetItem()
         check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
         self.table.setItem(index, self.COL_APPLY, check_item)
         self.table.setItem(index, self.COL_FUNC,
-                           QtWidgets.QTableWidgetItem("%s @ %#x  (reanalyze)" % (name, func.start_ea)))
+                           QtWidgets.QTableWidgetItem("%s @ %#x%s" % (name, func.start_ea, suffix)))
         self.table.setItem(index, self.COL_NEW_NAME, QtWidgets.QTableWidgetItem(""))
         self.table.setItem(index, self.COL_STATUS, QtWidgets.QTableWidgetItem("Pending"))
         self.table.setItem(index, self.COL_PREVIEW, QtWidgets.QTableWidgetItem(""))
@@ -8866,20 +9223,26 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         return graph
 
     def open_recursive_explain(self, func):
-        """Target function plus its direct callees only (depth 1 - callees
-        of callees are not included), each explained and auto-applied.
-        Capped by config.max_recursive_callees, deliberately a smaller,
-        separate setting from max_callees since this writes to the
-        database automatically.
+        """Target function's direct callees only (depth 1 - callees of
+        callees are not included), each explained and auto-applied, THEN
+        the target itself. Capped by config.max_recursive_callees,
+        deliberately a smaller, separate setting from max_callees since
+        this writes to the database automatically.
 
-        The target itself is always explained (the user invoked this ON
-        it), but callees are limited to ones that are still UNDISCOVERED -
-        i.e. carry a default auto-generated name (sub_/loc_/nullsub_/...).
-        A callee that already has a meaningful name is left alone rather
-        than re-analyzed (and, importantly, never at risk of having its
-        existing name/comment auto-overwritten), since the point of the
-        recursive pass is to fill in the unnamed ones. See
-        is_auto_generated_name."""
+        Callees are explained first and the target last (as a deferred
+        function - see BatchController) so that by the time the target is
+        analyzed, its callees already have real names/signatures instead of
+        sub_XXXXXXXX stubs: the target's prompt (built from the
+        already-updated database) reflects what its inner functions
+        actually do, the same way a human reverse engineer would work from
+        the inside out. The target itself is always explained (the user
+        invoked this ON it), but callees are limited to ones that are still
+        UNDISCOVERED - i.e. carry a default auto-generated name
+        (sub_/loc_/nullsub_/...). A callee that already has a meaningful
+        name is left alone rather than re-analyzed (and, importantly, never
+        at risk of having its existing name/comment auto-overwritten),
+        since the point of the recursive pass is to fill in the unnamed
+        ones. See is_auto_generated_name."""
         def _is_undiscovered(callee):
             name = ida_funcs.get_func_name(callee.start_ea) or ""
             return is_auto_generated_name(name)
@@ -8887,13 +9250,9 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         callees = gather_callee_funcs(
             func, self.config.max_recursive_callees, include=_is_undiscovered
         )
-        funcs = [func]
-        seen_eas = {func.start_ea}
-        for callee in callees:
-            if callee.start_ea not in seen_eas:
-                seen_eas.add(callee.start_ea)
-                funcs.append(callee)
-        dlg = BatchProgressDialog(self.config, funcs, auto_apply=True)
+        dlg = BatchProgressDialog(
+            self.config, list(callees), auto_apply=True, deferred_funcs=[func]
+        )
         return self._track_dialog(dlg)
 
 

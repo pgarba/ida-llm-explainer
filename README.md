@@ -12,12 +12,12 @@ the Hex-Rays or the disassembly view.
 
 - **Right-click → explain** — pseudocode or disassembly view, or a hotkey (`Ctrl-Alt-E`). Answer streams in live; reasoning models show their chain-of-thought separately.
 - **Human in the loop** — every suggestion is a separate, editable checkbox. Accept / Reason More / Cancel. The model never writes on its own.
-- **Rename & retype** — proposes a function name, full C signature, local-variable renames, **code-label** renames (`LABEL_5` → `cleanup_and_return`), **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names).
+- **Rename & retype** — proposes a function name, full C signature, local-variable renames, **code-label** renames (`LABEL_5` → `cleanup_and_return`), **called-function** renames, and **global/data-variable** renames (`byte_…`, `qword_…` → meaningful names). A called-function rename proposed for code the model hasn't actually seen yet is held back rather than applied blind — an **Investigate & Reconsider Name(s)** button fetches that function's code and asks the model to confirm or revise the name before it's offered for Accept.
 - **Struct detection** — infers an undefined struct from pointer-offset access patterns and applies it.
 - **Packed-string-table recovery** — spots a helper that slices fixed-length substrings out of one merged string blob (a common obfuscation), then reads the pointer/length constants at every call site and defines each carved string (`get_partial_string(dst, blob, 6)` → `"REFLEX"`).
-- **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer, or pull in the target's own **callers** to read the concrete arguments passed at real call sites (sharpens inferred parameter types).
+- **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer, or pull in compact call-site snippets from the target's own **callers** (the call expression + inferred argument types, not their full code) to sharpen inferred parameter types, falling back to a caller's full code only if asked for.
 - **Batch mode** — explain a checklist of functions, review (incl. each proposed new name), apply in bulk.
-- **Recursive auto-accept** — explains a function + its *undiscovered* (`sub_…`) callees and applies automatically; can re-analyze an already-named callee the model flags as misnamed.
+- **Recursive auto-accept** — explains a function's *undiscovered* (`sub_…`) callees first, then the function itself, so it's analyzed with its callees' real names/signatures already known; applies automatically, and can re-analyze an already-named callee the model flags as misnamed.
 - **Multi-server** — list several `llama-server` endpoints for ~Nx parallel batch throughput, with priority order + automatic failover.
 - **CFG recovery for obfuscated code** — walks basic blocks, resolves opaque predicates / dead code / flattening dispatchers with a fast deterministic pass (falls back to the LLM only when unsure), then optionally **patches** or **rebuilds** the real control flow. x86/x64 and AArch64.
 
@@ -57,7 +57,7 @@ Results are cached for the session (**Load Cached Result**), and any in-place/re
 | Temperature / Max tokens | `0.2` / `16384` | Keep tokens generous for reasoning models |
 | Follow calls depth | `0` | `N>0` eagerly includes N levels of callee code |
 | Max on-demand code requests | `5` | Cap on the model's `REQUEST_CODE`/`REQUEST_CALLERS` round-trips per conversation |
-| Max callers shown per request | `3` | How many call sites `REQUEST_CALLERS` returns for argument-type inference |
+| Max callers shown per request | `3` | How many callers `REQUEST_CALLERS` returns a compact call-site snippet for (not their full code) |
 | Max recursive callees | `10` | Cap for the recursive auto-accept action |
 | System prompt(s) | *(editable)* | Explain + CFG-trace protocols |
 | Resolve branches via constant propagation | on | Fast deterministic pass before the LLM (disable to always ask) |
@@ -73,7 +73,7 @@ The system prompt asks the model to emit structured lines the plugin parses out 
 | Marker | Purpose |
 |---|---|
 | `REQUEST_CODE: <fn>` | fetch a callee's code before answering (automatic) |
-| `REQUEST_CALLERS[: <fn>]` | fetch a few of the target's callers to read the concrete arguments passed in (automatic) |
+| `REQUEST_CALLERS[: <fn>]` | fetch a compact call-site snippet (call expression + inferred argument types, not full code) from a few of the target's callers (automatic) |
 | `SUGGESTED_NAME: <name>` | function name |
 | `SUGGESTED_SIGNATURE: <decl>` | prototype (Hex-Rays only) |
 | `SUGGESTED_VAR: <old> -> <new>` | local rename (Hex-Rays only) |
