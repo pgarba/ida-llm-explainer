@@ -16,6 +16,7 @@ the Hex-Rays or the disassembly view.
 - **Struct detection** — infers an undefined struct from pointer-offset access patterns and applies it.
 - **Packed-string-table recovery** — spots a helper that slices fixed-length substrings out of one merged string blob (a common obfuscation), then reads the pointer/length constants at every call site and defines each carved string (`get_partial_string(dst, blob, 6)` → `"REFLEX"`).
 - **Call-graph aware** — follows callees (configurable depth) and can fetch a specific callee's code on demand mid-answer, or pull in compact call-site snippets from the target's own **callers** (the call expression + inferred argument types, not their full code) to sharpen inferred parameter types, falling back to a caller's full code only if asked for.
+- **Export as compilable C** — right-click → *Export function as compilable C…* rewrites the pseudocode as a standalone `.h` + `.c` pair you can paste into a real project: `stdint.h` types instead of `__int64`/`_QWORD`, self-defined replacements for Hex-Rays intrinsics (`LOBYTE`, `__ROL4__`, …), and real struct/enum typedefs converted from IDA's own local types. Everything still living in the binary is bound to `g_image_base + RVA` (original VA in a comment) so it links *and* survives relocation — globals as typed accessors, un-emitted callees as a function-pointer typedef + same-named macro, while imported CRT/OS functions get their real header instead. String literals and small read-only tables are emitted as actual C data, so the result genuinely stands alone. One editable tab per file, **Copy** / **Save Files…**, a **Refine** box, and **Continue** for when the model hits its token limit mid-file. Writes nothing to your database.
 - **Batch mode** — explain a checklist of functions, review (incl. each proposed new name), apply in bulk.
 - **Recursive auto-accept** — explains a function's *undiscovered* (`sub_…`) callees first, then the function itself, so it's analyzed with its callees' real names/signatures already known; applies automatically, and can re-analyze an already-named callee the model flags as misnamed.
 - **Multi-server** — list several `llama-server` endpoints for ~Nx parallel batch throughput, with priority order + automatic failover.
@@ -30,6 +31,7 @@ Copy `llm_explainer.py` into `<IDA user dir>\plugins\` (Windows: `%APPDATA%\Hex-
 - **One function** — right-click → *Explain function with LLM…*, review the streamed suggestions, **Accept & Add Comment**.
 - **Batch** — Functions window → *Batch Explain Functions…*, check functions, **Apply Selected** when done. A **New Name** column shows the proposed rename per function as it finishes (marked `(kept: …)` when the existing non-default name would be preserved).
 - **Recursive** — right-click → *Explain function with LLM (recursively)…*. Auto-applies; capped by *Max recursive callees*; writes unattended, so use with care.
+- **Export C** — right-click → *Export function as compilable C…*, then **Save Files…** and build the `.h`/`.c` pair with your own toolchain; use **Refine** ("target MSVC", "no macros for globals") to iterate on anything that doesn't compile.
 - **CFG recovery** — disassembly view → *Trace/Recover CFG…*, pick a start address, watch the live transcript/graph, then review each block and pick an **On Accept** mode.
 
 ![Batch mode with a local Qwen model](qwen_ida.png)
@@ -59,7 +61,10 @@ Results are cached for the session (**Load Cached Result**), and any in-place/re
 | Max on-demand code requests | `5` | Cap on the model's `REQUEST_CODE`/`REQUEST_CALLERS` round-trips per conversation |
 | Max callers shown per request | `3` | How many callers `REQUEST_CALLERS` returns a compact call-site snippet for (not their full code) |
 | Max recursive callees | `10` | Cap for the recursive auto-accept action |
-| System prompt(s) | *(editable)* | Explain + CFG-trace protocols |
+| System prompt(s) | *(editable)* | Explain + CFG-trace + C-export protocols |
+| Max globals exported | `40` | How many referenced globals the C export describes (name, VA, RVA, size, type, segment) |
+| Embed initialized read-only data | on | Sends the actual bytes of strings/const tables so the exported C can define them as real data |
+| Max embedded bytes per global | `512` | Per-global cap; anything larger stays an address-based accessor |
 | Resolve branches via constant propagation | on | Fast deterministic pass before the LLM (disable to always ask) |
 | Enumerate ARM64 computed jump tables | off | Experimental; see above |
 | CFG trace colors / Max blocks | green/red/amber, `200` | REAL / DEAD / UNRESOLVED |
@@ -84,6 +89,7 @@ The system prompt asks the model to emit structured lines the plugin parses out 
 | `SUGGESTED_STRUCT: <decl>` | define + register a struct type |
 | `SUGGESTED_VAR_TYPE: <var> <type>` | apply a type to a local |
 | `SUGGESTED_STRING_EXTRACTOR: <fn> ptr=<n> len=<m>` | flag a helper that slices fixed-length substrings out of a packed string blob; the plugin reads the pointer/length constants at every call site and defines each carved string |
+| `BEGIN_FILE: <name>` … `END_FILE` | one emitted source file (C export only); a reply cut off mid-file is stitched back together by **Continue** |
 
 The prose answer itself is kept to one sentence — it becomes the function comment.
 

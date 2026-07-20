@@ -59,6 +59,33 @@ renaming a function whose name looks auto-generated), the callee count is
 capped by its own "Max recursive callees" setting, and a progress dialog
 stays open so you can watch what happens and cancel mid-run.
 
+"Export function as compilable C..." (same right-click menu) goes the other
+direction from every other action here: instead of writing something into
+the database, it takes the function OUT of IDA. Hex-Rays pseudocode does not
+compile - it uses IDA-only types (__int64, _BYTE, _QWORD), Hex-Rays
+intrinsics (LOBYTE, __ROL4__, __PAIR64__), calling-convention keywords,
+undeclared sub_XXXXXXXX callees and bare dword_140002000 globals with no
+definition anywhere. The plugin hands the model the pseudocode plus what the
+database actually knows - IDA's own C definitions of every user-defined type
+the function uses (printed with idc.print_decls, dependencies included), a
+table of every referenced global with its address, RVA, size, type, segment
+and, for string literals and small read-only objects, its actual bytes, and
+the current prototype of every callee - and asks for a self-contained .h/.c
+pair using only standard headers. Anything still living inside the analyzed
+binary - globals AND functions the model does not emit a body for - is bound
+relative to a g_image_base pointer (base + RVA, original VA in a comment) so
+the result both links and survives relocation: globals become typed
+accessors, un-emitted callees a function-pointer typedef plus a same-named
+macro (imported CRT/OS functions are declared from their real headers
+instead, since their address here is only this binary's import thunk).
+Initialized read-only data can be emitted as real C initializers rather than
+an address, so the code is genuinely standalone.
+The result appears in a dialog with one editable tab per file, a Refine box
+for follow-up instructions ("target MSVC", "no macros for globals"), a
+Continue button for when the model runs into its token limit mid-file, and
+Copy/Save Files actions. Nothing is ever written to the IDA database by this
+action.
+
 "Trace/Recover CFG..." (disassembly view only, since the whole point is a
 blob that may not even be recognized as a function) walks an obfuscated
 function's basic blocks forward from a given start address - the kind
@@ -173,12 +200,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.7.3"
+PLUGIN_VERSION = "1.8.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
 ACTION_ID_EXPLAIN_RECURSIVE = "llm_explainer:explain_recursive"
 ACTION_ID_TRACE_CFG = "llm_explainer:trace_cfg"
+ACTION_ID_EXPORT_C = "llm_explainer:export_c"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 
 
@@ -557,6 +585,134 @@ CFG_TRACE_SYSTEM_PROMPT = (
     "case 3b and both sides marked REAL."
 )
 
+CODEGEN_SYSTEM_PROMPT = (
+    "You are an expert reverse engineer and C programmer. You will be given "
+    "one function's Hex-Rays pseudocode (or, if the decompiler was not "
+    "available, its disassembly) exactly as IDA Pro produced it, together "
+    "with IDA's own definitions of the user-defined types it uses, a table "
+    "of every global/data object it references (name, virtual address, RVA, "
+    "size, type, segment, and - for initialized read-only data - the actual "
+    "bytes), and the prototypes of the functions it calls.\n\n"
+    "Your job is to rewrite that function as ORDINARY, SELF-CONTAINED C that "
+    "a developer can paste straight into a normal C/C++ project and compile "
+    "with a stock toolchain (gcc/clang/MSVC), with no IDA or Hex-Rays "
+    "headers anywhere and no undeclared identifiers left behind.\n\n"
+    "OUTPUT FORMAT - reply with EXACTLY two files and nothing outside "
+    "them (no prose, no explanation before or after, no markdown fences):\n"
+    "BEGIN_FILE: <basename>.h\n"
+    "...header contents...\n"
+    "END_FILE\n"
+    "BEGIN_FILE: <basename>.c\n"
+    "...implementation contents...\n"
+    "END_FILE\n"
+    "Use the suggested base name given in the request. The header carries "
+    "the include guard, the standard includes, every typedef/struct/union/"
+    "enum, the compatibility helpers, the global accessors and the extern "
+    "declarations; the .c file includes that header and holds the function "
+    "definition itself (plus the definition of any object the header only "
+    "declares extern).\n\n"
+    "RULES:\n"
+    "1. STANDARD HEADERS ONLY - <stdint.h>, <stddef.h>, <stdbool.h>, "
+    "<string.h>, <stdlib.h>, and so on. NEVER include ida.h, defs.h, "
+    "hexrays.h, or anything else that only exists inside IDA.\n"
+    "2. CONVERT EVERY IDA TYPE to a fixed-width standard one: __int8 -> "
+    "int8_t, __int16 -> int16_t, __int32 -> int32_t, __int64 -> int64_t, "
+    "unsigned __intN -> uintN_t, _BYTE -> uint8_t, _WORD -> uint16_t, "
+    "_DWORD -> uint32_t, _QWORD -> uint64_t, _OWORD -> a 16-byte struct you "
+    "define, _BOOL1/_BOOL2/_BOOL4 -> bool, _UNKNOWN -> void. Pointer-sized "
+    "integers become uintptr_t/intptr_t, not a fixed width.\n"
+    "3. DROP IDA CALLING-CONVENTION AND ATTRIBUTE KEYWORDS - __fastcall, "
+    "__stdcall, __cdecl, __usercall, __userpurge, __spoils, __noreturn, "
+    "__hidden, __return_ptr, __struct_ptr. If a convention genuinely matters "
+    "for the target platform, define ONE portable macro in the header (e.g. "
+    "#define RE_CALLCONV) that expands to nothing by default, and use that. "
+    "A __usercall/__userpurge function must be rewritten as a normal "
+    "function taking its arguments in order; note the original register "
+    "assignment in a comment.\n"
+    "4. HEX-RAYS INTRINSICS AND MACROS DO NOT EXIST outside IDA. Anything "
+    "like LOBYTE/HIBYTE/LOWORD/HIWORD/LODWORD/HIDWORD, BYTEn/WORDn/DWORDn, "
+    "SLOBYTE/SHIWORD/..., __ROL1__/__ROL4__/__ROR8__, __PAIR64__/__PAIR128__, "
+    "__CFADD__/__CFSUB__/__OFADD__/__OFSUB__, _byteswap_*, __readfsqword/"
+    "__readgsqword, is_mul_ok, __SETO__, MEMORY[...], _InterlockedExchange "
+    "and friends MUST be replaced by explicit C you write yourself: either "
+    "inline the arithmetic directly, or define a small `static inline` "
+    "helper (or macro) for it in the header. Never emit a call to one of "
+    "these without defining it. Prefer shifts/masks over type punning; where "
+    "you must pun, use memcpy or a union rather than a strict-aliasing "
+    "violation.\n"
+    "5. TYPES - emit a proper C definition for every struct/union/enum the "
+    "function touches, converted from the IDA type dump in the request. Keep "
+    "the layout faithful: preserve field order and offsets, insert explicit "
+    "padding members where IDA shows gaps, and use #pragma pack(push, 1) / "
+    "#pragma pack(pop) around any type whose packing demands it. "
+    "Forward-declare types that reference each other or themselves. If a "
+    "field's type is unknown, use a byte array of the right size rather "
+    "than guessing.\n"
+    "6. CALLED FUNCTIONS - every function called but not defined here gets a "
+    "declaration. If it is clearly a standard C library function (memcpy, "
+    "malloc, strlen, ...), just include the real standard header instead of "
+    "declaring it yourself. If it is a documented OS/platform API, declare "
+    "it in a clearly marked block so the user can swap in the real SDK "
+    "header. A callee the request marks [imported] is one of these two "
+    "cases - it lives in another module, so declare it normally and never "
+    "bind it to an address (that address is just this binary's import "
+    "thunk). Otherwise the function lives in the analyzed binary and nothing "
+    "would resolve it at link time, so DO NOT leave it as a bare `extern` "
+    "prototype - bind it to its address exactly the way rule 7 binds "
+    "globals: emit a function-pointer typedef carrying the prototype from "
+    "the request, plus a same-named macro built from its RVA, with the "
+    "original virtual address in a comment. For example, given "
+    "int poly_mul_scalar(struct BigInt *src, unsigned int multiplier, "
+    "struct DynArray *dst) at VA 0x140001100 (RVA 0x1100):\n"
+    "/* poly_mul_scalar @ VA 0x140001100 - resolved in the target module */\n"
+    "typedef int (*poly_mul_scalar_fn)(struct BigInt *src, unsigned int "
+    "multiplier, struct DynArray *dst);\n"
+    "#define poly_mul_scalar ((poly_mul_scalar_fn)(uintptr_t)(g_image_base "
+    "+ 0x1100))\n"
+    "Cast through uintptr_t like that so the object-pointer-to-function-"
+    "pointer conversion is explicit, and keep the macro's name identical to "
+    "the name used in the body so call sites read unchanged. The same "
+    "applies to any function pointer the code calls through whose target "
+    "address is known. If you need "
+    "to see a called function's actual code before you can write an honest "
+    "prototype for it, reply with ONLY the single line\n"
+    "REQUEST_CODE: <function name or address>\n"
+    "(one such line per function, nothing else in that reply); you will be "
+    "given the code and can then produce the files.\n"
+    "7. GLOBALS - the request gives you, for each referenced global, its "
+    "virtual address AND its RVA (offset from the module's image base). "
+    "Bind globals RELATIVE TO A BASE POINTER so the code still works when "
+    "the module is relocated. In the header declare\n"
+    "extern uint8_t *g_image_base;\n"
+    "and in the .c file define it to the original image base given in the "
+    "request. Then give each global a named accessor built from its RVA, "
+    "with the original virtual address in a comment, e.g.\n"
+    "/* dword_140002000 @ VA 0x140002000 */\n"
+    "#define g_flags (*(uint32_t *)(g_image_base + 0x2000))\n"
+    "Use the global's real type for the cast, and an array/pointer accessor "
+    "(g_image_base + RVA, cast to the element pointer type) for arrays and "
+    "buffers rather than dereferencing them.\n"
+    "8. EMBEDDED DATA - when the request supplies the actual bytes of a "
+    "read-only global (a string literal, a constant table), prefer emitting "
+    "it as REAL C DATA - static const char k_name[] = \"...\"; or static "
+    "const uint8_t k_name[] = { 0x.., ... }; - and use that object in the "
+    "code instead of the address accessor, so the result is genuinely "
+    "standalone. Keep the original name and VA in a comment. Writable or "
+    "uninitialized globals stay address-based accessors (rule 7).\n"
+    "9. PRESERVE SEMANTICS. This is a port, not a rewrite: same control "
+    "flow, same arithmetic, same side effects, same argument order. You may "
+    "improve names and structure, and you may keep goto/labels where the "
+    "original control flow needs them. Do NOT invent behavior for something "
+    "you cannot recover - leave it as an explicit /* TODO: ... */ comment "
+    "next to the closest faithful approximation, and never silently drop a "
+    "statement.\n"
+    "10. IT MUST COMPILE. Every identifier used anywhere in the two files "
+    "must be defined or declared in them (or come from a standard header you "
+    "included). No IDA-only spellings, no dangling helpers, no placeholder "
+    "types. Before you answer, re-read your own output once and check each "
+    "identifier against that rule."
+)
+
 DEFAULT_CONFIG = {
     "server_urls": ["http://127.0.0.1:8080"],
     "server_names": {},
@@ -592,6 +748,14 @@ DEFAULT_CONFIG = {
     # or over-shoot. Every enumerated target is still shown for review
     # before anything is written/patched. See _try_enumerate_arm64_table_dispatch.
     "cfg_trace_enumerate_computed_jumps": False,
+    "codegen_system_prompt": CODEGEN_SYSTEM_PROMPT,
+    # Cap on how many referenced globals the "Export as compilable C" request
+    # describes, and how many bytes of an initialized read-only global it
+    # dumps for the model to embed as a real C initializer (0 disables the
+    # byte dump entirely, leaving every global address-based).
+    "codegen_max_globals": 40,
+    "codegen_max_data_bytes": 512,
+    "codegen_embed_data": True,
     # sha256 of DEFAULT_SYSTEM_PROMPT / CFG_TRACE_SYSTEM_PROMPT as they were
     # when this config was last saved (set in save()). Lets a later load
     # tell "the stored prompt was that version's UNMODIFIED default" (hash
@@ -601,6 +765,7 @@ DEFAULT_CONFIG = {
     # historical registry below. See PluginConfig._upgrade_stale_default_prompts.
     "system_prompt_default_hash": "",
     "cfg_trace_prompt_default_hash": "",
+    "codegen_prompt_default_hash": "",
 }
 
 
@@ -631,6 +796,10 @@ _KNOWN_CFG_TRACE_PROMPT_HASHES = frozenset({
     "647d49a3f20832c369f164617e20e906852c172ef7b7662419fb52a494576f05",
     "48c637e12b804769465a1e8f3f305e9144be722fcdbd502308806ffe2ceba94c",
 })
+# Deliberately empty: the codegen prompt shipped only after the save-time
+# default-hash stamp existed, so every config that could ever hold one also
+# carries its own codegen_prompt_default_hash. Nothing to backfill.
+_KNOWN_CODEGEN_PROMPT_HASHES = frozenset()
 
 ContextBundle = namedtuple("ContextBundle", ["kind", "text"])
 
@@ -676,6 +845,12 @@ _STRING_EXTRACTOR_LEN_RE = re.compile(r"(?i)\blen\s*=\s*(\d+)")
 # harmless/ignored elsewhere. Target is a single token; optional reason
 # after a dash.
 _SUGGESTED_REANALYZE_RE = re.compile(r"(?im)^\s*SUGGESTED_REANALYZE:\s*(\S+)(?:\s*-\s*(.*?))?\s*$")
+# "Export function as compilable C": the model wraps each emitted source
+# file in BEGIN_FILE: <name> ... END_FILE. Non-greedy body, MULTILINE so the
+# markers anchor to their own lines, DOTALL so the body may span lines.
+_CODEGEN_FILE_RE = re.compile(r"(?ims)^[ \t]*BEGIN_FILE:[ \t]*(\S+)[ \t]*$\n(.*?)^[ \t]*END_FILE[ \t]*$")
+_CODEGEN_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.+\-]{1,64}$")
+
 _VALID_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _AUTO_NAME_RE = re.compile(r"^(sub|loc|nullsub|j_sub|j_nullsub)_[0-9A-Fa-f]+$")
 
@@ -858,6 +1033,395 @@ def format_data_refs_section(data_refs):
     if names:
         lines.append("Globals referenced: " + ", ".join(names))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Context gathering for "Export function as compilable C"
+#
+# Everything below is read-only: it describes what the database already knows
+# about the function's types, globals and callees precisely enough that the
+# model can emit standalone C (real type definitions, extern prototypes, and
+# globals bound to image_base + RVA) instead of guessing. See
+# CODEGEN_SYSTEM_PROMPT for what the model is asked to do with it.
+# ---------------------------------------------------------------------------
+
+def _image_base():
+    try:
+        return idaapi.get_imagebase()
+    except Exception:
+        return 0
+
+
+def _pointer_size_bits():
+    try:
+        if ida_ida is not None:
+            return 64 if ida_ida.inf_is_64bit() else 32
+    except Exception:
+        pass
+    try:
+        return 64 if (idc.get_inf_attr(idc.INF_LFLAGS) & idc.LFLG_64BIT) else 32
+    except Exception:
+        return 64
+
+
+def _tinfo_at(ea):
+    """Declared type of the data item at `ea` as a tinfo_t, or None."""
+    try:
+        tif = ida_typeinf.tinfo_t()
+        if ida_nalt.get_tinfo(tif, ea) and not _tinfo_is_empty(tif):
+            return tif
+    except Exception:
+        pass
+    return None
+
+
+def _guess_data_type_name(ea, size):
+    """Fallback C type for a data item IDA has no explicit type for, derived
+    from how the item is defined in the listing (byte/word/dword/qword) and
+    otherwise from its size. Deliberately spells out fixed-width types - the
+    model is told to emit stdint.h types, so hand it those already."""
+    try:
+        flags = ida_bytes.get_flags(ea)
+    except Exception:
+        flags = 0
+    for pred, name in (
+        ("is_byte", "uint8_t"),
+        ("is_word", "uint16_t"),
+        ("is_dword", "uint32_t"),
+        ("is_qword", "uint64_t"),
+        ("is_float", "float"),
+        ("is_double", "double"),
+    ):
+        try:
+            if getattr(ida_bytes, pred)(flags):
+                return name
+        except Exception:
+            continue
+    return {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}.get(size, "uint8_t")
+
+
+CodegenGlobal = namedtuple("CodegenGlobal", [
+    "ea", "name", "type_decl", "size", "is_string", "text", "init_bytes",
+    "segment", "writable",
+])
+CodegenCallee = namedtuple("CodegenCallee", ["ea", "name", "prototype", "imported"])
+
+
+def gather_codegen_globals(func, config):
+    """Every global/data object func's instructions reference, described in
+    enough detail to re-express it in standalone C: name, address, size,
+    declared type, segment + writability, and (for initialized read-only
+    data and string literals, when small enough) its actual bytes.
+
+    Mirrors gather_data_refs' walk (root function only, dedupe by address,
+    skip function entries, one bad ref never aborts the rest) but keeps the
+    raw facts rather than a display string, and is capped by its own
+    codegen_max_globals setting.
+    """
+    max_globals = max(0, int(getattr(config, "codegen_max_globals", 0) or 0))
+    if max_globals <= 0:
+        return []
+    max_data_bytes = max(0, int(getattr(config, "codegen_max_data_bytes", 0) or 0))
+    embed = bool(getattr(config, "codegen_embed_data", False)) and max_data_bytes > 0
+    result = []
+    seen = set()
+    for ea in idautils.FuncItems(func.start_ea):
+        try:
+            refs = list(idautils.DataRefsFrom(ea))
+        except Exception:
+            continue
+        for ref in refs:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                callee = ida_funcs.get_func(ref)
+                if callee is not None and callee.start_ea == ref:
+                    continue  # a function entry - handled by gather_codegen_callees
+            except Exception:
+                pass
+            try:
+                name = idc.get_name(ref) or ""
+            except Exception:
+                name = ""
+            if not name:
+                continue
+            try:
+                size = ida_bytes.get_item_size(ref) or 1
+            except Exception:
+                size = 1
+
+            is_string = False
+            text = ""
+            try:
+                strtype = idc.get_str_type(ref)
+            except Exception:
+                strtype = None
+            if strtype is not None:
+                try:
+                    raw = idc.get_strlit_contents(ref, -1, strtype)
+                    text = (raw or b"").decode("utf-8", "replace")
+                    is_string = bool(text)
+                except Exception:
+                    is_string = False
+            if is_string and len(text) > config.max_string_len:
+                text = text[: config.max_string_len] + "...[truncated]"
+
+            tif = _tinfo_at(ref)
+            if tif is not None:
+                try:
+                    type_decl = tif.dstr()
+                except Exception:
+                    type_decl = _guess_data_type_name(ref, size)
+            elif is_string:
+                type_decl = "char[]"
+            else:
+                type_decl = _guess_data_type_name(ref, size)
+
+            segment = ""
+            writable = True
+            try:
+                seg = ida_segment.getseg(ref)
+                if seg is not None:
+                    segment = ida_segment.get_segm_name(seg) or ""
+                    perm = getattr(seg, "perm", 0)
+                    if perm:
+                        writable = bool(perm & ida_segment.SEGPERM_WRITE)
+            except Exception:
+                pass
+
+            # Only initialized data worth pasting into the generated C: a
+            # string literal (its contents ARE the interesting part, however
+            # the segment is mapped) or a small read-only object. Writable
+            # globals stay address-based - their runtime value is not the
+            # bytes sitting in the file.
+            init_bytes = b""
+            if embed and size <= max_data_bytes and (is_string or not writable):
+                try:
+                    if ida_bytes.is_loaded(ref):
+                        init_bytes = ida_bytes.get_bytes(ref, size) or b""
+                except Exception:
+                    init_bytes = b""
+
+            result.append(CodegenGlobal(
+                ea=ref, name=name, type_decl=type_decl, size=size,
+                is_string=is_string, text=text, init_bytes=init_bytes,
+                segment=segment, writable=writable,
+            ))
+            if len(result) >= max_globals:
+                return result
+    return result
+
+
+def format_codegen_globals_section(globals_, image_base):
+    """One line per referenced global, giving the model everything rule 7/8
+    of CODEGEN_SYSTEM_PROMPT needs: name, VA, RVA (so accessors can be
+    base-relative), size, type, segment/writability, and the actual bytes
+    where we have them."""
+    if not globals_:
+        return ""
+    lines = ["Referenced globals (bind these to g_image_base + RVA):"]
+    for g in globals_:
+        rva = g.ea - image_base if g.ea >= image_base else g.ea
+        parts = [
+            "  %s: VA %#x, RVA %#x, size %d, type %s" % (g.name, g.ea, rva, g.size, g.type_decl),
+        ]
+        if g.segment:
+            parts.append("seg %s" % g.segment)
+        parts.append("writable" if g.writable else "read-only")
+        line = ", ".join(parts)
+        if g.is_string and g.text:
+            escaped = g.text.replace("\\", "\\\\").replace('"', '\\"')
+            escaped = escaped.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+            line += '\n    contents: "%s"' % escaped
+        elif g.init_bytes:
+            line += "\n    bytes: %s" % " ".join("%02X" % b for b in g.init_bytes)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def gather_codegen_callees(func, config):
+    """Direct callees with their current prototypes, so the model can emit an
+    honest `extern` declaration for each instead of inventing one. `imported`
+    marks a callee living in an import/extern segment (a library function the
+    user will want to satisfy with the real SDK header)."""
+    # An export needs every callee's prototype to declare it, so a user who
+    # turned the explain prompt's callee list down to 0 still gets the
+    # default cap here rather than an empty declaration section.
+    limit = config.max_callees if config.max_callees > 0 else DEFAULT_CONFIG["max_callees"]
+    callees = gather_callee_funcs(func, limit)
+    result = []
+    for callee in callees:
+        ea = callee.start_ea
+        try:
+            name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
+        except Exception:
+            name = "sub_%X" % ea
+        prototype = ""
+        try:
+            prototype = idc.get_type(ea) or ""
+        except Exception:
+            prototype = ""
+        imported = False
+        try:
+            seg = ida_segment.getseg(ea)
+            if seg is not None:
+                seg_class = (ida_segment.get_segm_class(seg) or "").upper()
+                seg_name = (ida_segment.get_segm_name(seg) or "").lower()
+                imported = seg_class == "XTRN" or seg_name in ("extern", ".idata", ".plt")
+        except Exception:
+            pass
+        result.append(CodegenCallee(ea=ea, name=name, prototype=prototype, imported=imported))
+    return result
+
+
+def format_codegen_callees_section(callees, image_base):
+    if not callees:
+        return ""
+    lines = [
+        "Called functions - for each one you do not define yourself, bind it "
+        "to g_image_base + RVA via a function-pointer typedef + macro (rule "
+        "6), except where [imported] marks it as belonging to another module:"
+    ]
+    for c in callees:
+        rva = c.ea - image_base if c.ea >= image_base else c.ea
+        proto = c.prototype or "(no prototype known - infer one from the call sites)"
+        lines.append(
+            "  %s: VA %#x, RVA %#x%s\n    prototype: %s"
+            % (c.name, c.ea, rva, " [imported]" if c.imported else "", proto)
+        )
+    return "\n".join(lines)
+
+
+def _collect_type_ordinals(tif, ordinals, depth=0):
+    """Add the local-type ordinal(s) `tif` ultimately depends on to
+    `ordinals`. Strips pointers/arrays down to the named base type and
+    descends one level into function types (return type + arguments).
+    Depth-limited and fully guarded: an exotic or broken type must never
+    break the export."""
+    if tif is None or depth > 4 or len(ordinals) > 64:
+        return
+    try:
+        for _ in range(8):
+            if tif.is_ptr():
+                tif = tif.get_pointed_object()
+            elif tif.is_array():
+                tif = tif.get_array_element()
+            else:
+                break
+            if tif is None:
+                return
+    except Exception:
+        return
+    try:
+        if tif.is_func():
+            try:
+                _collect_type_ordinals(tif.get_rettype(), ordinals, depth + 1)
+                for i in range(tif.get_nargs()):
+                    _collect_type_ordinals(tif.get_nth_arg(i), ordinals, depth + 1)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
+    try:
+        ordinal = tif.get_ordinal()
+    except Exception:
+        ordinal = 0
+    if ordinal:
+        ordinals.add(int(ordinal))
+
+
+def gather_codegen_type_decls(func, config, globals_=None):
+    """IDA's own C definitions of every user-defined type the function uses -
+    its prototype, its Hex-Rays locals, and its referenced globals' types -
+    printed with idc.print_decls(PDF_INCL_DEPS), so nested/dependent types
+    come along automatically. Returns "" when there are none (or when
+    Hex-Rays/local types are unavailable): the model is then simply told
+    nothing about types and defines what it needs itself.
+    """
+    ordinals = set()
+    try:
+        tif = ida_typeinf.tinfo_t()
+        if ida_nalt.get_tinfo(tif, func.start_ea):
+            _collect_type_ordinals(tif, ordinals)
+    except Exception:
+        pass
+    if ida_hexrays is not None:
+        try:
+            if ida_hexrays.init_hexrays_plugin():
+                cfunc = ida_hexrays.decompile(func)
+                if cfunc is not None:
+                    for lvar in cfunc.get_lvars():
+                        try:
+                            _collect_type_ordinals(lvar.type(), ordinals)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+    for g in (globals_ or []):
+        gtif = _tinfo_at(g.ea)
+        if gtif is not None:
+            _collect_type_ordinals(gtif, ordinals)
+    if not ordinals:
+        return ""
+    try:
+        text = idc.print_decls(
+            ",".join(str(o) for o in sorted(ordinals)),
+            idc.PDF_INCL_DEPS | idc.PDF_DEF_FWD,
+        ) or ""
+    except Exception as exc:
+        ida_kernwin.msg("[%s] Could not print local type definitions: %s\n" % (PLUGIN_NAME, exc))
+        return ""
+    text = text.strip()
+    if len(text) > config.max_context_chars:
+        text = text[: config.max_context_chars] + "\n...[truncated]..."
+    return text
+
+
+def codegen_file_basename(func_ea):
+    """Suggested output file base name for a function, e.g. "recovered_foo"."""
+    name = ida_funcs.get_func_name(func_ea) or ("sub_%X" % func_ea)
+    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name).strip("_") or ("sub_%X" % func_ea)
+    return "recovered_%s" % cleaned
+
+
+def build_codegen_user_message(config, func, ctx, type_decls, globals_, callees):
+    """The single user turn for an "export as compilable C" request: what the
+    function is, the types/globals/callees it depends on, and its body.
+    Mirrors build_user_message's shape (header lines, then blocks)."""
+    name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+    base = _image_base()
+    rva = func.start_ea - base if func.start_ea >= base else func.start_ea
+    parts = [
+        "Rewrite the function below as standalone, compilable C.\n\n"
+        "Function: %s\n"
+        "Address: %#x (RVA %#x)\n"
+        "Module image base: %#x\n"
+        "Architecture: %s (%d-bit pointers)\n"
+        "Source form: %s\n"
+        "Suggested output file base name: %s (emit %s.h and %s.c)\n"
+        % (
+            name, func.start_ea, rva, base, get_procname(), _pointer_size_bits(),
+            "Hex-Rays pseudocode" if ctx.kind == "pseudocode" else
+            "disassembly (the decompiler was unavailable - reconstruct the C from it)",
+            codegen_file_basename(func.start_ea),
+            codegen_file_basename(func.start_ea), codegen_file_basename(func.start_ea),
+        )
+    ]
+    if type_decls:
+        parts.append(
+            "--- Type definitions as IDA knows them (convert these to portable "
+            "C; they may use IDA-only spellings) ---\n%s" % type_decls
+        )
+    globals_section = format_codegen_globals_section(globals_, base)
+    if globals_section:
+        parts.append(globals_section)
+    callees_section = format_codegen_callees_section(callees, base)
+    if callees_section:
+        parts.append(callees_section)
+    parts.append(format_function_block("Target function", func.start_ea, ctx, config))
+    return "\n\n".join(parts)
 
 
 def format_function_block(label, func_ea, ctx, config):
@@ -3849,6 +4413,7 @@ class PluginConfig(object):
         # customization (keep it). See _upgrade_stale_default_prompts.
         self.system_prompt_default_hash = _prompt_hash(DEFAULT_SYSTEM_PROMPT)
         self.cfg_trace_prompt_default_hash = _prompt_hash(CFG_TRACE_SYSTEM_PROMPT)
+        self.codegen_prompt_default_hash = _prompt_hash(CODEGEN_SYSTEM_PROMPT)
         data = self.to_dict()
         # Never persist a prompt that is just the current default - store it
         # empty so a non-customizer always picks up the latest default on
@@ -3859,6 +4424,8 @@ class PluginConfig(object):
             data["system_prompt"] = ""
         if data.get("cfg_trace_system_prompt") == CFG_TRACE_SYSTEM_PROMPT:
             data["cfg_trace_system_prompt"] = ""
+        if data.get("codegen_system_prompt") == CODEGEN_SYSTEM_PROMPT:
+            data["codegen_system_prompt"] = ""
         path = self._config_path()
         tmp_path = path + ".tmp"
         try:
@@ -3983,6 +4550,16 @@ class PluginConfig(object):
         self.cfg_trace_system_prompt = self.cfg_trace_system_prompt or CFG_TRACE_SYSTEM_PROMPT
         self.cfg_trace_use_symbolic = bool(self.cfg_trace_use_symbolic)
         self.cfg_trace_enumerate_computed_jumps = bool(self.cfg_trace_enumerate_computed_jumps)
+        self.codegen_system_prompt = self.codegen_system_prompt or CODEGEN_SYSTEM_PROMPT
+        self.codegen_embed_data = bool(self.codegen_embed_data)
+        try:
+            self.codegen_max_globals = max(0, min(500, int(self.codegen_max_globals)))
+        except (TypeError, ValueError):
+            self.codegen_max_globals = DEFAULT_CONFIG["codegen_max_globals"]
+        try:
+            self.codegen_max_data_bytes = max(0, min(65536, int(self.codegen_max_data_bytes)))
+        except (TypeError, ValueError):
+            self.codegen_max_data_bytes = DEFAULT_CONFIG["codegen_max_data_bytes"]
 
     def _upgrade_stale_default_prompts(self):
         """Auto-adopt the current default for any stored prompt that is an
@@ -4004,6 +4581,11 @@ class PluginConfig(object):
             self.cfg_trace_system_prompt, CFG_TRACE_SYSTEM_PROMPT,
             getattr(self, "cfg_trace_prompt_default_hash", ""),
             _KNOWN_CFG_TRACE_PROMPT_HASHES, "CFG trace system prompt",
+        )
+        self.codegen_system_prompt = self._maybe_adopt_default(
+            getattr(self, "codegen_system_prompt", ""), CODEGEN_SYSTEM_PROMPT,
+            getattr(self, "codegen_prompt_default_hash", ""),
+            _KNOWN_CODEGEN_PROMPT_HASHES, "C export system prompt",
         )
 
     @staticmethod
@@ -4381,6 +4963,35 @@ class ConversationRunner(object):
         self._on_error_cb(message)
         return 0
 
+    # Sent once the model has used up its REQUEST_CODE budget. A subclass
+    # producing something other than an explanation (see CodeGenRunner)
+    # overrides this so the nudge asks for ITS deliverable.
+    _FORCE_FINAL_TEMPLATE = (
+        "You have reached the maximum number of code requests (%d). "
+        "Please give your best explanation now based on the information "
+        "already gathered, without requesting further code."
+    )
+
+    # Appended when a REQUEST_CODE/REQUEST_CALLERS round turned up nothing
+    # the model hasn't already been shown (see _handle_code_requests).
+    _NO_PROGRESS_NUDGE = (
+        "You already have all of the above and no new code is available. Do "
+        "NOT request any more code or callers - give your final one-sentence "
+        "answer and every applicable SUGGESTED_* line now."
+    )
+
+    def _emit_empty_result(self, reasoning_text, message, finish_reason=None):
+        """Overridable: the model produced no answer at all."""
+        self._on_result_cb(ConversationResult(
+            text="", reasoning_text=reasoning_text, suggested_name=None,
+            suggested_signature=None, suggested_vars=[], suggested_labels=[],
+            suggested_callee_renames=[],
+            suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
+            suggested_reanalyze=[], suggested_string_extractors=[],
+            root_is_pseudocode=self._root_is_pseudocode, error=message,
+            rejected_callee_renames=[],
+        ))
+
     def _on_worker_done(self, full_text, reasoning_text="", finish_reason=None):
         self.worker = None
         if self._closed:
@@ -4395,15 +5006,7 @@ class ConversationRunner(object):
                 )
             else:
                 msg = "Model returned an empty response (finish_reason=%s)." % (finish_reason or "unknown")
-            self._on_result_cb(ConversationResult(
-                text="", reasoning_text=reasoning_text, suggested_name=None,
-                suggested_signature=None, suggested_vars=[], suggested_labels=[],
-                suggested_callee_renames=[],
-                suggested_struct=None, suggested_var_types=[], suggested_global_renames=[],
-                suggested_reanalyze=[], suggested_string_extractors=[],
-                root_is_pseudocode=self._root_is_pseudocode, error=msg,
-                rejected_callee_renames=[],
-            ))
+            self._emit_empty_result(reasoning_text, msg, finish_reason)
             return 0
 
         self.messages.append({"role": "assistant", "content": text})
@@ -4424,17 +5027,19 @@ class ConversationRunner(object):
             self._forced_final = True
             self.messages.append({
                 "role": "user",
-                "content": (
-                    "You have reached the maximum number of code requests (%d). "
-                    "Please give your best explanation now based on the "
-                    "information already gathered, without requesting further "
-                    "code." % self.config.max_auto_fetch
-                ),
+                "content": self._FORCE_FINAL_TEMPLATE % self.config.max_auto_fetch,
             })
             self._on_status("Auto-fetch limit reached; asking for a final answer...")
             self._issue_request()
             return 0
 
+        self._emit_result(text, reasoning_text, finish_reason)
+        return 0
+
+    def _emit_result(self, text, reasoning_text, finish_reason=None):
+        """Overridable: turn the model's final answer into a result object.
+        This one extracts the SUGGESTED_* markers; CodeGenRunner parses
+        BEGIN_FILE blocks instead."""
         suggested_name = None
         name_matches = _SUGGESTED_NAME_RE.findall(text)
         if name_matches:
@@ -4710,12 +5315,7 @@ class ConversationRunner(object):
 
         if not made_progress:
             self._forced_final = True
-            reply_parts.append(
-                "You already have all of the above and no new code is "
-                "available. Do NOT request any more code or callers - give "
-                "your final one-sentence answer and every applicable "
-                "SUGGESTED_* line now."
-            )
+            reply_parts.append(self._NO_PROGRESS_NUDGE)
 
         reply_text = "\n\n".join(reply_parts) if reply_parts else "No additional code available."
         self.messages.append({"role": "user", "content": reply_text})
@@ -4796,6 +5396,137 @@ class ConversationRunner(object):
         header = "Found %d caller(s) of %s; showing call-site snippet(s) for up to %d:" % (
             len(caller_eas), target_name, limit)
         return (header + "\n\n" + "\n\n".join(blocks), made_progress)
+
+
+CodeGenResult = namedtuple("CodeGenResult", [
+    "text", "reasoning_text",
+    # [(filename, body)] parsed out of the model's BEGIN_FILE/END_FILE blocks,
+    # in the order it emitted them (normally the .h then the .c).
+    "files",
+    # Raw finish_reason from the server: "length" means the model was cut off
+    # mid-file and the answer needs continuing rather than saving.
+    "finish_reason",
+    "error",
+])
+
+
+class CodeGenRunner(ConversationRunner):
+    """Drives one "export this function as compilable C" conversation.
+
+    Reuses ConversationRunner wholesale - server priority/failover, the
+    REQUEST_CODE auto-fetch loop (genuinely useful here: the model may need
+    to see a callee before it can write an honest extern prototype for it),
+    streaming, cancellation - and only swaps out what differs: the system
+    prompt, the user message (types/globals/callees + body, see
+    build_codegen_user_message) and the answer parsing (BEGIN_FILE blocks
+    instead of SUGGESTED_* markers).
+
+    Like its base class this touches the database read-only; unlike the
+    explain flow there is no Accept step at all - the output is source code
+    for the user's clipboard/disk, never a database write.
+    """
+
+    _FORCE_FINAL_TEMPLATE = (
+        "You have reached the maximum number of code requests (%d). Emit the "
+        "two files now, in the required BEGIN_FILE/END_FILE format, based on "
+        "the information already gathered. Where a called function's exact "
+        "prototype is still unknown, declare your best-guess extern and mark "
+        "it with a /* TODO: unverified prototype */ comment."
+    )
+
+    _NO_PROGRESS_NUDGE = (
+        "You already have all of the above and no new code is available. Do "
+        "NOT request any more code or callers - emit the two files now in the "
+        "required BEGIN_FILE/END_FILE format, marking any prototype you could "
+        "not verify with a /* TODO: unverified prototype */ comment."
+    )
+
+    _CONTINUE_PROMPT = (
+        "Your previous reply was cut off before it finished. Continue from "
+        "exactly where you stopped - do not repeat anything you already "
+        "emitted and do not start over. If the cut-off happened inside a "
+        "file block, carry straight on with that file's contents and close "
+        "it with END_FILE, then emit any remaining file in the same "
+        "BEGIN_FILE/END_FILE format."
+    )
+
+    def build_initial_messages(self):
+        ctx = gather_function_context(self.func)
+        self._root_is_pseudocode = ctx.kind == "pseudocode"
+        self._fetched_eas = {self.func_ea}
+        globals_ = gather_codegen_globals(self.func, self.config)
+        callees = gather_codegen_callees(self.func, self.config)
+        type_decls = gather_codegen_type_decls(self.func, self.config, globals_)
+        user_msg = build_codegen_user_message(
+            self.config, self.func, ctx, type_decls, globals_, callees
+        )
+        self.messages = [
+            {"role": "system", "content": self.config.codegen_system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+        return self.messages
+
+    def continue_generation(self, on_result, on_error):
+        """Ask the model to carry on after a reply that hit the token limit.
+        The already-received text stays in the conversation as an assistant
+        turn (appended by _on_worker_done), so the continuation is parsed as
+        its own set of file blocks and merged by the dialog."""
+        self.send_followup(self._CONTINUE_PROMPT, on_result, on_error)
+
+    def _emit_empty_result(self, reasoning_text, message, finish_reason=None):
+        self._on_result_cb(CodeGenResult(
+            text="", reasoning_text=reasoning_text, files=[],
+            finish_reason=finish_reason, error=message,
+        ))
+
+    def _emit_result(self, text, reasoning_text, finish_reason=None):
+        files = parse_codegen_files(text, codegen_file_basename(self.func_ea))
+        error = None
+        if not files:
+            error = (
+                "The model's reply contained no BEGIN_FILE/END_FILE block; "
+                "showing its raw output instead."
+            )
+        self._on_result_cb(CodeGenResult(
+            text=text, reasoning_text=reasoning_text, files=files,
+            finish_reason=finish_reason, error=error,
+        ))
+
+
+def _sanitize_codegen_filename(name, fallback):
+    """Reduce a model-supplied file name to a safe bare basename with a C/C++
+    extension. Never trust it as a path: strip any directory component (the
+    Save action joins it onto a user-chosen directory), reject anything with
+    unexpected characters, and default the extension rather than writing
+    whatever the model dreamt up."""
+    name = (name or "").strip().strip("`'\"")
+    name = name.replace("\\", "/").split("/")[-1]
+    if not _CODEGEN_FILENAME_RE.match(name) or name in (".", ".."):
+        return fallback
+    if not name.lower().endswith((".h", ".c", ".hpp", ".cpp", ".cc", ".hh", ".inc")):
+        return name + ".c"
+    return name
+
+
+def parse_codegen_files(text, base_name):
+    """Pull the BEGIN_FILE: <name> ... END_FILE blocks out of a codegen reply.
+
+    Returns [(filename, body)] in reply order, deduped by filename (a later
+    block with the same name wins - that is how a continuation replaces a
+    partial file). Falls back to a single "<base>.c" holding the whole reply
+    when the model ignored the format, so its work is never lost.
+    """
+    # Normalize line endings first: a model that answers with CRLF would
+    # otherwise leave a stray \r before every end-of-line anchor and match
+    # nothing at all, and the \r would end up in the saved files too.
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    files = OrderedDict()
+    for raw_name, body in _CODEGEN_FILE_RE.findall(text):
+        filename = _sanitize_codegen_filename(raw_name, base_name + ".c")
+        body = strip_markdown_fences(body)
+        if body:
+            files[filename] = body
+    return list(files.items())
 
 
 # ---------------------------------------------------------------------------
@@ -5324,6 +6055,270 @@ class ExplainResultDialog(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+# ---------------------------------------------------------------------------
+# UI: export as compilable C
+# ---------------------------------------------------------------------------
+
+class CodeGenDialog(QtWidgets.QDialog):
+    """Streams an "export this function as compilable C" conversation and
+    shows each emitted source file in its own editable tab.
+
+    Deliberately has NO Accept button: this feature never writes to the IDA
+    database. The output leaves via the clipboard or Save Files..., and the
+    tabs are editable so small fixes can be made before either.
+    """
+
+    def __init__(self, config, func, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.func_ea = func.start_ea
+        self.func_name = ida_funcs.get_func_name(func.start_ea) or ("sub_%X" % func.start_ea)
+        self.base_name = codegen_file_basename(func.start_ea)
+        self._closed = False
+        self._reasoning_shown = False
+        # Raw model text accumulated across continuations. A reply cut off by
+        # the token limit ends mid-file (an unterminated BEGIN_FILE block),
+        # so files are always parsed from the CONCATENATION of every turn -
+        # that is what lets a continuation close the block it interrupted.
+        self._raw_text = ""
+        self._continuing = False
+        self._file_tabs = OrderedDict()  # filename -> QPlainTextEdit
+
+        self.setWindowTitle("%s - Export C - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
+        self.resize(760, 720)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.status_label = QtWidgets.QLabel("Contacting model...")
+        layout.addWidget(self.status_label)
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.stream_edit = QtWidgets.QPlainTextEdit()
+        self.stream_edit.setReadOnly(True)
+        self.stream_edit.setFont(QtGui.QFont("Consolas", 9))
+        self.tabs.addTab(self.stream_edit, "Model output")
+        layout.addWidget(self.tabs, 1)
+
+        followup_layout = QtWidgets.QHBoxLayout()
+        self.followup_input = QtWidgets.QLineEdit()
+        self.followup_input.setPlaceholderText(
+            "Refine, e.g. \"target MSVC\", \"avoid macros for globals\", then click Refine..."
+        )
+        self.followup_input.returnPressed.connect(self.on_refine)
+        followup_layout.addWidget(self.followup_input, 1)
+        self.refine_button = QtWidgets.QPushButton("Refine")
+        self.refine_button.clicked.connect(self.on_refine)
+        self.refine_button.setEnabled(False)
+        followup_layout.addWidget(self.refine_button)
+        layout.addLayout(followup_layout)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.continue_button = QtWidgets.QPushButton("Continue")
+        self.continue_button.setToolTip(
+            "The model hit its token limit mid-file. Ask it to carry on from "
+            "where it stopped; the continuation is stitched onto what you "
+            "already have."
+        )
+        self.continue_button.clicked.connect(self.on_continue)
+        self.continue_button.setEnabled(False)
+        self.continue_button.setVisible(False)
+        button_layout.addWidget(self.continue_button)
+        button_layout.addStretch(1)
+        self.copy_button = QtWidgets.QPushButton("Copy Current Tab")
+        self.copy_button.clicked.connect(self.on_copy)
+        button_layout.addWidget(self.copy_button)
+        self.save_button = QtWidgets.QPushButton("Save Files...")
+        self.save_button.clicked.connect(self.on_save)
+        self.save_button.setEnabled(False)
+        button_layout.addWidget(self.save_button)
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.clicked.connect(self.close)
+        button_layout.addWidget(self.close_button)
+        layout.addLayout(button_layout)
+
+        _add_copyright_footer(layout)
+
+        self.runner = CodeGenRunner(
+            config, func,
+            on_delta=self._on_delta,
+            on_reasoning_delta=self._on_reasoning_delta,
+            on_status=self._on_runner_status,
+        )
+        self._begin_request("Generating C source...")
+        self.runner.start(self._on_result, self._on_error)
+
+    # -- request lifecycle --------------------------------------------------
+
+    def _begin_request(self, status_text="Generating C source..."):
+        self._reasoning_shown = False
+        self.status_label.setText(status_text)
+        self.refine_button.setEnabled(False)
+        self.continue_button.setEnabled(False)
+        self.followup_input.setEnabled(False)
+
+    def _request_finished(self, status_text):
+        self.status_label.setText(status_text)
+        self.refine_button.setEnabled(True)
+        self.followup_input.setEnabled(True)
+
+    def _on_runner_status(self, text):
+        self._begin_request(text)
+        self._insert_styled("\n\n--- %s ---\n" % text)
+
+    # -- worker callbacks (run on IDA's main thread via execute_sync) -------
+
+    def _insert_styled(self, text, italic=False, color=None):
+        try:
+            cursor = self.stream_edit.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            fmt = QtGui.QTextCharFormat()
+            fmt.setFontItalic(italic)
+            if color is not None:
+                fmt.setForeground(color)
+            cursor.insertText(text, fmt)
+            self.stream_edit.setTextCursor(cursor)
+            self.stream_edit.ensureCursorVisible()
+        except RuntimeError:
+            pass
+
+    def _on_reasoning_delta(self, piece):
+        if self._closed:
+            return 0
+        if not self._reasoning_shown:
+            self._reasoning_shown = True
+            self._insert_styled("[thinking] ", italic=True, color=QtGui.QColor("gray"))
+        self._insert_styled(piece, italic=True, color=QtGui.QColor("gray"))
+        return 0
+
+    def _on_delta(self, piece):
+        if self._closed:
+            return 0
+        if self._reasoning_shown:
+            self._reasoning_shown = False
+            self._insert_styled("\n\n")
+        self._insert_styled(piece)
+        return 0
+
+    # -- runner callbacks ---------------------------------------------------
+
+    def _on_result(self, result):
+        if self._closed:
+            return
+        if result.error and not result.text.strip():
+            self._request_finished("Error: %s" % result.error)
+            return
+
+        if self._continuing and self._raw_text:
+            self._raw_text = self._raw_text + "\n" + result.text
+        else:
+            self._raw_text = result.text
+        self._continuing = False
+
+        files = parse_codegen_files(self._raw_text, self.base_name)
+        self._populate_file_tabs(files)
+
+        truncated = result.finish_reason == "length"
+        self.continue_button.setVisible(truncated)
+        self.continue_button.setEnabled(truncated)
+        if truncated:
+            self._request_finished(
+                "Model hit its token limit mid-answer - click Continue to finish it "
+                "(or raise Max tokens in settings)."
+            )
+        elif not files:
+            self._request_finished(
+                "No BEGIN_FILE block in the reply - see the Model output tab; "
+                "use Refine to ask for the required format."
+            )
+        else:
+            self._request_finished(
+                "Done - %d file(s). Nothing was written to the database."
+                % len(files)
+            )
+
+    def _on_error(self, message):
+        if self._closed:
+            return
+        self._continuing = False
+        self._request_finished("Error: %s" % message)
+
+    def _populate_file_tabs(self, files):
+        """Rebuild the per-file tabs from the latest parse. Content of a file
+        that is still present is replaced in its existing tab (so the tab bar
+        doesn't churn on Refine); tabs for files no longer emitted are
+        removed."""
+        for filename, body in files:
+            edit = self._file_tabs.get(filename)
+            if edit is None:
+                edit = QtWidgets.QPlainTextEdit()
+                edit.setFont(QtGui.QFont("Consolas", 9))
+                edit.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+                self._file_tabs[filename] = edit
+                self.tabs.addTab(edit, filename)
+            edit.setPlainText(body)
+        for filename in list(self._file_tabs):
+            if filename in dict(files):
+                continue
+            edit = self._file_tabs.pop(filename)
+            index = self.tabs.indexOf(edit)
+            if index >= 0:
+                self.tabs.removeTab(index)
+        if files:
+            self.save_button.setEnabled(True)
+            first_edit = self._file_tabs.get(files[0][0])
+            if first_edit is not None:
+                self.tabs.setCurrentWidget(first_edit)
+
+    # -- actions ------------------------------------------------------------
+
+    def on_refine(self):
+        question = self.followup_input.text().strip()
+        if not question:
+            return
+        self.followup_input.clear()
+        self._continuing = False
+        self._begin_request("Refining...")
+        self._insert_styled("\n\n--- You: %s ---\n\n" % question)
+        self.runner.send_followup(question, self._on_result, self._on_error)
+
+    def on_continue(self):
+        self._continuing = True
+        self._begin_request("Continuing where the model left off...")
+        self._insert_styled("\n\n--- Continuing ---\n\n")
+        self.runner.continue_generation(self._on_result, self._on_error)
+
+    def on_copy(self):
+        widget = self.tabs.currentWidget()
+        if widget is None:
+            return
+        QtWidgets.QApplication.clipboard().setText(widget.toPlainText())
+        self.status_label.setText("Copied %s to the clipboard." % self.tabs.tabText(self.tabs.currentIndex()))
+
+    def on_save(self):
+        if not self._file_tabs:
+            return
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Save generated source files to...")
+        if not directory:
+            return
+        written = []
+        for filename, edit in self._file_tabs.items():
+            path = os.path.join(directory, filename)
+            try:
+                with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(edit.toPlainText())
+            except Exception as exc:
+                ida_kernwin.warning("Failed to write %s:\n%s" % (path, exc))
+                return
+            written.append(path)
+            ida_kernwin.msg("[%s] Wrote %s\n" % (PLUGIN_NAME, path))
+        self.status_label.setText("Saved %d file(s) to %s" % (len(written), directory))
+
+    def closeEvent(self, event):
+        self._closed = True
+        self.runner.cancel()
+        super().closeEvent(event)
+
+
 def _rgb_hex_to_bgr_int(text, fallback):
     """Settings shows CFG-trace colors as plain '#RRGGBB' hex strings (the
     reading order everyone expects); idc.set_color's native representation
@@ -5556,6 +6551,39 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg_trace_system_prompt_edit.setMinimumHeight(140)
         form.addRow("CFG trace system prompt:", self.cfg_trace_system_prompt_edit)
 
+        self.codegen_max_globals_spin = QtWidgets.QSpinBox()
+        self.codegen_max_globals_spin.setRange(0, 500)
+        self.codegen_max_globals_spin.setToolTip(
+            "How many referenced globals 'Export function as compilable C' "
+            "describes to the model (name, VA, RVA, size, type, segment), so "
+            "it can bind them to g_image_base + RVA instead of guessing."
+        )
+        form.addRow("Max globals exported:", self.codegen_max_globals_spin)
+
+        self.codegen_embed_data_check = QtWidgets.QCheckBox(
+            "Embed initialized read-only data in exported C"
+        )
+        self.codegen_embed_data_check.setToolTip(
+            "Sends the actual bytes of string literals and small read-only "
+            "globals so the generated code can define them as real C data "
+            "and be genuinely standalone. Writable globals stay "
+            "address-based either way."
+        )
+        form.addRow(self.codegen_embed_data_check)
+
+        self.codegen_max_data_bytes_spin = QtWidgets.QSpinBox()
+        self.codegen_max_data_bytes_spin.setRange(0, 65536)
+        self.codegen_max_data_bytes_spin.setSingleStep(64)
+        self.codegen_max_data_bytes_spin.setToolTip(
+            "Per-global cap on how many bytes of initialized read-only data "
+            "are sent. Anything larger stays an address-based accessor."
+        )
+        form.addRow("Max embedded bytes per global:", self.codegen_max_data_bytes_spin)
+
+        self.codegen_system_prompt_edit = QtWidgets.QPlainTextEdit()
+        self.codegen_system_prompt_edit.setMinimumHeight(140)
+        form.addRow("C export system prompt:", self.codegen_system_prompt_edit)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -5605,6 +6633,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg_trace_color_dead_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_dead))
         self.cfg_trace_color_unresolved_edit.setText(_bgr_int_to_rgb_hex(config.cfg_trace_color_unresolved))
         self.cfg_trace_system_prompt_edit.setPlainText(config.cfg_trace_system_prompt)
+        self.codegen_max_globals_spin.setValue(config.codegen_max_globals)
+        self.codegen_embed_data_check.setChecked(config.codegen_embed_data)
+        self.codegen_max_data_bytes_spin.setValue(config.codegen_max_data_bytes)
+        self.codegen_system_prompt_edit.setPlainText(config.codegen_system_prompt)
 
     def _on_restore_defaults(self):
         answer = QtWidgets.QMessageBox.question(
@@ -5665,6 +6697,10 @@ class SettingsDialog(QtWidgets.QDialog):
             self.cfg_trace_color_unresolved_edit.text(), cfg.cfg_trace_color_unresolved
         )
         cfg.cfg_trace_system_prompt = self.cfg_trace_system_prompt_edit.toPlainText()
+        cfg.codegen_max_globals = self.codegen_max_globals_spin.value()
+        cfg.codegen_embed_data = self.codegen_embed_data_check.isChecked()
+        cfg.codegen_max_data_bytes = self.codegen_max_data_bytes_spin.value()
+        cfg.codegen_system_prompt = self.codegen_system_prompt_edit.toPlainText()
         cfg._validate()
         self.result_config = cfg
         self.accept()
@@ -8918,6 +9954,34 @@ class ExplainRecursiveActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
+class ExportCActionHandler(ida_kernwin.action_handler_t):
+    """Asks the LLM to rewrite the function under the cursor as standalone,
+    compilable C. Same view/cursor gating as ExplainActionHandler; unlike
+    every other action here it never writes to the database - the result
+    leaves via the clipboard or files on disk. See CodeGenDialog."""
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        func = _resolve_func(ctx)
+        if not func:
+            ida_kernwin.warning("Place the cursor inside a function first.")
+            return 0
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.open_codegen_dialog(func)
+        return 1
+
+    def update(self, ctx):
+        widget = getattr(ctx, "widget", None)
+        wtype = ida_kernwin.get_widget_type(widget) if widget else -1
+        if wtype not in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM):
+            return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
 class BatchActionHandler(ida_kernwin.action_handler_t):
     def __init__(self):
         super().__init__()
@@ -8976,9 +10040,11 @@ class PopupHooks(ida_kernwin.UI_Hooks):
         if wtype == ida_kernwin.BWN_PSEUDOCODE:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPORT_C, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_DISASM:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPORT_C, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_TRACE_CFG, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_FUNCS:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_BATCH, "LLM Explainer/")
@@ -8993,7 +10059,11 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "to explain it. The same menu also has 'Explain function with LLM "
         "(recursively)', which additionally explains the function's direct "
         "callees and automatically applies every result without a review "
-        "step - use with care. Right-click in the Functions window to "
+        "step - use with care. 'Export function as compilable C' in the same "
+        "menu rewrites the function as standalone C source (portable types, "
+        "struct typedefs, extern declarations, globals bound to image base + "
+        "RVA) for the clipboard or a file, without touching the database. "
+        "Right-click in the Functions window to "
         "batch-explain multiple functions. In the disassembly view, "
         "'Trace/Recover CFG...' asks the LLM to walk an obfuscated "
         "function's real control flow branch by branch and mark real/dead "
@@ -9017,6 +10087,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._applied_cfg_patches = OrderedDict()  # start_ea -> _AppliedCfgPatch, oldest-first
         self._action_handler = ExplainActionHandler()
         self._recursive_action_handler = ExplainRecursiveActionHandler()
+        self._export_c_action_handler = ExportCActionHandler()
         self._batch_action_handler = BatchActionHandler()
         self._trace_cfg_action_handler = CfgTraceActionHandler()
 
@@ -9042,6 +10113,19 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         )
         if not ida_kernwin.register_action(recursive_action):
             ida_kernwin.msg("[%s] Failed to register recursive action.\n" % PLUGIN_NAME)
+
+        export_c_action = ida_kernwin.action_desc_t(
+            ACTION_ID_EXPORT_C,
+            "Export function as compilable C...",
+            self._export_c_action_handler,
+            None,
+            "Ask the local LLM to rewrite this function as standalone C "
+            "(portable types, struct typedefs, extern declarations, globals "
+            "bound to image base + RVA) - nothing is written to the database",
+            -1,
+        )
+        if not ida_kernwin.register_action(export_c_action):
+            ida_kernwin.msg("[%s] Failed to register C export action.\n" % PLUGIN_NAME)
 
         batch_action = ida_kernwin.action_desc_t(
             ACTION_ID_BATCH,
@@ -9138,6 +10222,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         except Exception:
             pass
         try:
+            ida_kernwin.unregister_action(ACTION_ID_EXPORT_C)
+        except Exception:
+            pass
+        try:
             ida_kernwin.unregister_action(ACTION_ID_BATCH)
         except Exception:
             pass
@@ -9163,6 +10251,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
 
     def open_explain_dialog(self, func):
         dlg = ExplainResultDialog(self.config, func)
+        return self._track_dialog(dlg)
+
+    def open_codegen_dialog(self, func):
+        dlg = CodeGenDialog(self.config, func)
         return self._track_dialog(dlg)
 
     def open_batch_dialog(self, funcs):
