@@ -86,6 +86,30 @@ Continue button for when the model runs into its token limit mid-file, and
 Copy/Save Files actions. Nothing is ever written to the IDA database by this
 action.
 
+Because "the model says it compiles" is not evidence that it compiles, the
+generated files are then handed to a real compiler: clang, located on PATH
+or in the usual per-platform places (the copy Visual Studio bundles, Xcode /
+the macOS command line tools, Homebrew LLVM, a versioned /usr/bin/clang-NN
+on Linux), falling back to a system gcc/cc. If it fails, the diagnostics go
+straight back to the model with an instruction to fix them and re-emit the
+files, for a configurable number of automatic rounds, so the usual small
+mistakes (a missed intrinsic, an undeclared helper) are corrected before the
+code ever reaches the user. This check is deliberately syntax-only -
+-fsyntax-only is forced on and -c/-S/-emit-llvm stripped out, so code an LLM
+wrote is parsed and type-checked but never assembled, never linked and never
+executed. "Verify Now" re-checks the tabs as they currently stand, so
+hand-edits can be validated without the model rewriting them.
+
+"Open in Compiler Explorer" folds the emitted files into one translation
+unit (each local #include replaced by that file's contents) and opens it on
+godbolt.org - or on whatever instance is configured, so a self-hosted
+Compiler Explorer keeps everything internal - to build it against other
+toolchains and see the resulting assembly. Small sessions travel inside the
+URL itself; a larger one is uploaded to that instance's shortener. This is
+the ONLY thing in this plugin that sends anything off the machine, so it
+never happens without an explicit click and a confirmation naming the
+destination and saying which of those two it is about to do.
+
 "Trace/Recover CFG..." (disassembly view only, since the whole point is a
 blob that may not even be recognized as a function) walks an obfuscated
 function's basic blocks forward from a given start address - the kind
@@ -158,11 +182,17 @@ and refuses (leaving the original bytes untouched) rather than guessing
 at anything it doesn't fully recognize.
 """
 
+import base64
 import functools
+import glob
 import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -200,7 +230,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.9.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -756,6 +786,23 @@ DEFAULT_CONFIG = {
     "codegen_max_globals": 40,
     "codegen_max_data_bytes": 512,
     "codegen_embed_data": True,
+    # Syntax-check exported C with a real compiler and hand the diagnostics
+    # back to the model to fix. Path blank = auto-detect clang (see
+    # find_c_compiler). The flags MUST stay syntax-only: this compiles
+    # model-written code, so it never links and never runs anything.
+    "codegen_verify_compile": True,
+    "codegen_compiler_path": "",
+    "codegen_compile_flags": "-fsyntax-only -std=c11 -Wall",
+    "codegen_max_compile_rounds": 2,
+    # "Open in Compiler Explorer": the instance to open (point this at a
+    # self-hosted CE if the code must not leave your network), the compiler
+    # to preselect there (ids come from <instance>/api/compilers/c), and the
+    # flags to preselect. Never used unless the user clicks the button, which
+    # always asks first - this is the one action in the plugin that sends
+    # code off the machine.
+    "codegen_godbolt_url": "https://godbolt.org",
+    "codegen_godbolt_compiler_id": "cclang2010",
+    "codegen_godbolt_options": "-std=c11 -Wall",
     # sha256 of DEFAULT_SYSTEM_PROMPT / CFG_TRACE_SYSTEM_PROMPT as they were
     # when this config was last saved (set in save()). Lets a later load
     # tell "the stored prompt was that version's UNMODIFIED default" (hash
@@ -4560,6 +4607,24 @@ class PluginConfig(object):
             self.codegen_max_data_bytes = max(0, min(65536, int(self.codegen_max_data_bytes)))
         except (TypeError, ValueError):
             self.codegen_max_data_bytes = DEFAULT_CONFIG["codegen_max_data_bytes"]
+        self.codegen_verify_compile = bool(self.codegen_verify_compile)
+        self.codegen_compiler_path = (self.codegen_compiler_path or "").strip()
+        self.codegen_compile_flags = (
+            (self.codegen_compile_flags or "").strip() or DEFAULT_CONFIG["codegen_compile_flags"]
+        )
+        try:
+            self.codegen_max_compile_rounds = max(0, min(10, int(self.codegen_max_compile_rounds)))
+        except (TypeError, ValueError):
+            self.codegen_max_compile_rounds = DEFAULT_CONFIG["codegen_max_compile_rounds"]
+        godbolt_url = (self.codegen_godbolt_url or "").strip().rstrip("/")
+        # Must stay an http(s) endpoint: this URL decides where code gets
+        # sent, so a malformed/exotic scheme falls back to the default rather
+        # than being handed to the browser as-is.
+        if not (godbolt_url.startswith("http://") or godbolt_url.startswith("https://")):
+            godbolt_url = DEFAULT_CONFIG["codegen_godbolt_url"]
+        self.codegen_godbolt_url = godbolt_url
+        self.codegen_godbolt_compiler_id = (self.codegen_godbolt_compiler_id or "").strip()
+        self.codegen_godbolt_options = (self.codegen_godbolt_options or "").strip()
 
     def _upgrade_stale_default_prompts(self):
         """Auto-adopt the current default for any stored prompt that is an
@@ -4768,6 +4833,334 @@ class LlamaStreamWorker(threading.Thread):
             ida_kernwin.execute_sync(
                 functools.partial(self._on_delta, content), ida_kernwin.MFF_FAST
             )
+
+
+# ---------------------------------------------------------------------------
+# Compile check for exported C (background thread, syntax-only)
+#
+# Runs a real compiler over the files the model just wrote, so its mistakes
+# are caught by a compiler rather than by the user pasting the code into a
+# project an hour later - and, more usefully, so the exact diagnostics can be
+# handed straight back to the model to fix (see CodeGenDialog._start_compile_
+# check / CodeGenRunner.send_compile_feedback).
+#
+# SAFETY: this compiles code an LLM wrote, so it is deliberately syntax-only.
+# The flags are forced to include -fsyntax-only, which means the compiler
+# parses and type-checks but emits no object file, links nothing, and runs
+# nothing. Nothing generated here is ever executed.
+# ---------------------------------------------------------------------------
+
+CompileCheckResult = namedtuple("CompileCheckResult", [
+    "ok", "diagnostics", "command", "compiler", "error",
+])
+
+# Where to look for clang when it isn't on PATH and no explicit path is
+# configured. IDA runs on all three desktop platforms, and on each of them
+# clang is commonly installed somewhere PATH doesn't reach (bundled with
+# Visual Studio, inside Xcode, or as a versioned /usr/bin/clang-NN).
+_CLANG_GLOB_CANDIDATES_WINDOWS = (
+    r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\Llvm\x64\bin\clang.exe",
+    r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\Llvm\x64\bin\clang.exe",
+    r"C:\Program Files\LLVM\bin\clang.exe",
+)
+_CLANG_GLOB_CANDIDATES_MACOS = (
+    "/opt/homebrew/opt/llvm/bin/clang",                 # Homebrew, Apple Silicon
+    "/usr/local/opt/llvm/bin/clang",                    # Homebrew, Intel
+    "/Library/Developer/CommandLineTools/usr/bin/clang",
+    "/Applications/Xcode.app/Contents/Developer/Toolchains/"
+    "XcodeDefault.xctoolchain/usr/bin/clang",
+    "/usr/bin/clang",
+)
+_CLANG_GLOB_CANDIDATES_LINUX = (
+    "/usr/bin/clang",
+    "/usr/local/bin/clang",
+    "/usr/lib/llvm-*/bin/clang",                        # Debian/Ubuntu versioned installs
+    "/usr/bin/clang-[0-9]*",
+)
+# Last resort: gcc/cc also implement -fsyntax-only and -Wall, so a machine
+# with only a system gcc still gets its exported C checked.
+_FALLBACK_COMPILER_NAMES = ("gcc", "cc")
+
+_VERSION_NUM_RE = re.compile(r"(\d+)")
+
+
+def _newest_compiler(paths):
+    """Pick the highest-versioned match, comparing the numbers in the path
+    numerically - "clang-9" must not beat "clang-14", which plain string
+    sorting would get backwards."""
+    def key(path):
+        return [int(n) for n in _VERSION_NUM_RE.findall(path)] or [0]
+    return sorted(paths, key=key)[-1]
+
+
+def _clang_glob_candidates():
+    if os.name == "nt":
+        return _CLANG_GLOB_CANDIDATES_WINDOWS
+    if sys.platform == "darwin":
+        return _CLANG_GLOB_CANDIDATES_MACOS
+    return _CLANG_GLOB_CANDIDATES_LINUX
+
+
+def find_c_compiler(config):
+    """Resolve the compiler to syntax-check exported C with: the configured
+    path when set (used as-is, so a bare command name still goes through
+    PATH), otherwise clang from PATH, otherwise a well-known clang install
+    for this platform, otherwise a system gcc/cc. Returns None when nothing
+    usable was found."""
+    configured = (getattr(config, "codegen_compiler_path", "") or "").strip().strip('"')
+    if configured:
+        if os.path.isfile(configured):
+            return configured
+        return shutil.which(configured) or None
+    for name in ("clang", "clang.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for pattern in _clang_glob_candidates():
+        matches = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+        if matches:
+            return _newest_compiler(matches)
+    for name in _FALLBACK_COMPILER_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _compile_flags(config):
+    """Configured flags, with -fsyntax-only forced on. A user editing the
+    flags must not be able to turn this into something that emits or links a
+    binary - see the safety note above."""
+    flags = (getattr(config, "codegen_compile_flags", "") or "").split()
+    flags = [f for f in flags if f not in ("-c", "-S", "-emit-llvm")]
+    if "-fsyntax-only" not in flags:
+        flags.insert(0, "-fsyntax-only")
+    return flags
+
+
+_MAX_DIAGNOSTICS_CHARS = 8000
+
+
+class CompileCheckWorker(threading.Thread):
+    """Writes the given files to a scratch directory and syntax-checks them.
+
+    Same threading contract as LlamaStreamWorker: runs off the UI thread and
+    marshals its single callback back onto IDA's main thread with
+    execute_sync, so the caller can touch Qt widgets in it.
+    """
+
+    def __init__(self, config, files, on_done):
+        super().__init__(daemon=True)
+        self._config = config
+        self._files = list(files)
+        self._on_done = on_done
+
+    def run(self):
+        try:
+            result = self._check()
+        except Exception as exc:  # never let a worker thread die silently
+            result = CompileCheckResult(
+                ok=False, diagnostics="", command="", compiler="",
+                error="Compile check failed: %s" % exc,
+            )
+        ida_kernwin.execute_sync(
+            functools.partial(self._on_done, result), ida_kernwin.MFF_FAST
+        )
+
+    def _check(self):
+        compiler = find_c_compiler(self._config)
+        if not compiler:
+            return CompileCheckResult(
+                ok=False, diagnostics="", command="", compiler="",
+                error="No C compiler found. Install clang or set its path in settings.",
+            )
+        sources = [name for name, _ in self._files if name.lower().endswith((".c", ".cpp", ".cc"))]
+        if not sources:
+            # Header-only reply: check it as a translation unit of its own
+            # rather than reporting "nothing to do".
+            sources = [name for name, _ in self._files]
+        if not sources:
+            return CompileCheckResult(
+                ok=False, diagnostics="", command="", compiler=compiler,
+                error="Nothing to compile.",
+            )
+
+        workdir = tempfile.mkdtemp(prefix="llm_explainer_cc_")
+        try:
+            for name, body in self._files:
+                with open(os.path.join(workdir, name), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+            cmd = [compiler] + _compile_flags(self._config)
+            # Headers are included as "name.h" from the same directory, and
+            # -x c makes a bare .h check as C rather than a precompiled header.
+            if all(s.lower().endswith((".h", ".hpp", ".hh", ".inc")) for s in sources):
+                cmd += ["-x", "c"]
+            cmd += ["-I", workdir] + [os.path.join(workdir, s) for s in sources]
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            completed = subprocess.run(
+                cmd, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=120, **kwargs
+            )
+            output = (completed.stdout or b"").decode("utf-8", "replace")
+            # Paths in diagnostics are scratch paths that mean nothing to the
+            # model (or the user) - show the bare file names instead.
+            output = output.replace(workdir + os.sep, "").replace(workdir, "")
+            if len(output) > _MAX_DIAGNOSTICS_CHARS:
+                output = output[:_MAX_DIAGNOSTICS_CHARS] + "\n...[diagnostics truncated]..."
+            # Displayed (and sent to the model) with the scratch directory
+            # reduced to "." - the absolute temp path is noise in both places.
+            shown = [os.path.basename(cmd[0])] + [
+                "." if c == workdir else (os.path.basename(c) if os.path.isabs(c) else c)
+                for c in cmd[1:]
+            ]
+            return CompileCheckResult(
+                ok=completed.returncode == 0, diagnostics=output.strip(),
+                command=" ".join(shown), compiler=compiler, error=None,
+            )
+        except subprocess.TimeoutExpired:
+            return CompileCheckResult(
+                ok=False, diagnostics="", command="", compiler=compiler,
+                error="Compile check timed out after 120s.",
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# "Open in Compiler Explorer" for exported C
+#
+# PRIVACY: this is the only thing in this plugin that sends anything off the
+# machine, so it only ever happens from an explicit button press that asks
+# first (see CodeGenDialog.on_open_godbolt), and the instance is
+# configurable - point codegen_godbolt_url at a self-hosted Compiler Explorer
+# and nothing reaches a third party at all.
+# ---------------------------------------------------------------------------
+
+_INCLUDE_LOCAL_RE = re.compile(r'(?m)^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*$')
+
+# Compiler Explorer serves the state from the URL path, so a large program
+# would exceed what servers accept in a request line. Past this we ask its
+# shortener for a /z/ link instead of inlining the state.
+_GODBOLT_MAX_URL_CHARS = 8000
+
+
+def merge_codegen_translation_unit(files):
+    """Fold the exported files into ONE translation unit for a single-editor
+    site like Compiler Explorer: each `#include "x.h"` that names one of the
+    emitted files is replaced by that file's contents (each header inlined
+    once, so an include from two places - or a cycle - can't duplicate or
+    loop), and any header never included from a source is prepended.
+    """
+    by_name = OrderedDict(files)
+    sources = [n for n in by_name if n.lower().endswith((".c", ".cpp", ".cc"))]
+    if not sources:
+        sources = list(by_name)
+    inlined = set()
+
+    def expand(name, depth=0):
+        body = by_name.get(name, "")
+        if depth > 8:
+            return body
+
+        def repl(match):
+            target = match.group(1).replace("\\", "/").split("/")[-1]
+            if target not in by_name or target in inlined:
+                # Not ours (a real system header), or already inlined above.
+                return match.group(0) if target not in by_name else (
+                    "/* %s inlined above */" % target
+                )
+            inlined.add(target)
+            return "/* ---- %s ---- */\n%s\n/* ---- end %s ---- */" % (
+                target, expand(target, depth + 1), target
+            )
+
+        return _INCLUDE_LOCAL_RE.sub(repl, body)
+
+    parts = [expand(name) for name in sources]
+    # A header nothing included still belongs in the translation unit.
+    leftovers = [n for n in by_name if n not in sources and n not in inlined]
+    return "\n\n".join(["/* ---- %s ---- */\n%s" % (n, by_name[n]) for n in leftovers] + parts)
+
+
+def godbolt_client_state(config, files):
+    """The ClientState object Compiler Explorer accepts either base64-encoded
+    in a /clientstate/ URL or as the body of its shortener API."""
+    session = {
+        "id": 1,
+        "language": "c",
+        "source": merge_codegen_translation_unit(files),
+        "compilers": [],
+    }
+    compiler_id = (getattr(config, "codegen_godbolt_compiler_id", "") or "").strip()
+    if compiler_id:
+        session["compilers"] = [{
+            "id": compiler_id,
+            "options": (getattr(config, "codegen_godbolt_options", "") or "").strip(),
+        }]
+    return {"sessions": [session]}
+
+
+def godbolt_base_url(config):
+    return (getattr(config, "codegen_godbolt_url", "") or
+            DEFAULT_CONFIG["codegen_godbolt_url"]).strip().rstrip("/")
+
+
+def godbolt_clientstate_url(config, files):
+    """Self-contained URL carrying the whole session, or None when the result
+    would be too long for a request line (the caller then shortens)."""
+    # ensure_ascii keeps every non-ASCII character as a \uXXXX escape, which
+    # is what CE expects and also what makes the payload safe to base64 as
+    # ASCII. URL-safe alphabet, since the payload sits in a path segment.
+    payload = json.dumps(
+        godbolt_client_state(config, files), ensure_ascii=True, separators=(",", ":")
+    )
+    encoded = base64.urlsafe_b64encode(payload.encode("ascii")).decode("ascii").rstrip("=")
+    url = "%s/clientstate/%s" % (godbolt_base_url(config), encoded)
+    return url if len(url) <= _GODBOLT_MAX_URL_CHARS else None
+
+
+class GodboltShortenWorker(threading.Thread):
+    """Asks a Compiler Explorer instance's shortener for a /z/ link when the
+    session is too big to carry in the URL itself. Same threading contract as
+    the other workers here: one callback, marshalled onto IDA's main thread.
+
+    Note this UPLOADS the code to that instance, where the resulting link is
+    public and persistent - the caller must have confirmed with the user
+    first.
+    """
+
+    def __init__(self, config, files, on_done):
+        super().__init__(daemon=True)
+        self._config = config
+        self._files = list(files)
+        self._on_done = on_done
+
+    def run(self):
+        url, error = None, None
+        try:
+            api = godbolt_base_url(self._config) + "/api/shortener"
+            body = json.dumps(godbolt_client_state(self._config, self._files)).encode("utf-8")
+            req = urllib.request.Request(
+                api, data=body,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                answer = json.loads(resp.read().decode("utf-8", "replace"))
+            url = answer.get("url") or answer.get("storedId")
+            if url and not url.startswith("http"):
+                url = "%s/z/%s" % (godbolt_base_url(self._config), url)
+            if not url:
+                error = "Compiler Explorer's shortener returned no URL."
+        except urllib.error.HTTPError as exc:
+            error = "Compiler Explorer returned HTTP %s." % exc.code
+        except Exception as exc:
+            error = "Could not reach Compiler Explorer: %s" % exc
+        ida_kernwin.execute_sync(
+            functools.partial(self._on_done, url, error), ida_kernwin.MFF_FAST
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5466,6 +5859,39 @@ class CodeGenRunner(ConversationRunner):
         ]
         return self.messages
 
+    def send_compile_feedback(self, diagnostics, command, files, on_result, on_error):
+        """Hand a failed compile straight back to the model.
+
+        `files` is what was ACTUALLY compiled - the dialog's current tab
+        contents, which the user may have edited by hand - so the model is
+        asked to fix the code the compiler really saw, not the code it
+        remembers writing. Re-stating those files keeps the two in sync
+        after a manual edit and after a truncated-then-continued answer.
+        """
+        parts = [
+            "Your generated code does NOT compile. This is the compiler's "
+            "output from `%s`:\n\n%s" % (command, diagnostics)
+        ]
+        if files:
+            parts.append(
+                "For reference, this is exactly what was compiled (including "
+                "any manual edits):\n\n" + "\n\n".join(
+                    "BEGIN_FILE: %s\n%s\nEND_FILE" % (name, body) for name, body in files
+                )
+            )
+        parts.append(
+            "Fix every error above and re-emit ALL files, complete, in the "
+            "same BEGIN_FILE/END_FILE format. Do not abbreviate, elide or "
+            "summarize unchanged parts - each file must be emitted in full, "
+            "because the previous version is replaced wholesale by what you "
+            "send now. Do not explain the fixes; output only the files. If a "
+            "diagnostic points at something you genuinely cannot resolve "
+            "(e.g. a type whose real layout is unknown), define a faithful "
+            "placeholder that compiles and mark it with /* TODO: ... */ "
+            "rather than leaving the error in place."
+        )
+        self.send_followup("\n\n".join(parts), on_result, on_error)
+
     def continue_generation(self, on_result, on_error):
         """Ask the model to carry on after a reply that hit the token limit.
         The already-received text stays in the conversation as an assistant
@@ -6083,6 +6509,13 @@ class CodeGenDialog(QtWidgets.QDialog):
         self._raw_text = ""
         self._continuing = False
         self._file_tabs = OrderedDict()  # filename -> QPlainTextEdit
+        # Compile-check state: how many automatic fix round-trips this
+        # conversation has already spent, and whether the request currently
+        # in flight is one of them (so its result triggers a re-check rather
+        # than a fresh one).
+        self._compile_rounds = 0
+        self._awaiting_compile_fix = False
+        self._compile_worker = None
 
         self.setWindowTitle("%s - Export C - %s @ %#x" % (PLUGIN_NAME, self.func_name, func.start_ea))
         self.resize(760, 720)
@@ -6112,6 +6545,38 @@ class CodeGenDialog(QtWidgets.QDialog):
         followup_layout.addWidget(self.refine_button)
         layout.addLayout(followup_layout)
 
+        verify_layout = QtWidgets.QHBoxLayout()
+        self.verify_check = QtWidgets.QCheckBox("Verify with a C compiler and let the model fix errors")
+        self.verify_check.setChecked(bool(config.codegen_verify_compile))
+        compiler = find_c_compiler(config)
+        if compiler:
+            self.verify_check.setToolTip(
+                "After each answer, syntax-check the generated files with\n%s\n"
+                "and, if it fails, send the diagnostics back to the model to "
+                "fix (up to %d automatic round(s)). Syntax-only: nothing is "
+                "linked and nothing is ever executed."
+                % (compiler, config.codegen_max_compile_rounds)
+            )
+        else:
+            self.verify_check.setEnabled(False)
+            self.verify_check.setChecked(False)
+            self.verify_check.setText("Verify with a C compiler (no compiler found)")
+            self.verify_check.setToolTip(
+                "No clang found on PATH or in a Visual Studio/LLVM install. "
+                "Set an explicit compiler path in Edit > Plugins > LLM Explainer."
+            )
+        verify_layout.addWidget(self.verify_check)
+        verify_layout.addStretch(1)
+        self.verify_button = QtWidgets.QPushButton("Verify Now")
+        self.verify_button.setToolTip(
+            "Compile the current tab contents (including any edits you made "
+            "here) without asking the model to change anything."
+        )
+        self.verify_button.clicked.connect(self.on_verify_now)
+        self.verify_button.setEnabled(False)
+        verify_layout.addWidget(self.verify_button)
+        layout.addLayout(verify_layout)
+
         button_layout = QtWidgets.QHBoxLayout()
         self.continue_button = QtWidgets.QPushButton("Continue")
         self.continue_button.setToolTip(
@@ -6131,6 +6596,18 @@ class CodeGenDialog(QtWidgets.QDialog):
         self.save_button.clicked.connect(self.on_save)
         self.save_button.setEnabled(False)
         button_layout.addWidget(self.save_button)
+        self.godbolt_button = QtWidgets.QPushButton("Open in Compiler Explorer")
+        self.godbolt_button.setToolTip(
+            "Open the generated code in Compiler Explorer (%s) to build it "
+            "against other compilers and see the resulting assembly.\n\n"
+            "This SENDS THE CODE to that site - it is the only thing in this "
+            "plugin that leaves your machine, so it always asks first. Point "
+            "'Compiler Explorer URL' in settings at a self-hosted instance to "
+            "keep it internal." % godbolt_base_url(config)
+        )
+        self.godbolt_button.clicked.connect(self.on_open_godbolt)
+        self.godbolt_button.setEnabled(False)
+        button_layout.addWidget(self.godbolt_button)
         self.close_button = QtWidgets.QPushButton("Close")
         self.close_button.clicked.connect(self.close)
         button_layout.addWidget(self.close_button)
@@ -6155,11 +6632,15 @@ class CodeGenDialog(QtWidgets.QDialog):
         self.refine_button.setEnabled(False)
         self.continue_button.setEnabled(False)
         self.followup_input.setEnabled(False)
+        # No point compiling the tabs while a reply that will replace them is
+        # in flight.
+        self.verify_button.setEnabled(False)
 
     def _request_finished(self, status_text):
         self.status_label.setText(status_text)
         self.refine_button.setEnabled(True)
         self.followup_input.setEnabled(True)
+        self.verify_button.setEnabled(bool(self._file_tabs))
 
     def _on_runner_status(self, text):
         self._begin_request(text)
@@ -6204,10 +6685,16 @@ class CodeGenDialog(QtWidgets.QDialog):
     def _on_result(self, result):
         if self._closed:
             return
+        was_compile_fix = self._awaiting_compile_fix
+        self._awaiting_compile_fix = False
         if result.error and not result.text.strip():
             self._request_finished("Error: %s" % result.error)
             return
 
+        # A continuation is glued onto the previous turn (it closes a file
+        # block the token limit cut in half); every other kind of follow-up -
+        # a Refine, a compile fix - re-emits complete files, so it REPLACES
+        # what came before rather than accumulating.
         if self._continuing and self._raw_text:
             self._raw_text = self._raw_text + "\n" + result.text
         else:
@@ -6230,11 +6717,96 @@ class CodeGenDialog(QtWidgets.QDialog):
                 "No BEGIN_FILE block in the reply - see the Model output tab; "
                 "use Refine to ask for the required format."
             )
+        elif self._verify_enabled():
+            self._start_compile_check(
+                "Compiling the model's fix..." if was_compile_fix
+                else "Checking that it compiles..."
+            )
         else:
             self._request_finished(
                 "Done - %d file(s). Nothing was written to the database."
                 % len(files)
             )
+
+    # -- compile check ------------------------------------------------------
+
+    def _verify_enabled(self):
+        return self.verify_check.isEnabled() and self.verify_check.isChecked()
+
+    def _current_files(self):
+        """What is actually in the tabs right now - the model's output plus
+        any manual edits. This, not the raw reply, is what gets compiled and
+        saved, so the compiler always judges the code the user can see."""
+        return [(name, edit.toPlainText()) for name, edit in self._file_tabs.items()]
+
+    def _start_compile_check(self, status_text):
+        files = self._current_files()
+        if not files:
+            return
+        self.status_label.setText(status_text)
+        self.refine_button.setEnabled(False)
+        self.verify_button.setEnabled(False)
+        self._compile_worker = CompileCheckWorker(self.config, files, self._on_compile_done)
+        self._compile_worker.start()
+
+    def _on_compile_done(self, result):
+        if self._closed:
+            return 0
+        self._compile_worker = None
+        if result.error:
+            self._insert_styled("\n\n--- Compile check: %s ---\n" % result.error)
+            self._request_finished("Compile check unavailable: %s" % result.error)
+            return 0
+
+        if result.ok:
+            self._insert_styled(
+                "\n\n--- Compiles clean (%s) ---\n%s\n"
+                % (result.command, result.diagnostics or "no diagnostics")
+            )
+            suffix = " with warnings" if result.diagnostics else ""
+            self._request_finished(
+                "Compiles clean%s - %d file(s). Nothing was written to the database."
+                % (suffix, len(self._file_tabs))
+            )
+            return 0
+
+        self._insert_styled(
+            "\n\n--- Compile FAILED (%s) ---\n%s\n" % (result.command, result.diagnostics)
+        )
+        max_rounds = max(0, int(self.config.codegen_max_compile_rounds or 0))
+        if self._compile_rounds < max_rounds:
+            self._compile_rounds += 1
+            self._awaiting_compile_fix = True
+            self._begin_request(
+                "Compile errors - asking the model to fix them (round %d of %d)..."
+                % (self._compile_rounds, max_rounds)
+            )
+            self.runner.send_compile_feedback(
+                result.diagnostics, result.command, self._current_files(),
+                self._on_result, self._on_error,
+            )
+            return 0
+
+        self._request_finished(
+            "Still does not compile after %d fix round(s) - see the Model output "
+            "tab for the errors, then edit a tab and click Verify Now, or use "
+            "Refine." % max_rounds
+        )
+        return 0
+
+    def on_verify_now(self):
+        """Manual re-check: compiles whatever is in the tabs right now
+        WITHOUT spending an automatic fix round, so hand-edits can be
+        validated without the model rewriting them."""
+        if not self._file_tabs:
+            return
+        if not find_c_compiler(self.config):
+            ida_kernwin.warning(
+                "No C compiler found.\n\nInstall clang, or set an explicit "
+                "compiler path in Edit > Plugins > LLM Explainer."
+            )
+            return
+        self._start_compile_check("Compiling current tab contents...")
 
     def _on_error(self, message):
         if self._closed:
@@ -6265,6 +6837,8 @@ class CodeGenDialog(QtWidgets.QDialog):
                 self.tabs.removeTab(index)
         if files:
             self.save_button.setEnabled(True)
+            self.verify_button.setEnabled(True)
+            self.godbolt_button.setEnabled(True)
             first_edit = self._file_tabs.get(files[0][0])
             if first_edit is not None:
                 self.tabs.setCurrentWidget(first_edit)
@@ -6277,6 +6851,9 @@ class CodeGenDialog(QtWidgets.QDialog):
             return
         self.followup_input.clear()
         self._continuing = False
+        # A human-directed change gets its own fresh fix budget: the previous
+        # rounds were spent on code the user has now asked to be different.
+        self._compile_rounds = 0
         self._begin_request("Refining...")
         self._insert_styled("\n\n--- You: %s ---\n\n" % question)
         self.runner.send_followup(question, self._on_result, self._on_error)
@@ -6293,6 +6870,66 @@ class CodeGenDialog(QtWidgets.QDialog):
             return
         QtWidgets.QApplication.clipboard().setText(widget.toPlainText())
         self.status_label.setText("Copied %s to the clipboard." % self.tabs.tabText(self.tabs.currentIndex()))
+
+    def on_open_godbolt(self):
+        """Open the current tab contents in Compiler Explorer.
+
+        Always confirms first: unlike everything else here, this transmits
+        the code - which came out of the user's binary - to whatever instance
+        is configured, and a shortened link there is public and permanent.
+        """
+        if not self._file_tabs:
+            return
+        files = self._current_files()
+        base = godbolt_base_url(self.config)
+        url = godbolt_clientstate_url(self.config, files)
+        needs_upload = url is None
+        detail = (
+            "The code is too large to carry in the link, so it will be "
+            "UPLOADED to that site's shortener, where the resulting link is "
+            "public and permanent."
+            if needs_upload else
+            "The code travels inside the link itself; nothing is stored there "
+            "unless you click Share on the site."
+        )
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Send code to Compiler Explorer?",
+            "This will send the generated code to:\n\n    %s\n\n%s\n\n"
+            "Nothing else in this plugin sends your code anywhere. Continue?"
+            % (base, detail),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        if not needs_upload:
+            self._launch_url(url)
+            return
+        self.status_label.setText("Uploading to %s..." % base)
+        self.godbolt_button.setEnabled(False)
+        GodboltShortenWorker(self.config, files, self._on_godbolt_link).start()
+
+    def _on_godbolt_link(self, url, error):
+        if self._closed:
+            return 0
+        self.godbolt_button.setEnabled(bool(self._file_tabs))
+        if error:
+            self.status_label.setText("Compiler Explorer: %s" % error)
+            ida_kernwin.warning("Could not create a Compiler Explorer link.\n\n%s" % error)
+            return 0
+        self._launch_url(url)
+        return 0
+
+    def _launch_url(self, url):
+        ida_kernwin.msg("[%s] Opening %s\n" % (PLUGIN_NAME, url))
+        if QtGui.QDesktopServices.openUrl(QtCore.QUrl(url)):
+            self.status_label.setText("Opened in Compiler Explorer.")
+            return
+        # No usable browser - the link is still useful, so hand it over.
+        QtWidgets.QApplication.clipboard().setText(url)
+        self.status_label.setText("Could not open a browser - link copied to the clipboard.")
 
     def on_save(self):
         if not self._file_tabs:
@@ -6580,6 +7217,66 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Max embedded bytes per global:", self.codegen_max_data_bytes_spin)
 
+        self.codegen_verify_compile_check = QtWidgets.QCheckBox(
+            "Verify exported C with a compiler and feed errors back to the model"
+        )
+        detected = find_c_compiler(PluginConfig(codegen_compiler_path=""))
+        self.codegen_verify_compile_check.setToolTip(
+            "After each C export answer, syntax-check the generated files "
+            "with clang and, if it fails, send the diagnostics back to the "
+            "model to fix. Syntax-only (-fsyntax-only is always forced on): "
+            "nothing is linked and nothing is ever executed.\n"
+            "Auto-detected compiler: %s" % (detected or "none found")
+        )
+        form.addRow(self.codegen_verify_compile_check)
+
+        self.codegen_compiler_path_edit = QtWidgets.QLineEdit()
+        self.codegen_compiler_path_edit.setPlaceholderText(
+            "(blank = auto-detect clang: %s)" % (detected or "none found")
+        )
+        form.addRow("C compiler path:", self.codegen_compiler_path_edit)
+
+        self.codegen_compile_flags_edit = QtWidgets.QLineEdit()
+        self.codegen_compile_flags_edit.setToolTip(
+            "Flags for the verification compile. -fsyntax-only is always "
+            "added (and -c/-S/-emit-llvm removed) so this can never emit, "
+            "link or run anything."
+        )
+        form.addRow("Compile check flags:", self.codegen_compile_flags_edit)
+
+        self.codegen_max_compile_rounds_spin = QtWidgets.QSpinBox()
+        self.codegen_max_compile_rounds_spin.setRange(0, 10)
+        self.codegen_max_compile_rounds_spin.setToolTip(
+            "How many times the model may be asked to fix its own compile "
+            "errors before the export gives up and leaves it to you. 0 = "
+            "report errors but never auto-fix."
+        )
+        form.addRow("Max compile fix rounds:", self.codegen_max_compile_rounds_spin)
+
+        self.codegen_godbolt_url_edit = QtWidgets.QLineEdit()
+        self.codegen_godbolt_url_edit.setToolTip(
+            "Where 'Open in Compiler Explorer' sends the generated code. "
+            "Point this at a self-hosted Compiler Explorer to keep the code "
+            "inside your network. The button always asks before sending, and "
+            "nothing else in this plugin transmits your code anywhere."
+        )
+        form.addRow("Compiler Explorer URL:", self.codegen_godbolt_url_edit)
+
+        self.codegen_godbolt_compiler_edit = QtWidgets.QLineEdit()
+        self.codegen_godbolt_compiler_edit.setPlaceholderText("(blank = let the site choose)")
+        self.codegen_godbolt_compiler_edit.setToolTip(
+            "Compiler to preselect there, e.g. cclang2010 or cg151. Valid "
+            "ids come from <Compiler Explorer URL>/api/compilers/c."
+        )
+        form.addRow("Compiler Explorer compiler:", self.codegen_godbolt_compiler_edit)
+
+        self.codegen_godbolt_options_edit = QtWidgets.QLineEdit()
+        self.codegen_godbolt_options_edit.setToolTip(
+            "Flags to preselect for that compiler (these run on the Compiler "
+            "Explorer instance, not on your machine)."
+        )
+        form.addRow("Compiler Explorer flags:", self.codegen_godbolt_options_edit)
+
         self.codegen_system_prompt_edit = QtWidgets.QPlainTextEdit()
         self.codegen_system_prompt_edit.setMinimumHeight(140)
         form.addRow("C export system prompt:", self.codegen_system_prompt_edit)
@@ -6636,6 +7333,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.codegen_max_globals_spin.setValue(config.codegen_max_globals)
         self.codegen_embed_data_check.setChecked(config.codegen_embed_data)
         self.codegen_max_data_bytes_spin.setValue(config.codegen_max_data_bytes)
+        self.codegen_verify_compile_check.setChecked(config.codegen_verify_compile)
+        self.codegen_compiler_path_edit.setText(config.codegen_compiler_path)
+        self.codegen_compile_flags_edit.setText(config.codegen_compile_flags)
+        self.codegen_max_compile_rounds_spin.setValue(config.codegen_max_compile_rounds)
+        self.codegen_godbolt_url_edit.setText(config.codegen_godbolt_url)
+        self.codegen_godbolt_compiler_edit.setText(config.codegen_godbolt_compiler_id)
+        self.codegen_godbolt_options_edit.setText(config.codegen_godbolt_options)
         self.codegen_system_prompt_edit.setPlainText(config.codegen_system_prompt)
 
     def _on_restore_defaults(self):
@@ -6700,6 +7404,13 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.codegen_max_globals = self.codegen_max_globals_spin.value()
         cfg.codegen_embed_data = self.codegen_embed_data_check.isChecked()
         cfg.codegen_max_data_bytes = self.codegen_max_data_bytes_spin.value()
+        cfg.codegen_verify_compile = self.codegen_verify_compile_check.isChecked()
+        cfg.codegen_compiler_path = self.codegen_compiler_path_edit.text().strip()
+        cfg.codegen_compile_flags = self.codegen_compile_flags_edit.text().strip()
+        cfg.codegen_max_compile_rounds = self.codegen_max_compile_rounds_spin.value()
+        cfg.codegen_godbolt_url = self.codegen_godbolt_url_edit.text().strip()
+        cfg.codegen_godbolt_compiler_id = self.codegen_godbolt_compiler_edit.text().strip()
+        cfg.codegen_godbolt_options = self.codegen_godbolt_options_edit.text().strip()
         cfg.codegen_system_prompt = self.codegen_system_prompt_edit.toPlainText()
         cfg._validate()
         self.result_config = cfg
