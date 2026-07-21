@@ -1550,22 +1550,45 @@ def resolve_global_query(query):
     byte_18002C6C3, dword_18002C178, or a raw address) to its linear
     address, or idaapi.BADADDR if it can't be resolved or the address
     turns out to be a function entry (functions are handled by
-    SUGGESTED_CALLEE_NAME instead, never here). The address must be a
-    valid, loaded location that actually has a name attached - i.e. a
-    real data item the listing refers to - so a bare number that happens
-    to parse but points at nothing is rejected rather than blindly
-    renamed."""
-    ea = _resolve_name_or_address(query)
+    SUGGESTED_CALLEE_NAME instead, never here).
+
+    A query that resolves via a real symbol name is trusted outright: it is
+    by definition a named data item the listing refers to. In particular we
+    do NOT require ida_bytes.is_loaded(ea) for a named global - that flag is
+    False for legitimately named variables living in an uninitialized
+    section (.bss), such as a contiguous run of auto-named CRT flag storage
+    (dword_70F88x), and gating on it silently dropped every such rename so
+    the UI never offered them. The is_loaded/points-at-something check is
+    only meaningful for a bare number that happens to parse: it guards
+    against renaming an address that references nothing real."""
+    query = (query or "").strip().strip("`'\"")
+    if not query:
+        return idaapi.BADADDR
+    from_name = False
+    ea = idc.get_name_ea_simple(query)
+    if ea != idaapi.BADADDR:
+        from_name = True
+    else:
+        for base in (0, 16):
+            try:
+                ea = int(query, base)
+                break
+            except ValueError:
+                ea = idaapi.BADADDR
     if ea == idaapi.BADADDR:
         return idaapi.BADADDR
+    func = ida_funcs.get_func(ea)
+    if func is not None and func.start_ea == ea:
+        return idaapi.BADADDR  # a function entry - not a data global
+    if from_name:
+        return ea
+    # Bare numeric address: it must point at a real, loaded location, else a
+    # number that merely parses but references nothing would be renamed.
     try:
         if not ida_bytes.is_loaded(ea):
             return idaapi.BADADDR
     except Exception:
         return idaapi.BADADDR
-    func = ida_funcs.get_func(ea)
-    if func is not None and func.start_ea == ea:
-        return idaapi.BADADDR  # a function entry - not a data global
     return ea
 
 
