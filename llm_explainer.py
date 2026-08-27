@@ -7595,7 +7595,15 @@ class SettingsDialog(QtWidgets.QDialog):
         self.result_config = None
         self._base_config = config
 
-        form = QtWidgets.QFormLayout()
+        # Settings are grouped into tabs so the dialog stays compact on
+        # small screens; `form` points at whichever tab's layout the
+        # following rows belong to (reassigned at each section boundary).
+        server_form = QtWidgets.QFormLayout()
+        explain_form = QtWidgets.QFormLayout()
+        trace_form = QtWidgets.QFormLayout()
+        export_form = QtWidgets.QFormLayout()
+        agent_form = QtWidgets.QFormLayout()
+        form = server_form
 
         self.server_urls_edit = QtWidgets.QPlainTextEdit()
         self.server_urls_edit.setPlaceholderText(
@@ -7649,6 +7657,7 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Request timeout (s):", self.timeout_spin)
 
+        form = explain_form
         self.max_context_spin = QtWidgets.QSpinBox()
         self.max_context_spin.setRange(500, 200000)
         self.max_context_spin.setSingleStep(500)
@@ -7771,6 +7780,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.system_prompt_edit.setMinimumHeight(140)
         form.addRow("System prompt:", self.system_prompt_edit)
 
+        form = trace_form
         self.max_trace_blocks_spin = QtWidgets.QSpinBox()
         self.max_trace_blocks_spin.setRange(1, 5000)
         self.max_trace_blocks_spin.setToolTip(
@@ -7836,6 +7846,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cfg_trace_system_prompt_edit.setMinimumHeight(140)
         form.addRow("CFG trace system prompt:", self.cfg_trace_system_prompt_edit)
 
+        form = export_form
         self.codegen_max_globals_spin = QtWidgets.QSpinBox()
         self.codegen_max_globals_spin.setRange(0, 500)
         self.codegen_max_globals_spin.setToolTip(
@@ -7929,6 +7940,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.codegen_system_prompt_edit.setMinimumHeight(140)
         form.addRow("C export system prompt:", self.codegen_system_prompt_edit)
 
+        form = agent_form
         # --- agent server (external-agent HTTP API) ---
         self.agent_server_check = QtWidgets.QCheckBox("Agent server (let an external agent drive IDA over HTTP)")
         self.agent_server_check.setToolTip(
@@ -8008,8 +8020,21 @@ class SettingsDialog(QtWidgets.QDialog):
             self._on_restore_defaults
         )
 
+        tabs = QtWidgets.QTabWidget()
+        for _title, _f in (("Server", server_form), ("Explain", explain_form),
+                           ("CFG trace", trace_form), ("C export", export_form),
+                           ("Agent server", agent_form)):
+            # Each tab scrolls if its content is taller than the dialog, so
+            # the whole settings screen is reachable on any screen size.
+            _page = QtWidgets.QScrollArea()
+            _page.setWidgetResizable(True)
+            _inner = QtWidgets.QWidget()
+            _inner.setLayout(_f)
+            _page.setWidget(_inner)
+            tabs.addTab(_page, _title)
+
         outer = QtWidgets.QVBoxLayout(self)
-        outer.addLayout(form)
+        outer.addWidget(tabs)
         outer.addWidget(buttons)
         _add_copyright_footer(outer)
 

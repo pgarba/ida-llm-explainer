@@ -21,11 +21,92 @@ def _stub(name, **attrs):
     sys.modules[name] = mod
     return mod
 
+class _Any:
+    """A universal no-op: callable, chainable, and coercible to the types
+    the plugin code expects (str/int/float/bool/iterable)."""
+    def __call__(self, *a, **k):
+        return _Any()
+    def __getattr__(self, item):
+        return _Any()
+    def __str__(self):
+        return ""
+    def __int__(self):
+        return 0
+    def __float__(self):
+        return 0.0
+    def __bool__(self):
+        return False
+    def __iter__(self):
+        return iter(())
+    def __or__(self, other):
+        return _Any()
+    def __and__(self, other):
+        return _Any()
+    def __add__(self, other):
+        return _Any()
+    def __radd__(self, other):
+        return _Any()
+    def __sub__(self, other):
+        return _Any()
+    def __rsub__(self, other):
+        return _Any()
+    def __mul__(self, other):
+        return _Any()
+    def __rmul__(self, other):
+        return _Any()
+    def __truediv__(self, other):
+        return _Any()
+    def __floordiv__(self, other):
+        return _Any()
+    def __mod__(self, other):
+        return _Any()
+    def __neg__(self):
+        return _Any()
+    def __len__(self):
+        return 0
+    def __eq__(self, other):
+        return True
+    def __ne__(self, other):
+        return False
+    def __lt__(self, other):
+        return False
+    def __gt__(self, other):
+        return False
+    def __le__(self, other):
+        return False
+    def __ge__(self, other):
+        return False
+
+# Qt accessors whose return type the plugin code depends on
+_QT_STR_METHODS = {"text", "toPlainText", "toHtml", "currentText", "placeholderText"}
+_QT_NUM_METHODS = {"value", "valueFromText", "count", "rowCount", "columnCount"}
+_QT_BOOL_METHODS = {"isChecked", "isEnabled", "isVisible", "hasFocus"}
+
+def _qt_method(name):
+    if name in _QT_STR_METHODS:
+        return (lambda *a, **k: "")
+    if name in _QT_NUM_METHODS:
+        return (lambda *a, **k: 0)
+    if name in _QT_BOOL_METHODS:
+        return (lambda *a, **k: False)
+    # everything else (signals like `clicked`, setters, ...) is a chainable
+    # no-op that also coerces to a sane value if called and used as one
+    return _Any()
+
+class _DummyMeta(type):
+    """Metaclass so class-level Qt attribute access (e.g.
+    QLineEdit.EchoMode.Password) resolves to a no-op instead of raising."""
+    def __getattr__(cls, item):
+        return _Any()
+
 def _dummy_class(name):
-    """A class that can be subclassed and instantiated with anything."""
-    return type(name, (), {
+    """A class that can be subclassed and instantiated with anything, and
+    whose class-level attributes (Qt enums) also resolve to no-ops.
+    The metaclass is called directly (not via type(..., metaclass=...))
+    because Python 3.14 no longer consumes the metaclass keyword in type()."""
+    return _DummyMeta(name, (), {
         "__init__": lambda self, *a, **k: None,
-        "__getattr__": lambda self, item: (lambda *a, **k: None),
+        "__getattr__": lambda self, item: _qt_method(item),
     })
 
 class _ActionHandler:
@@ -62,7 +143,7 @@ _stub("ida_funcs", get_func=lambda ea: None, get_func_name=lambda ea: "sub_%X" %
 _stub("ida_graph", GraphViewer=_dummy_class("GraphViewer"))
 
 # PySide6 stubs: dummy classes (subclassable, instantiable with anything)
-_QT_WIDGETS = ["QDialog", "QWidget", "QFormLayout", "QPlainTextEdit", "QLineEdit",
+_QT_WIDGETS = ["QDialog", "QDialogButtonBox", "QWidget", "QFormLayout", "QPlainTextEdit", "QLineEdit",
                "QSpinBox", "QDoubleSpinBox", "QCheckBox", "QPushButton", "QHBoxLayout",
                "QVBoxLayout", "QGridLayout", "QScrollArea", "QLabel", "QComboBox",
                "QTabWidget", "QTableView", "QHeaderView", "QAbstractTableModel",
@@ -75,7 +156,7 @@ qtcore = _stub("PySide6.QtCore", Signal=lambda *a, **k: None, QObject=_dummy_cla
 qtwidgets = _stub("PySide6.QtWidgets")
 for _cn in _QT_WIDGETS:
     setattr(qtwidgets, _cn, _dummy_class(_cn))
-qtgui = _stub("PySide6.QtGui", QAction=_dummy_class("QAction"), QColor=_dummy_class("QColor"),
+qtgui = _stub("PySide6.QtGui", QAction=_dummy_class("QAction"), QColor=_dummy_class("QColor"), QPalette=_dummy_class("QPalette"),
               QKeySequence=_dummy_class("QKeySequence"), QFont=_dummy_class("QFont"),
               QPainter=_dummy_class("QPainter"), QPen=_dummy_class("QPen"),
               QBrush=_dummy_class("QBrush"), QDesktopServices=_dummy_class("QDesktopServices"),
@@ -317,6 +398,19 @@ try:
           L.query_server_context_size("http://fallback-shape.test", "m") == 4096)
 finally:
     _ur.urlopen = _real_urlopen
+
+# 9d. SettingsDialog builds (tabbed layout) and _on_ok round-trips every
+#     widget - this is the regression guard for "widget referenced in
+#     _on_ok/_populate but never created in __init__" (the auto-compact
+#     widgets had exactly that bug).
+dlg = L.SettingsDialog(cfg)
+dlg._on_ok()
+rc = dlg.result_config
+check("SettingsDialog builds + _on_ok round-trips",
+      rc is not None and rc.server_context_size == 0
+      and rc.auto_compact_threshold >= 0.05
+      and rc.agent_server_enabled is False
+      and rc.agent_server_port == 0)
 
 # 10. agent server: protocol layer (real HTTP on localhost)
 import urllib.error
