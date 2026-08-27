@@ -230,7 +230,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.9.0"
+PLUGIN_VERSION = "1.10.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -758,6 +758,29 @@ DEFAULT_CONFIG = {
     "max_total_context_chars": 40000,
     "max_auto_fetch": 5,
     "max_caller_refs": 3,
+    # --- auto-compact (context-window management) -------------------------
+    # llama.cpp servers have a fixed context size per model; once a
+    # conversation's prompt exceeds it the server rejects the request or
+    # silently truncates it and the model "just stops". When enabled, the
+    # runner estimates the prompt size before every request and, once it
+    # reaches auto_compact_threshold of the server's context, summarizes
+    # the conversation history into a dense digest (older messages are
+    # elided mechanically if the summarization request itself fails) so
+    # long sessions - follow-ups, REQUEST_CODE rounds, compile-fix loops -
+    # keep working instead of overflowing the window.
+    "auto_compact_enabled": True,
+    # Fraction of the server context at which compaction triggers (0.9 =
+    # 90%, leaving headroom for the model's reply).
+    "auto_compact_threshold": 0.9,
+    # Server context window in tokens. 0 = auto-detect from the server's
+    # /v1/models endpoint (llama.cpp reports context.size per model). Set
+    # a positive value to override (server hides it, or runs a smaller
+    # runtime context than the model's nominal one).
+    "server_context_size": 0,
+    # Fallback estimate of characters per token for prompt sizing; the
+    # runner recalibrates it from real usage the server reports whenever
+    # available.
+    "chars_per_token": 3.5,
     "include_data_refs": True,
     "max_data_refs": 20,
     "max_string_len": 150,
@@ -4589,6 +4612,19 @@ class PluginConfig(object):
             self.max_caller_refs = max(0, int(self.max_caller_refs))
         except (TypeError, ValueError):
             self.max_caller_refs = DEFAULT_CONFIG["max_caller_refs"]
+        self.auto_compact_enabled = bool(self.auto_compact_enabled)
+        try:
+            self.auto_compact_threshold = max(0.05, min(1.0, float(self.auto_compact_threshold)))
+        except (TypeError, ValueError):
+            self.auto_compact_threshold = DEFAULT_CONFIG["auto_compact_threshold"]
+        try:
+            self.server_context_size = max(0, int(self.server_context_size))
+        except (TypeError, ValueError):
+            self.server_context_size = DEFAULT_CONFIG["server_context_size"]
+        try:
+            self.chars_per_token = max(1.0, min(10.0, float(self.chars_per_token)))
+        except (TypeError, ValueError):
+            self.chars_per_token = DEFAULT_CONFIG["chars_per_token"]
         self.include_data_refs = bool(self.include_data_refs)
         try:
             self.max_data_refs = max(0, int(self.max_data_refs))
@@ -4692,6 +4728,169 @@ class PluginConfig(object):
 
 
 # ---------------------------------------------------------------------------
+# Context-window management (auto-compact)
+#
+# A llama.cpp server has a fixed context size per model; once a
+# conversation's prompt exceeds it the server either refuses the request
+# or silently truncates it, and the model "just stops" mid-answer or
+# starts confabulating. To prevent that, ConversationRunner estimates the
+# prompt size before every request and, once it reaches the configured
+# threshold (default 90%) of the server's context, first asks the model to
+# compress the conversation history into a dense summary, then continues
+# from that summary (mechanical elision is the fallback when the
+# summarization request itself fails).
+# ---------------------------------------------------------------------------
+
+_CONTEXT_SIZE_CACHE = {}  # (server_url, model) -> int tokens (0 = unknown)
+
+
+def query_server_context_size(server_url, model="", api_key="", timeout=5):
+    """Ask the server for the context size of the model we talk to.
+
+    llama.cpp's /v1/models endpoint reports each model's context as
+    "context": {"size": N, "used": M}. Returns None when it could not be
+    determined (auto-compact then falls back to the manual
+    server_context_size override, and does nothing if that is 0 too).
+    Results - including failures - are cached per (url, model) so a slow
+    or dead server costs at most one short probe per conversation.
+    """
+    key = (server_url, (model or "").strip())
+    cached = _CONTEXT_SIZE_CACHE.get(key)
+    if cached is not None:
+        return cached or None
+    size = 0
+    try:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = "Bearer " + api_key
+        req = urllib.request.Request(server_url + "/v1/models", headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        entries = data.get("data") or []
+        chosen = None
+        if key[1]:
+            for entry in entries:
+                if entry.get("id") == key[1]:
+                    chosen = entry
+                    break
+        if chosen is None and entries:
+            chosen = entries[0]  # model unset: server default = first listed
+        if chosen is not None:
+            # llama.cpp: data[].meta.n_ctx - the RUNTIME context of the
+            # loaded model (the -c value), e.g.
+            #   "meta": {"n_ctx": 80128, "n_ctx_train": 262144, ...}
+            # Other OpenAI-compatible servers: data[].context.size
+            candidate = None
+            meta = chosen.get("meta") or {}
+            if isinstance(meta.get("n_ctx"), int) and meta["n_ctx"] > 0:
+                candidate = meta["n_ctx"]
+            else:
+                ctx = chosen.get("context") or {}
+                if isinstance(ctx.get("size"), int) and ctx["size"] > 0:
+                    candidate = ctx["size"]
+            if candidate is not None:
+                size = candidate
+    except Exception:
+        pass
+    _CONTEXT_SIZE_CACHE[key] = size
+    return size or None
+
+
+def estimate_prompt_tokens(messages, chars_per_token):
+    """Estimate the prompt-token count of a message list: total characters
+    over chars_per_token, plus a small per-message overhead (role markers
+    and chat-template separators)."""
+    total_chars = sum(len(m.get("content") or "") for m in messages)
+    return total_chars / max(1.0, float(chars_per_token)) + 4.0 * len(messages)
+
+
+def blocking_chat_completion(config, server_url, messages, max_tokens=2048, temperature=0.1):
+    """One NON-streaming chat completion (used for the auto-compact
+    summarization request). Returns (text, usage_dict_or_None). Raises
+    RuntimeError on any failure - callers treat that as "compaction
+    failed" and fall back to mechanical elision."""
+    url = server_url + "/v1/chat/completions"
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if config.model:
+        payload["model"] = config.model
+    headers = {"Content-Type": "application/json"}
+    if config.api_key:
+        headers["Authorization"] = "Bearer " + config.api_key
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=config.request_timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        raise RuntimeError("HTTP %s: %s" % (exc.code, detail)) from None
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError("Cannot connect to %s (%s)" % (url, getattr(exc, "reason", exc))) from None
+    try:
+        obj = json.loads(body.decode("utf-8", "replace"))
+    except Exception as exc:
+        raise RuntimeError("Unexpected response from server: %s" % exc) from None
+    choices = obj.get("choices") or []
+    if not choices:
+        err = obj.get("error")
+        raise RuntimeError(str(err) if err else "Empty response from server.") from None
+    message = choices[0].get("message") or {}
+    return message.get("content") or "", obj.get("usage")
+
+
+# Summarizer prompts for auto-compact. The transcript is compressed into a
+# structured digest that preserves every identifier, address and
+# SUGGESTED_* decision verbatim, so the assistant can continue the same
+# work from the summary without re-reading the elided code.
+_COMPACT_SYSTEM_PROMPT = (
+    "You are a context-compaction engine for a reverse-engineering "
+    "assistant. You will be given the transcript of a conversation between "
+    "a user (an IDA Pro analyst) and an assistant that explains, renames "
+    "and refactors reverse-engineered code. Compress it into a dense, "
+    "factual summary that lets the assistant continue the work seamlessly, "
+    "as if it had never lost the original transcript. Output ONLY the "
+    "summary - no preamble, no questions, no markdown fences."
+)
+
+_COMPACT_USER_TEMPLATE = (
+    "Summarize the following conversation transcript for a context "
+    "compaction. The summary MUST cover, in this order, using terse "
+    "bullet points:\n"
+    "1. Target: the function(s)/address(es) under analysis and what they "
+    "appear to do.\n"
+    "2. Established facts: signatures, structs, data layouts, and the "
+    "inferred meaning of important variables, globals and callees.\n"
+    "3. Code seen: which other functions' code was requested and shown "
+    "(names/addresses), and the key fact(s) taken from each.\n"
+    "4. Decisions: every SUGGESTED_* line the assistant proposed (verbatim, "
+    "old -> new), and which were applied, rejected or still pending.\n"
+    "5. Open questions: what was unresolved, and what the analyst last "
+    "asked.\n"
+    "Preserve exact identifiers, addresses and type spellings - never "
+    "paraphrase them. Keep the whole summary under 1500 words.\n\n"
+    "TRANSCRIPT:\n%s"
+)
+
+_COMPACTED_CONTEXT_PREAMBLE = (
+    "CONTEXT SUMMARY (auto-compacted: the earlier transcript was "
+    "summarized because the conversation approached the server's context "
+    "window limit). Rely on the summary below plus any new information I "
+    "provide; if you need exact details of elided code, request it again "
+    "with REQUEST_CODE.\n\n"
+)
+
+
+# ---------------------------------------------------------------------------
 # Networking (background thread, SSE streaming over urllib)
 # ---------------------------------------------------------------------------
 
@@ -4722,6 +4921,17 @@ class LlamaStreamWorker(threading.Thread):
         self._on_error = on_error
         self._cancel_event = threading.Event()
         self._response = None
+        # Server-reported token accounting ({"prompt_tokens": N, ...}) from
+        # the last chunk that carried it - ConversationRunner uses it to
+        # calibrate its chars-per-token estimate for auto-compact.
+        self.usage = None
+        # Server-reported timings ({"predicted_per_second": N, ...}) from
+        # the final chunk - shown in the dialog's context gauge (t/s).
+        self.timings = None
+        # Chars of the in-flight reply so far (content only, no reasoning)
+        # - lets the dialog's timer refresh the context gauge live while
+        # tokens are still streaming in.
+        self._content_chars = 0
 
     def cancel(self):
         self._cancel_event.set()
@@ -4749,6 +4959,11 @@ class LlamaStreamWorker(threading.Thread):
             "temperature": self._config.temperature,
             "max_tokens": self._config.max_tokens,
             "stream": True,
+            # Ask llama-server to append a final usage chunk to the stream
+            # so the plugin can measure real prompt tokens (auto-compact).
+            # OpenAI-compatible servers that don't know this field ignore
+            # it.
+            "stream_options": {"include_usage": True},
         }
         if self._config.model:
             payload["model"] = self._config.model
@@ -4800,6 +5015,12 @@ class LlamaStreamWorker(threading.Thread):
                             obj = json.loads(data_str)
                         except ValueError:
                             continue
+                        usage = obj.get("usage")
+                        if isinstance(usage, dict) and usage:
+                            self.usage = usage
+                        timings = obj.get("timings")
+                        if isinstance(timings, dict) and timings:
+                            self.timings = timings
                         choices = obj.get("choices") or []
                         if not choices:
                             continue
@@ -4817,6 +5038,7 @@ class LlamaStreamWorker(threading.Thread):
                         piece = delta.get("content")
                         if piece:
                             parts.append(piece)
+                            self._content_chars += len(piece)
                             ida_kernwin.execute_sync(
                                 functools.partial(self._on_delta, piece), ida_kernwin.MFF_FAST
                             )
@@ -4838,6 +5060,12 @@ class LlamaStreamWorker(threading.Thread):
             obj = json.loads(body.decode("utf-8", "replace"))
         except Exception as exc:
             raise RuntimeError("Unexpected response from server: %s" % exc) from None
+        usage = obj.get("usage")
+        if isinstance(usage, dict) and usage:
+            self.usage = usage
+        timings = obj.get("timings")
+        if isinstance(timings, dict) and timings:
+            self.timings = timings
         choices = obj.get("choices") or []
         if not choices:
             err = obj.get("error")
@@ -5246,6 +5474,16 @@ class ConversationRunner(object):
         self._closed = False
         self._on_result_cb = None
         self._on_error_cb = None
+        # --- context-window management (auto-compact) ---------------------
+        self._context_size = None  # server context in tokens (None = unknown)
+        self._cpt = float(getattr(config, "chars_per_token", 3.5))
+        self._compacting = False
+        self._last_sent_chars = 0
+        # Dialog UIs set this to (est_tokens, context_size, tokens_per_sec)
+        # -> None to show a live "context: N%" gauge; (0, 0, ...) means the
+        # window is unknown, and t/s is None until a reply has completed.
+        self._on_context_usage_cb = None
+        self._last_tps = None  # generation speed from the last reply
 
     def build_initial_messages(self):
         blocks = gather_recursive_context(self.func, self.config)
@@ -5277,6 +5515,7 @@ class ConversationRunner(object):
         except Exception as exc:
             self._on_error_cb("Failed to gather function context: %s" % exc)
             return
+        self._detect_context_size()
         self._issue_request()
 
     def send_followup(self, user_text, on_result, on_error):
@@ -5339,12 +5578,220 @@ class ConversationRunner(object):
             self.worker.cancel()
 
     def _issue_request(self):
+        # Auto-compact: if the prompt is at/over the configured fraction of
+        # the server's context window, shrink it first (the compact path
+        # re-enters _issue_request when done). _compacting guards against
+        # re-triggering while a summarization request is in flight.
+        if self.config.auto_compact_enabled and not self._compacting and self._maybe_compact():
+            return
+        self._last_sent_chars = sum(len(m.get("content") or "") for m in self.messages)
+        self._notify_context_usage()
         self.worker = LlamaStreamWorker(
             self.config, self.server_url, list(self.messages),
             self._on_delta, self._on_reasoning_delta,
             self._on_worker_done, self._on_worker_error,
         )
         self.worker.start()
+
+    # -- context-window management (auto-compact) --------------------------
+
+    def _notify_context_usage(self):
+        """Tell the attached UI how full the context window is (estimated
+        tokens of the current message list vs the server's window) and how
+        fast the last reply was generated. Runs on the main thread at
+        every request point, after every reply, and after compaction."""
+        cb = self._on_context_usage_cb
+        if cb is None:
+            return
+        if self._context_size:
+            cb(int(estimate_prompt_tokens(self.messages, self._cpt)), int(self._context_size), self._last_tps)
+        else:
+            cb(0, 0, self._last_tps)
+
+    def refresh_context_gauge(self):
+        """Timer-driven refresh (the dialogs call this every couple of
+        seconds). Unlike _notify_context_usage, this ALSO counts the
+        in-flight streaming reply so the gauge climbs live while tokens
+        are still arriving. Safe to call from the main thread at any
+        point - it only reads state and fires the UI callback."""
+        cb = self._on_context_usage_cb
+        if cb is None:
+            return
+        msgs = self.messages or []
+        est = int(estimate_prompt_tokens(msgs, self._cpt))
+        worker = self.worker
+        if worker is not None:
+            est += max(0, int(getattr(worker, "_content_chars", 0) / self._cpt))
+        if self._context_size:
+            cb(est, int(self._context_size), self._last_tps)
+        else:
+            cb(0, 0, self._last_tps)
+
+    def _detect_context_size(self):
+        """Resolve the context window for the CURRENT server: the manual
+        override when set, otherwise a (cached) probe of the server's
+        /v1/models endpoint. None when neither yields a number - in that
+        case auto-compact stays dormant rather than guessing."""
+        if self.config.server_context_size > 0:
+            self._context_size = self.config.server_context_size
+            return
+        self._context_size = query_server_context_size(
+            self.server_url, self.config.model, self.config.api_key
+        )
+
+    def _maybe_compact(self):
+        """Check the current prompt against the server's context window.
+        Returns True (and starts shrinking) when it is at/over the
+        configured threshold; the caller must then NOT issue the request -
+        the post-compact path re-enters _issue_request itself."""
+        if not self._context_size:
+            return False
+        limit_tokens = int(self._context_size * self.config.auto_compact_threshold)
+        est_tokens = estimate_prompt_tokens(self.messages, self._cpt)
+        if est_tokens < limit_tokens:
+            return False
+        pct = int(100.0 * est_tokens / self._context_size)
+        if len(self.messages) <= 3:
+            # No history to summarize - the initial code context itself is
+            # too big, so elide it mechanically.
+            self._on_status(
+                "Prompt is ~%d%% of the server's %d-token context window; "
+                "truncating context..." % (pct, self._context_size)
+            )
+            self._hard_truncate(limit_tokens)
+            return True
+        self._on_status(
+            "Prompt is ~%d%% of the server's %d-token context window; "
+            "compacting conversation..." % (pct, self._context_size)
+        )
+        self._compacting = True
+        threading.Thread(target=self._compact_thread, daemon=True).start()
+        return True
+
+    def _compact_request_messages(self):
+        """Summarizer request: the whole conversation except the system
+        prompt and the PENDING user turn (that one is re-attached after
+        compaction), with the transcript capped well under the window so
+        the compact request itself always fits."""
+        middle = self.messages[1:-1]
+        transcript = "\n\n".join(
+            "### %s\n%s" % ((m.get("role") or "user").upper(), m.get("content") or "")
+            for m in middle
+        )
+        cap = max(4000, int(self._context_size * 0.8 * self._cpt))
+        if len(transcript) > cap:
+            half = cap // 2
+            transcript = transcript[:half] + "\n...[middle of transcript elided]...\n" + transcript[-half:]
+        return [
+            {"role": "system", "content": _COMPACT_SYSTEM_PROMPT},
+            {"role": "user", "content": _COMPACT_USER_TEMPLATE % transcript},
+        ]
+
+    def _compact_thread(self):
+        """Background: run the summarization request, then marshal the
+        outcome back onto IDA's main thread (same contract as
+        LlamaStreamWorker)."""
+        try:
+            summary, usage = blocking_chat_completion(
+                self.config, self.server_url, self._compact_request_messages(),
+                max_tokens=2048,
+            )
+        except Exception:
+            summary, usage = None, None
+        if isinstance(usage, dict) and usage:
+            self._calibrate_from_usage(usage)
+        ida_kernwin.execute_sync(
+            functools.partial(self._on_compact_done, summary), ida_kernwin.MFF_FAST
+        )
+
+    def _on_compact_done(self, summary):
+        self._compacting = False
+        if self._closed:
+            return 0
+        limit_tokens = int(self._context_size * self.config.auto_compact_threshold)
+        if summary and summary.strip():
+            self._apply_summary(summary.strip())
+            self._on_status(
+                "Conversation compacted (%d-char summary); resuming..." % len(summary)
+            )
+        else:
+            self._on_status("Auto-compact summarization failed; eliding older messages instead.")
+            self._hard_truncate(limit_tokens)
+        # If it is STILL over after compaction (e.g. the pending turn
+        # itself is huge), elide mechanically as a last resort so the
+        # request actually fits.
+        if estimate_prompt_tokens(self.messages, self._cpt) >= limit_tokens:
+            self._hard_truncate(limit_tokens)
+        self._issue_request()
+
+    def _apply_summary(self, summary):
+        """Replace the history with [system, user(summary)] and re-attach
+        the pending user turn (at every _issue_request call site the last
+        message is the user turn that is about to be answered)."""
+        pending = self.messages[-1] if self.messages[-1].get("role") == "user" else None
+        self.messages = [
+            self.messages[0],
+            {"role": "user", "content": _COMPACTED_CONTEXT_PREAMBLE + summary},
+        ]
+        if pending is not None:
+            self.messages.append(pending)
+
+    def _hard_truncate(self, limit_tokens):
+        """Mechanical last-resort shrink (no LLM involved): trim the OLDEST
+        messages first - the system prompt, the last assistant reply and
+        the pending user turn are protected - so the prompt fits even
+        when summarization is unavailable."""
+        budget_chars = max(2000, int(limit_tokens * self._cpt * 0.95))
+        msgs = list(self.messages)
+        total = sum(len(m.get("content") or "") for m in msgs)
+        if total <= budget_chars:
+            return
+        protected = sum(len(m.get("content") or "") for m in msgs[-2:])
+        oldest_budget = budget_chars - protected
+        if oldest_budget < 1000:
+            # Even the last exchange alone exceeds the budget: keep its TAIL
+            # (the newest content is what the model is answering to).
+            for i in range(1, len(msgs) - 1):
+                msgs[i] = {"role": msgs[i]["role"], "content": "[elided by auto-compact]"}
+            tail = msgs[-1]
+            keep = max(500, budget_chars - 40)
+            content = tail.get("content") or ""
+            if len(content) > keep:
+                tail = {"role": tail["role"], "content": "...[head truncated by auto-compact]...\n" + content[-keep:]}
+            msgs[-1] = tail
+            self.messages = msgs
+            return
+        remaining = oldest_budget
+        i = 1  # index 0 is the system prompt - never trim it
+        while i < len(msgs) - 2:
+            m = msgs[i]
+            content = m.get("content") or ""
+            if len(content) <= remaining:
+                remaining -= len(content)
+            else:
+                cut = max(300, remaining - 80)
+                msgs[i] = {
+                    "role": m["role"],
+                    "content": content[:cut] + "\n...[truncated by auto-compact to fit the context window]...",
+                }
+                remaining = 80
+                for j in range(i + 1, len(msgs) - 2):
+                    msgs[j] = {"role": msgs[j]["role"], "content": "[elided by auto-compact]"}
+                break
+            i += 1
+        self.messages = msgs
+
+    def _calibrate_from_usage(self, usage):
+        """When the server reports real prompt tokens, derive the true
+        chars-per-token ratio from the messages that were actually sent
+        and use it for every later estimate (far more accurate than the
+        static setting)."""
+        prompt_tokens = usage.get("prompt_tokens")
+        if not isinstance(prompt_tokens, int) or prompt_tokens < 50:
+            return
+        if self._last_sent_chars <= 0:
+            return
+        self._cpt = max(1.0, min(10.0, self._last_sent_chars / prompt_tokens))
 
     def _next_fallback_server(self):
         """Highest-priority (list-order) configured server not yet tried
@@ -5369,6 +5816,7 @@ class ConversationRunner(object):
                     "%s is unreachable (%s) - falling back to %s..."
                     % (self.config.server_label(failed_from), message, self.config.server_label(next_server))
                 )
+                self._detect_context_size()  # the new server may have a different window
                 self._issue_request()
                 return 0
             self._on_error_cb(
@@ -5409,9 +5857,17 @@ class ConversationRunner(object):
         ))
 
     def _on_worker_done(self, full_text, reasoning_text="", finish_reason=None):
+        usage = getattr(self.worker, "usage", None)
+        timings = getattr(self.worker, "timings", None)
         self.worker = None
         if self._closed:
             return 0
+        if isinstance(usage, dict) and usage:
+            self._calibrate_from_usage(usage)
+        if isinstance(timings, dict):
+            tps = timings.get("predicted_per_second")
+            if isinstance(tps, (int, float)) and tps > 0:
+                self._last_tps = float(tps)
         text = full_text
 
         if not text.strip():
@@ -5426,6 +5882,7 @@ class ConversationRunner(object):
             return 0
 
         self.messages.append({"role": "assistant", "content": text})
+        self._notify_context_usage()  # the reply just grew the conversation
 
         requests = _REQUEST_CODE_RE.findall(text)
         caller_requests = _REQUEST_CALLERS_RE.findall(text)
@@ -6006,8 +6463,17 @@ class ExplainResultDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
 
+        status_layout = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("Contacting model...")
-        layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_label, 1)
+        self.context_label = QtWidgets.QLabel("")
+        self.context_label.setToolTip(
+            "Estimated share of the server's context window used by this "
+            "conversation. When it reaches the auto-compact threshold the "
+            "history is summarized so the conversation can continue."
+        )
+        status_layout.addWidget(self.context_label)
+        layout.addLayout(status_layout)
 
         self.stream_edit = QtWidgets.QPlainTextEdit()
         self.stream_edit.setReadOnly(True)
@@ -6154,8 +6620,39 @@ class ExplainResultDialog(QtWidgets.QDialog):
             on_reasoning_delta=self._on_reasoning_delta,
             on_status=self._on_runner_status,
         )
+        self.runner._on_context_usage_cb = self._on_context_usage
+        # Re-read the gauge every 2s so it climbs live while tokens stream
+        # in (the runner counts the in-flight reply), and so a fresh t/s
+        # from the previous reply shows up without waiting for the next
+        # request. The timer is a child of this dialog, so it dies with it.
+        self._gauge_timer = QtCore.QTimer(self)
+        self._gauge_timer.setInterval(2000)
+        self._gauge_timer.timeout.connect(self.runner.refresh_context_gauge)
+        self._gauge_timer.start()
         self._begin_request("Querying model...")
         self.runner.start(self._on_conversation_result, self._on_conversation_error)
+
+    def _on_context_usage(self, est_tokens, context_size, tps=None):
+        """Live context-window gauge, refreshed by the runner before every
+        request and after every reply/compaction."""
+        try:
+            speed = ""
+            if tps:
+                speed = "  ·  %s t/s" % ("{:.0f}".format(tps) if tps >= 100 else "{:.1f}".format(tps))
+            if context_size > 0:
+                pct = max(0, min(100, int(100.0 * est_tokens / context_size)))
+                color = ("#1a7f1a" if pct < 70
+                         else ("#b26a00" if pct < 90 else "#c41e1e"))
+                self.context_label.setText(
+                    "Context: %d%%  (%s / %s tok)%s" % (pct, "{:,}".format(est_tokens),
+                                                        "{:,}".format(context_size), speed)
+                )
+                self.context_label.setStyleSheet("color: %s; font-weight: bold;" % color)
+            else:
+                self.context_label.setText("Context: unknown%s" % speed)
+                self.context_label.setStyleSheet("")
+        except RuntimeError:
+            pass  # widget already destroyed
 
     # -- request lifecycle --------------------------------------------------
 
@@ -6545,8 +7042,17 @@ class CodeGenDialog(QtWidgets.QDialog):
 
         layout = QtWidgets.QVBoxLayout(self)
 
+        status_layout = QtWidgets.QHBoxLayout()
         self.status_label = QtWidgets.QLabel("Contacting model...")
-        layout.addWidget(self.status_label)
+        status_layout.addWidget(self.status_label, 1)
+        self.context_label = QtWidgets.QLabel("")
+        self.context_label.setToolTip(
+            "Estimated share of the server's context window used by this "
+            "conversation. When it reaches the auto-compact threshold the "
+            "history is summarized so the conversation can continue."
+        )
+        status_layout.addWidget(self.context_label)
+        layout.addLayout(status_layout)
 
         self.tabs = QtWidgets.QTabWidget()
         self.stream_edit = QtWidgets.QPlainTextEdit()
@@ -6644,8 +7150,39 @@ class CodeGenDialog(QtWidgets.QDialog):
             on_reasoning_delta=self._on_reasoning_delta,
             on_status=self._on_runner_status,
         )
+        self.runner._on_context_usage_cb = self._on_context_usage
+        # Re-read the gauge every 2s so it climbs live while tokens stream
+        # in (the runner counts the in-flight reply), and so a fresh t/s
+        # from the previous reply shows up without waiting for the next
+        # request. The timer is a child of this dialog, so it dies with it.
+        self._gauge_timer = QtCore.QTimer(self)
+        self._gauge_timer.setInterval(2000)
+        self._gauge_timer.timeout.connect(self.runner.refresh_context_gauge)
+        self._gauge_timer.start()
         self._begin_request("Generating C source...")
         self.runner.start(self._on_result, self._on_error)
+
+    def _on_context_usage(self, est_tokens, context_size, tps=None):
+        """Live context-window gauge, refreshed by the runner before every
+        request and after every reply/compaction."""
+        try:
+            speed = ""
+            if tps:
+                speed = "  ·  %s t/s" % ("{:.0f}".format(tps) if tps >= 100 else "{:.1f}".format(tps))
+            if context_size > 0:
+                pct = max(0, min(100, int(100.0 * est_tokens / context_size)))
+                color = ("#1a7f1a" if pct < 70
+                         else ("#b26a00" if pct < 90 else "#c41e1e"))
+                self.context_label.setText(
+                    "Context: %d%%  (%s / %s tok)%s" % (pct, "{:,}".format(est_tokens),
+                                                        "{:,}".format(context_size), speed)
+                )
+                self.context_label.setStyleSheet("color: %s; font-weight: bold;" % color)
+            else:
+                self.context_label.setText("Context: unknown%s" % speed)
+                self.context_label.setStyleSheet("")
+        except RuntimeError:
+            pass  # widget already destroyed
 
     # -- request lifecycle --------------------------------------------------
 
@@ -7409,6 +7946,10 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.max_auto_fetch = self.max_auto_fetch_spin.value()
         cfg.max_caller_refs = self.max_caller_refs_spin.value()
         cfg.max_recursive_callees = self.max_recursive_callees_spin.value()
+        cfg.auto_compact_enabled = self.auto_compact_check.isChecked()
+        cfg.auto_compact_threshold = self.auto_compact_threshold_spin.value() / 100.0
+        cfg.server_context_size = self.server_context_size_spin.value()
+        cfg.chars_per_token = self.chars_per_token_spin.value()
         cfg.explain_hotkey = self.hotkey_edit.text().strip()
         cfg.system_prompt = self.system_prompt_edit.toPlainText()
         cfg.max_trace_blocks = self.max_trace_blocks_spin.value()
@@ -10817,6 +11358,12 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self.config = PluginConfig.load()
         self._open_dialogs = []
         self._open_graphs = []
+        # The currently-open Explain / Export-C dialog of each kind. A new
+        # run of the same kind CLOSES the previous one first, so every run
+        # always starts from a clean conversation - the last function's
+        # context is never carried into a new one.
+        self._explain_dialog = None
+        self._codegen_dialog = None
         self._trace_cache = OrderedDict()  # start_ea -> _CachedCfgTrace, oldest-first
         self._applied_cfg_patches = OrderedDict()  # start_ea -> _AppliedCfgPatch, oldest-first
         self._action_handler = ExplainActionHandler()
@@ -10983,12 +11530,32 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         dlg.activateWindow()
         return dlg
 
+    def _close_singleton(self, slot):
+        """Close the previously-open dialog of this kind (if any). Closing
+        triggers its closeEvent, which cancels its in-flight runner, so the
+        old conversation is fully discarded before the fresh one starts."""
+        old = getattr(self, slot, None)
+        if old is None:
+            return
+        setattr(self, slot, None)
+        try:
+            if old.isVisible():
+                old.close()
+            else:
+                old.deleteLater()
+        except RuntimeError:
+            pass  # C++ object already deleted
+
     def open_explain_dialog(self, func):
+        self._close_singleton("_explain_dialog")
         dlg = ExplainResultDialog(self.config, func)
+        self._explain_dialog = dlg
         return self._track_dialog(dlg)
 
     def open_codegen_dialog(self, func):
+        self._close_singleton("_codegen_dialog")
         dlg = CodeGenDialog(self.config, func)
+        self._codegen_dialog = dlg
         return self._track_dialog(dlg)
 
     def open_batch_dialog(self, funcs):
