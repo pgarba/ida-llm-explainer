@@ -23,6 +23,7 @@ the Hex-Rays or the disassembly view.
 - **Recursive auto-accept** — explains a function's *undiscovered* (`sub_…`) callees first, then the function itself, so it's analyzed with its callees' real names/signatures already known; applies automatically, and can re-analyze an already-named callee the model flags as misnamed.
 - **Multi-server** — list several `llama-server` endpoints for ~Nx parallel batch throughput, with priority order + automatic failover.
 - **CFG recovery for obfuscated code** — walks basic blocks, resolves opaque predicates / dead code / flattening dispatchers with a fast deterministic pass (falls back to the LLM only when unsure), then optionally **patches** or **rebuilds** the real control flow. x86/x64 and AArch64.
+- **Agent server** — an optional localhost HTTP API an external agent (an LLM agent loop, a script, another tool) can use to read code/data/types, search, and mutate the database. Self-describing: `GET /tools` returns the full catalog, so an agent discovers the API without any hardcoded knowledge. Bearer-token auth; the bound URL + token are logged at startup.
 
 ## Install
 
@@ -50,6 +51,23 @@ Chosen on the review screen (all re-verify actual bytes before touching anything
 
 Results are cached for the session (**Load Cached Result**), and any in-place/rebuild patch is revertible with **Undo Patches**. Opt-in *Enumerate ARM64 computed jump tables* (experimental) recovers `*(base + i*stride + field)` dispatch handlers.
 
+## Agent server
+
+Off by default. Enable it in **Settings → Agent server**, restart IDA, and the bound URL + bearer token are printed to IDA's output window (e.g. `http://127.0.0.1:8181`, token `3f9c…`). An external agent then drives IDA over plain HTTP:
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | liveness + tool count |
+| `GET /tools` | token | the self-describing catalog: every tool's name, description, and parameter list |
+| `POST /call` | token | `{"name": "getFunctionSummary", "args": {"address": "main"}}` → one tool result |
+| `POST /batch` | token | `{"calls": [{"name": …, "args": …}, …]}` → sequential results |
+
+Every `address`/`name` argument accepts either an address (`0x401000`, `"0x401000"`, `4198400`) or a symbol name (`"main"`). Responses are `{"ok": true, "result": …}` on success, `{"ok": false, "error": …}` on failure, with `400` for bad arguments, `403` for gated tools, `404` for unknown tools, `408` when the IDA main thread doesn't answer in time.
+
+**What an agent can do** (61 tools): session meta (`getMetadata`, `getAnalysisStatus`, `getCurrentCursor`, `showInIda`); discovery (`getFunctions`, `getStrings`, `getImports`, `getExports`, `getSegments`, `searchBytes`, `searchText`, …); code reading (`getDisassembly`, `getFunctionDisassembly`, `getDecompilation`, `getFunctionPrototype`, `getFunctionArguments`, `getCallers`, `getBasicBlocks`, `getCallGraph`, `getCrossReferencesTo/From`, `getFunctionSummary`, …); data & types (`readBytes`, `getDataAt`, `getGlobalVariables`, `listStructs`, `getStruct`, `listEnums`, `getTypeAt`, …); mutation (`renameFunction`, `renameGlobal`, `createLabel`, `renameVariable`, `setVariableType`, `setFunctionPrototype`, `setComment`, `makeFunction`, `createData`, `createStruct`, bookmarks, …).
+
+**Safety.** Binds to `127.0.0.1` by default (change the host in settings to expose it). Everything the agent can do by default is the same undoable, human-reviewable IDA editing this plugin does everywhere else — the one exceptions are two **gated** tools that are **off by default**: `patchBytes` (write bytes to the IDB) and `runIdaScript` (run arbitrary Python with IDA imports, an escape hatch for anything the catalog doesn't cover). Enable them explicitly if you want an agent to do those. Every result is truncated to a configurable character cap (default 20,000) so a single huge field can't blow an agent's context.
+
 ## Configuration
 
 **Edit → Plugins → LLM Explainer.** Persisted as `llm_explainer.cfg.json` in your IDA user dir. Key settings:
@@ -76,6 +94,13 @@ Results are cached for the session (**Load Cached Result**), and any in-place/re
 | Resolve branches via constant propagation | on | Fast deterministic pass before the LLM (disable to always ask) |
 | Enumerate ARM64 computed jump tables | off | Experimental; see above |
 | CFG trace colors / Max blocks | green/red/amber, `200` | REAL / DEAD / UNRESOLVED |
+| Auto-compact long conversations | on | Summarize older turns when near the context window so long sessions keep working |
+| Compact at / Context size / Chars-token | `90%` / `0` (auto) / `3.5` | Trigger threshold; `0` auto-detects the server's context; chars/token is the fallback prompt estimate |
+| Agent server | off | Start the localhost HTTP API for external agents; see the Agent server section |
+| Agent host / Port | `127.0.0.1` / `8181` | Bind address; port `0` = auto-assign |
+| Agent token | *(blank)* | Bearer token; blank = random per session (logged at startup) |
+| Allow agent to patch bytes / run scripts | off / off | Gate the two destructive tools (`patchBytes`, `runIdaScript`) |
+| Agent max output chars | `20000` | Per-result truncation cap |
 
 Saved prompts auto-update to the current default when you haven't customized them, so plugin updates take effect without editing the config.
 

@@ -189,6 +189,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -198,6 +199,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque, namedtuple, OrderedDict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import idaapi
 import idautils
@@ -226,11 +228,21 @@ try:
 except ImportError:
     ida_ida = None
 
+try:
+    import ida_idaapi
+except ImportError:
+    ida_idaapi = None
+
+try:
+    import ida_bookmark
+except ImportError:
+    ida_bookmark = None
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.10.0"
+PLUGIN_VERSION = "1.11.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -781,6 +793,24 @@ DEFAULT_CONFIG = {
     # runner recalibrates it from real usage the server reports whenever
     # available.
     "chars_per_token": 3.5,
+    # --- agent server (external-agent HTTP API) ---------------------------
+    # A local HTTP API an external agent (an LLM agent loop, a script,
+    # another tool) can use to drive IDA: read code/data/types, search,
+    # and mutate the database (renames, comments, types, functions). Bearer-
+    # token auth, bound to localhost by default. patchBytes and runIdaScript
+    # are additionally gated by their own flags (both off by default). See
+    # the AGENT_TOOLS registry and AgentServer class near the bottom.
+    "agent_server_enabled": False,
+    "agent_server_host": "127.0.0.1",
+    # Fixed default port; 0 = auto-assign. The bound URL + token are always
+    # logged at startup so the agent can be pointed at it.
+    "agent_server_port": 8181,
+    # Empty = a random token is generated each IDA session.
+    "agent_server_token": "",
+    "agent_allow_patches": False,
+    "agent_allow_scripts": False,
+    # Per-result truncation cap (agents have context budgets too).
+    "agent_max_output_chars": 20000,
     "include_data_refs": True,
     "max_data_refs": 20,
     "max_string_len": 150,
@@ -4625,6 +4655,20 @@ class PluginConfig(object):
             self.chars_per_token = max(1.0, min(10.0, float(self.chars_per_token)))
         except (TypeError, ValueError):
             self.chars_per_token = DEFAULT_CONFIG["chars_per_token"]
+        # --- agent server ---
+        self.agent_server_enabled = bool(self.agent_server_enabled)
+        self.agent_server_host = (self.agent_server_host or "").strip() or DEFAULT_CONFIG["agent_server_host"]
+        try:
+            self.agent_server_port = max(0, min(65535, int(self.agent_server_port)))
+        except (TypeError, ValueError):
+            self.agent_server_port = DEFAULT_CONFIG["agent_server_port"]
+        self.agent_server_token = (self.agent_server_token or "").strip()
+        self.agent_allow_patches = bool(self.agent_allow_patches)
+        self.agent_allow_scripts = bool(self.agent_allow_scripts)
+        try:
+            self.agent_max_output_chars = max(1000, min(1000000, int(self.agent_max_output_chars)))
+        except (TypeError, ValueError):
+            self.agent_max_output_chars = DEFAULT_CONFIG["agent_max_output_chars"]
         self.include_data_refs = bool(self.include_data_refs)
         try:
             self.max_data_refs = max(0, int(self.max_data_refs))
@@ -7664,6 +7708,50 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Max callers shown per request:", self.max_caller_refs_spin)
 
+        self.auto_compact_check = QtWidgets.QCheckBox("Auto-compact long conversations")
+        self.auto_compact_check.setToolTip(
+            "When the conversation approaches the server's context window, "
+            "summarize the older turns into a dense digest and continue from "
+            "it, so long sessions (follow-ups, REQUEST_CODE rounds, "
+            "compile-fix loops) keep working instead of the model "
+            "stopping mid-answer."
+        )
+        form.addRow(self.auto_compact_check)
+
+        compact_row = QtWidgets.QHBoxLayout()
+        self.auto_compact_threshold_spin = QtWidgets.QSpinBox()
+        self.auto_compact_threshold_spin.setRange(5, 100)
+        self.auto_compact_threshold_spin.setSingleStep(5)
+        self.auto_compact_threshold_spin.setSuffix("%")
+        self.auto_compact_threshold_spin.setToolTip(
+            "Fraction of the server's context window at which compaction "
+            "triggers (90% leaves headroom for the model's reply)."
+        )
+        compact_row.addWidget(QtWidgets.QLabel("Compact at:"))
+        compact_row.addWidget(self.auto_compact_threshold_spin)
+        self.server_context_size_spin = QtWidgets.QSpinBox()
+        self.server_context_size_spin.setRange(0, 4194304)
+        self.server_context_size_spin.setSingleStep(1024)
+        self.server_context_size_spin.setToolTip(
+            "Server context window in tokens. 0 = auto-detect from the "
+            "server's /v1/models endpoint (llama.cpp reports it per "
+            "model). Set a positive value to override."
+        )
+        compact_row.addWidget(QtWidgets.QLabel("Context size:"))
+        compact_row.addWidget(self.server_context_size_spin)
+        self.chars_per_token_spin = QtWidgets.QDoubleSpinBox()
+        self.chars_per_token_spin.setRange(1.0, 10.0)
+        self.chars_per_token_spin.setSingleStep(0.5)
+        self.chars_per_token_spin.setToolTip(
+            "Fallback estimate of characters per token for prompt sizing; "
+            "the plugin recalibrates it from real usage the server reports "
+            "whenever available."
+        )
+        compact_row.addWidget(QtWidgets.QLabel("Chars/token:"))
+        compact_row.addWidget(self.chars_per_token_spin)
+        compact_row.addStretch(1)
+        form.addRow("Auto-compact:", compact_row)
+
         self.max_recursive_callees_spin = QtWidgets.QSpinBox()
         self.max_recursive_callees_spin.setRange(1, 100)
         self.max_recursive_callees_spin.setToolTip(
@@ -7841,6 +7929,74 @@ class SettingsDialog(QtWidgets.QDialog):
         self.codegen_system_prompt_edit.setMinimumHeight(140)
         form.addRow("C export system prompt:", self.codegen_system_prompt_edit)
 
+        # --- agent server (external-agent HTTP API) ---
+        self.agent_server_check = QtWidgets.QCheckBox("Agent server (let an external agent drive IDA over HTTP)")
+        self.agent_server_check.setToolTip(
+            "Starts a localhost HTTP API an external agent (an LLM agent "
+            "loop, a script, another tool) can use to read code/data/types, "
+            "search, and mutate the database (renames, comments, types, "
+            "functions). Bearer-token auth; the bound URL and token are "
+            "logged at startup. GET /tools lists the full self-describing "
+            "catalog."
+        )
+        form.addRow(self.agent_server_check)
+
+        agent_row1 = QtWidgets.QHBoxLayout()
+        self.agent_host_edit = QtWidgets.QLineEdit()
+        self.agent_host_edit.setPlaceholderText("127.0.0.1")
+        self.agent_host_edit.setMaximumWidth(140)
+        self.agent_port_spin = QtWidgets.QSpinBox()
+        self.agent_port_spin.setRange(0, 65535)
+        self.agent_port_spin.setSpecialValueText("auto")
+        self.agent_port_spin.setToolTip("Fixed port for the agent server. 0 = auto-assign.")
+        agent_row1.addWidget(QtWidgets.QLabel("Host:"))
+        agent_row1.addWidget(self.agent_host_edit)
+        agent_row1.addWidget(QtWidgets.QLabel("Port:"))
+        agent_row1.addWidget(self.agent_port_spin)
+        agent_row1.addStretch(1)
+        form.addRow("Agent server:", agent_row1)
+
+        agent_row2 = QtWidgets.QHBoxLayout()
+        self.agent_token_edit = QtWidgets.QLineEdit()
+        self.agent_token_edit.setPlaceholderText("(blank = random per session)")
+        self.agent_token_edit.setToolTip(
+            "Bearer token clients must send. Blank = a random one is "
+            "generated each IDA session (shown in the log at startup)."
+        )
+        self.agent_token_regen_button = QtWidgets.QPushButton("Regenerate")
+        self.agent_token_regen_button.clicked.connect(
+            lambda: self.agent_token_edit.setText(secrets.token_hex(16))
+        )
+        agent_row2.addWidget(self.agent_token_edit)
+        agent_row2.addWidget(self.agent_token_regen_button)
+        form.addRow("Agent token:", agent_row2)
+
+        self.agent_allow_patches_check = QtWidgets.QCheckBox("Allow agent to patch bytes (patchBytes)")
+        self.agent_allow_patches_check.setToolTip(
+            "Lets the agent write bytes into the IDB. Off by default - "
+            "everything else the agent can do is normal, undoable IDA "
+            "editing."
+        )
+        form.addRow(self.agent_allow_patches_check)
+
+        self.agent_allow_scripts_check = QtWidgets.QCheckBox("Allow agent to run IDA Python (runIdaScript)")
+        self.agent_allow_scripts_check.setToolTip(
+            "Lets the agent execute arbitrary Python with IDA imports - an "
+            "escape hatch for anything the tool catalog doesn't cover. Off "
+            "by default."
+        )
+        form.addRow(self.agent_allow_scripts_check)
+
+        self.agent_max_output_spin = QtWidgets.QSpinBox()
+        self.agent_max_output_spin.setRange(1000, 1000000)
+        self.agent_max_output_spin.setSingleStep(1000)
+        self.agent_max_output_spin.setToolTip(
+            "Per-result truncation cap in characters - agents have context "
+            "budgets too. Longer fields are cut with a '...[truncated]' "
+            "marker."
+        )
+        form.addRow("Agent max output chars:", self.agent_max_output_spin)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -7880,6 +8036,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.max_total_context_spin.setValue(config.max_total_context_chars)
         self.max_auto_fetch_spin.setValue(config.max_auto_fetch)
         self.max_caller_refs_spin.setValue(config.max_caller_refs)
+        self.auto_compact_check.setChecked(config.auto_compact_enabled)
+        self.auto_compact_threshold_spin.setValue(int(round(config.auto_compact_threshold * 100)))
+        self.server_context_size_spin.setValue(config.server_context_size)
+        self.chars_per_token_spin.setValue(config.chars_per_token)
         self.max_recursive_callees_spin.setValue(config.max_recursive_callees)
         self.hotkey_edit.setText(config.explain_hotkey)
         self.system_prompt_edit.setPlainText(config.system_prompt)
@@ -7901,6 +8061,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.codegen_godbolt_compiler_edit.setText(config.codegen_godbolt_compiler_id)
         self.codegen_godbolt_options_edit.setText(config.codegen_godbolt_options)
         self.codegen_system_prompt_edit.setPlainText(config.codegen_system_prompt)
+        self.agent_server_check.setChecked(config.agent_server_enabled)
+        self.agent_host_edit.setText(config.agent_server_host)
+        self.agent_port_spin.setValue(config.agent_server_port)
+        self.agent_token_edit.setText(config.agent_server_token)
+        self.agent_allow_patches_check.setChecked(config.agent_allow_patches)
+        self.agent_allow_scripts_check.setChecked(config.agent_allow_scripts)
+        self.agent_max_output_spin.setValue(config.agent_max_output_chars)
 
     def _on_restore_defaults(self):
         answer = QtWidgets.QMessageBox.question(
@@ -7976,6 +8143,13 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.codegen_godbolt_compiler_id = self.codegen_godbolt_compiler_edit.text().strip()
         cfg.codegen_godbolt_options = self.codegen_godbolt_options_edit.text().strip()
         cfg.codegen_system_prompt = self.codegen_system_prompt_edit.toPlainText()
+        cfg.agent_server_enabled = self.agent_server_check.isChecked()
+        cfg.agent_server_host = self.agent_host_edit.text().strip()
+        cfg.agent_server_port = self.agent_port_spin.value()
+        cfg.agent_server_token = self.agent_token_edit.text().strip()
+        cfg.agent_allow_patches = self.agent_allow_patches_check.isChecked()
+        cfg.agent_allow_scripts = self.agent_allow_scripts_check.isChecked()
+        cfg.agent_max_output_chars = self.agent_max_output_spin.value()
         cfg._validate()
         self.result_config = cfg
         self.accept()
@@ -11174,6 +11348,1305 @@ class CfgTraceDialog(QtWidgets.QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Agent server - HTTP API for external agents to drive IDA Pro
+#
+# A small localhost HTTP server (stdlib only) that an external agent - an
+# LLM agent loop, a script, another tool - can use to read code/data/types,
+# search, and mutate the database (renames, comments, types, functions).
+# Bearer-token auth. Every handler body runs on the IDA main thread via
+# execute_sync (IDA APIs are not thread-safe); the server thread only does
+# I/O and dispatch. GET /tools returns a self-describing catalog (the same
+# AGENT_TOOLS registry that dispatches), so an agent can discover the API
+# without any hardcoded knowledge of it.
+# ---------------------------------------------------------------------------
+
+AGENT_DEFAULT_PORT = 8181
+AGENT_MAX_LIMIT = 500          # clamp for every per-call "limit" arg
+AGENT_CALL_TIMEOUT_MS = 60000  # max time a single call may hold the main thread
+
+
+class _AgentError(Exception):
+    """Bad arguments / not-found - maps to HTTP 400."""
+
+
+class _AgentTimeout(Exception):
+    """The IDA main thread did not answer in time - maps to HTTP 408."""
+
+
+def _hex(value):
+    try:
+        return "0x%x" % int(value)
+    except Exception:
+        return ""
+
+
+def _run_on_ida(fn, timeout_ms=AGENT_CALL_TIMEOUT_MS):
+    """Run fn() on the IDA main thread and return its result. The server
+    thread must never call IDA APIs directly. Raises _AgentTimeout when the
+    main thread does not answer within timeout_ms, or re-raises whatever fn
+    raised (so _AgentError propagates to the 400 mapping in dispatch)."""
+    result = []
+    error = []
+
+    def _wrap():
+        try:
+            result.append(fn())
+        except Exception as exc:
+            error.append(exc)
+
+    ok = ida_kernwin.execute_sync(_wrap, ida_kernwin.MFF_FAST, timeout_ms)
+    if not ok:
+        raise _AgentTimeout(
+            "IDA main thread did not respond within %ds (a long operation or "
+            "a modal dialog may be blocking it)" % (timeout_ms // 1000)
+        )
+    if error:
+        raise error[0]
+    return result[0] if result else None
+
+
+def _agent_ea(args, key, required=True):
+    """Resolve an address/name argument to a linear address."""
+    raw = args.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if required:
+            raise _AgentError("missing required argument '%s'" % key)
+        return idaapi.BADADDR
+    if isinstance(raw, int):
+        ea = raw
+    else:
+        ea = _resolve_name_or_address(str(raw))
+    if ea == idaapi.BADADDR:
+        raise _AgentError("cannot resolve '%s' to an address" % raw)
+    return ea
+
+
+def _agent_opt_ea(args, key):
+    return _agent_ea(args, key, required=False)
+
+
+def _agent_limit(args, default=100):
+    try:
+        val = int(args.get("limit", default))
+    except (TypeError, ValueError):
+        val = default
+    return max(1, min(AGENT_MAX_LIMIT, val))
+
+
+def _agent_name(args, key="name"):
+    name = (args.get(key) or "").strip()
+    if not name:
+        raise _AgentError("missing required argument '%s'" % key)
+    return name
+
+
+def _agent_get_func(args):
+    """Resolve an address/name argument to the function it names or contains."""
+    ea = _agent_ea(args, "address")
+    f = ida_funcs.get_func(ea)
+    if f is None:
+        raise _AgentError("no function at %s" % _hex(ea))
+    return f
+
+
+def _agent_func_info(f):
+    ea = f.start_ea
+    return {
+        "address": _hex(ea),
+        "name": ida_funcs.get_func_name(ea) or "",
+        "start": _hex(f.start_ea),
+        "end": _hex(f.end_ea),
+        "size": f.end_ea - f.start_ea,
+        "prototype": idc.get_type(ea) or "",
+        "is_thunk": bool(f.flags & ida_funcs.FUNC_THUNK),
+        "is_library": bool(f.flags & ida_funcs.FUNC_LIB),
+        "comment": ida_funcs.get_func_cmt(f, False) or "",
+    }
+
+
+def _agent_func_disasm_text(f):
+    lines = []
+    ea = f.start_ea
+    while ea < f.end_ea:
+        lines.append(idc.generate_disassembly(ea))
+        ea = idc.next_head(ea, f.end_ea)
+    return "\n".join(lines)
+
+
+def _agent_callee_targets(f):
+    """Unique direct call targets of a function, in order of first use."""
+    seen = []
+    seen_set = set()
+    ea = f.start_ea
+    insn = ida_ua.insn_t()
+    while ea < f.end_ea:
+        if ida_ua.decode_insn(insn, ea):
+            if insn.is_call():
+                tgt = insn.get_op_addr(0)
+                if tgt != idaapi.BADADDR and tgt not in seen_set:
+                    seen_set.add(tgt)
+                    seen.append(tgt)
+        ea = idc.next_head(ea, f.end_ea)
+    return seen
+
+
+def _agent_lvar_rows(f, only_args):
+    if ida_hexrays is None:
+        raise _AgentError("Hex-Rays decompiler is not available (needed for argument/local info)")
+    cfunc = ida_hexrays.decompile(f.start_ea)
+    if cfunc is None:
+        raise _AgentError("decompilation failed for %s" % (ida_funcs.get_func_name(f.start_ea) or _hex(f.start_ea)))
+    out = []
+    for lv in cfunc.get_lvars():
+        is_arg = _lvar_is_arg(lv)
+        if is_arg != only_args:
+            continue
+        loc = "?"
+        try:
+            if lv.loc.is_stkoff():
+                loc = "stack:%+d" % lv.loc.stkoff()
+            elif lv.loc.is_reg():
+                try:
+                    import ida_regs
+                    loc = "reg:" + ida_regs.regnum_to_short_name(lv.loc.reg())
+                except Exception:
+                    loc = "reg:%d" % lv.loc.reg()
+            else:
+                loc = "reg:%d" % lv.loc.reg()
+        except Exception:
+            pass
+        out.append({"name": lv.name, "type": str(lv.tif), "location": loc})
+    return out
+
+
+def _agent_struct_dump(sid):
+    s = idaapi.get_struc(sid)
+    fields = []
+    i = 0
+    while True:
+        off = idaapi.get_struc_off_by_idx(sid, i)
+        if off == idaapi.BADADDR:
+            break
+        m = idaapi.get_struc_member(sid, off)
+        if m is None:
+            break
+        fields.append({"offset": off, "size": m.size, "name": m.name or "", "type": str(m.tif)})
+        i += 1
+    return {"name": idaapi.get_struc_name(s) or "", "size": idaapi.get_struc_size(s), "fields": fields}
+
+
+def _truncate_result(obj, max_chars):
+    """Recursively cap every string in a JSON-able result to max_chars so a
+    single huge field cannot blow an agent's context. Returns (obj, any_truncated)."""
+    if isinstance(obj, str):
+        if len(obj) > max_chars:
+            return obj[:max_chars] + "...[truncated]", True
+        return obj, False
+    if isinstance(obj, dict):
+        out = {}
+        any_trunc = False
+        for k, v in obj.items():
+            nv, t = _truncate_result(v, max_chars)
+            out[k] = nv
+            any_trunc = any_trunc or t
+        if any_trunc:
+            out["_truncated"] = True
+        return out, any_trunc
+    if isinstance(obj, list):
+        out = []
+        any_trunc = False
+        for v in obj:
+            nv, t = _truncate_result(v, max_chars)
+            out.append(nv)
+            any_trunc = any_trunc or t
+        return out, any_trunc
+    return obj, False
+
+
+# --- tool implementations -------------------------------------------------
+# Each takes the request's args dict and returns a JSON-serializable dict.
+# They run ON the IDA main thread (wrapped by the AGENT_TOOLS registry via
+# _run_on_ida), so they may call IDA APIs freely.
+
+
+def _agent_impl_metadata(args):
+    entries = []
+    for ea in idautils.Entries():
+        entries.append({"address": _hex(ea), "name": idc.get_name(ea) or ""})
+    return {
+        "idb_name": ida_nalt.get_root_filename() or "",
+        "idb_path": idaapi.get_path(idaapi.PATH_IDB) or "",
+        "input_file": ida_nalt.get_root_filename(idaapi.PATH_INPUT) or "",
+        "processor": get_procname(),
+        "bits": _pointer_size_bits(),
+        "image_base": _hex(_image_base()),
+        "entry_points": entries,
+        "ida_version": idaapi.get_version(),
+    }
+
+
+def _agent_impl_analysis_status(args):
+    return {"analysis_done": not ida_auto.autoanalysis_required(ida_auto.WF_DEFER)}
+
+
+def _agent_impl_current_cursor(args):
+    ea = idc.get_screen_ea()
+    f = ida_funcs.get_func(ea)
+    return {
+        "address": _hex(ea),
+        "function": (ida_funcs.get_func_name(f.start_ea) if f else None),
+        "function_address": (_hex(f.start_ea) if f else None),
+    }
+
+
+def _agent_impl_show_in_ida(args):
+    ea = _agent_ea(args, "address")
+    ida_kernwin.jumpto(ea, 0, False)
+    return {"address": _hex(ea)}
+
+
+def _agent_impl_functions(args):
+    filt = (args.get("filter") or "").lower()
+    min_size = max(0, int(args.get("min_size") or 0))
+    offset = max(0, int(args.get("offset") or 0))
+    limit = _agent_limit(args)
+    out = []
+    for ea in idautils.Functions():
+        f = ida_funcs.get_func(ea)
+        if f is None:
+            continue
+        name = ida_funcs.get_func_name(ea) or ""
+        size = f.end_ea - f.start_ea
+        if filt and filt not in name.lower():
+            continue
+        if size < min_size:
+            continue
+        out.append({
+            "address": _hex(f.start_ea),
+            "name": name,
+            "size": size,
+            "is_thunk": bool(f.flags & ida_funcs.FUNC_THUNK),
+            "is_library": bool(f.flags & ida_funcs.FUNC_LIB),
+        })
+    total = len(out)
+    return {"total": total, "offset": offset, "limit": limit, "functions": out[offset:offset + limit]}
+
+
+def _agent_impl_function_at(args):
+    ea = _agent_ea(args, "address")
+    f = ida_funcs.get_func(ea)
+    if f is None:
+        raise _AgentError("no function contains %s" % _hex(ea))
+    return _agent_func_info(f)
+
+
+def _agent_impl_function_info(args):
+    return _agent_func_info(_agent_get_func(args))
+
+
+def _agent_impl_strings(args):
+    filt = (args.get("filter") or "").lower()
+    min_len = max(0, int(args.get("min_length") or 0))
+    offset = max(0, int(args.get("offset") or 0))
+    limit = _agent_limit(args)
+    out = []
+    for item in idautils.Strings():
+        try:
+            value = str(item)
+        except Exception:
+            value = ""
+        if len(value) < min_len:
+            continue
+        if filt and filt not in value.lower():
+            continue
+        out.append({"address": _hex(item.ea), "value": value, "type": item.strtype})
+    total = len(out)
+    return {"total": total, "offset": offset, "limit": limit, "strings": out[offset:offset + limit]}
+
+
+def _agent_impl_imports(args):
+    modf = (args.get("module") or "").lower()
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    out = []
+    i = 0
+    while True:
+        name = ida_nalt.get_import_name(i)
+        if name is None:
+            break
+        module = ""
+        try:
+            module = ida_nalt.get_import_module_name(i) or ""
+        except Exception:
+            try:
+                module = ida_nalt.get_import_module(i) or ""
+            except Exception:
+                module = ""
+        if modf and modf not in module.lower():
+            i += 1
+            continue
+        ea = ida_nalt.get_import_addr(i)
+        out.append({"address": _hex(ea) if ea != idaapi.BADADDR else "", "name": name, "module": module})
+        i += 1
+        if len(out) >= limit:
+            break
+    return {"total": len(out), "imports": out}
+
+
+def _agent_impl_exports(args):
+    filt = (args.get("filter") or "").lower()
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    out = []
+    i = 0
+    while True:
+        name = ida_nalt.enum_export_names(i)
+        if name is None:
+            break
+        if filt and filt not in name.lower():
+            i += 1
+            continue
+        ea = ida_nalt.get_export_addr_by_name(name)
+        out.append({"address": _hex(ea) if ea != idaapi.BADADDR else "", "name": name})
+        i += 1
+        if len(out) >= limit:
+            break
+    return {"total": len(out), "exports": out}
+
+
+def _agent_impl_segments(args):
+    out = []
+    for seg_ea in idautils.Segments():
+        s = ida_segment.getseg(seg_ea)
+        if s is None:
+            continue
+        perm = ("x" if s.perm & ida_segment.SEGPERM_EXEC else "-") + \
+               ("w" if s.perm & ida_segment.SEGPERM_WRITE else "-") + \
+               ("r" if s.perm & ida_segment.SEGPERM_READ else "-")
+        out.append({
+            "name": ida_segment.get_segm_name(s),
+            "start": _hex(s.start_ea),
+            "end": _hex(s.end_ea),
+            "size": s.end_ea - s.start_ea,
+            "permissions": perm,
+            "class": s.get_class(),
+        })
+    return {"segments": out}
+
+
+def _agent_impl_entry_points(args):
+    out = []
+    for ea in idautils.Entries():
+        out.append({"address": _hex(ea), "name": idc.get_name(ea) or ""})
+    return {"entry_points": out}
+
+
+def _agent_impl_search_bytes(args):
+    pattern = (args.get("pattern") or "").strip()
+    if not pattern:
+        raise _AgentError("missing required argument 'pattern' (e.g. \"48 8B ?? FF\")")
+    start = _agent_opt_ea(args, "start")
+    end = _agent_opt_ea(args, "end")
+    if start == idaapi.BADADDR:
+        start = _image_base()
+    if end == idaapi.BADADDR:
+        end = idaapi.get_inf_structure().upper_bound
+    limit = _agent_limit(args)
+    out = []
+    ea = start
+    while ea != idaapi.BADADDR and ea < end and len(out) < limit:
+        ea = idc.find_binary(ea, end, pattern, 16)
+        if ea == idaapi.BADADDR:
+            break
+        out.append(_hex(ea))
+        ea = ea + 1
+    return {"pattern": pattern, "start": _hex(start), "end": _hex(end),
+            "matches": out, "truncated": len(out) >= limit}
+
+
+def _agent_impl_search_text(args):
+    text = (args.get("text") or "").strip()
+    if not text:
+        raise _AgentError("missing required argument 'text'")
+    needle = text.lower()
+    start = _agent_opt_ea(args, "start")
+    end = _agent_opt_ea(args, "end")
+    limit = _agent_limit(args)
+    ea = start if start != idaapi.BADADDR else _image_base()
+    stop = end if end != idaapi.BADADDR else idaapi.get_inf_structure().upper_bound
+    out = []
+    ea = idc.next_head(ea, stop)
+    while ea != idaapi.BADADDR and ea < stop and len(out) < limit:
+        try:
+            line = idc.generate_disassembly(ea)
+        except Exception:
+            line = ""
+        if needle in line.lower():
+            out.append(_hex(ea))
+        ea = idc.next_head(ea, stop)
+    return {"text": text, "matches": out, "truncated": len(out) >= limit}
+
+
+def _agent_impl_disassembly(args):
+    ea = _agent_ea(args, "address")
+    count = max(1, min(1000, int(args.get("count") or 100)))
+    stop = idaapi.get_inf_structure().upper_bound
+    start = ea
+    lines = []
+    for _ in range(count):
+        if ea == idaapi.BADADDR or ea >= stop:
+            break
+        lines.append(idc.generate_disassembly(ea))
+        ea = idc.next_head(ea, stop)
+    return {"address": _hex(start), "instruction_count": len(lines), "text": "\n".join(lines)}
+
+
+def _agent_impl_function_disassembly(args):
+    f = _agent_get_func(args)
+    info = _agent_func_info(f)
+    info["text"] = _agent_func_disasm_text(f)
+    return info
+
+
+def _agent_impl_decompilation(args):
+    if ida_hexrays is None:
+        raise _AgentError("Hex-Rays decompiler is not available in this IDA")
+    f = _agent_get_func(args)
+    cfunc = ida_hexrays.decompile(f.start_ea)
+    if cfunc is None:
+        raise _AgentError("decompilation failed for %s" % (ida_funcs.get_func_name(f.start_ea) or _hex(f.start_ea)))
+    info = _agent_func_info(f)
+    info["pseudocode"] = str(cfunc)
+    return info
+
+
+def _agent_impl_function_prototype(args):
+    f = _agent_get_func(args)
+    return {"address": _hex(f.start_ea), "name": ida_funcs.get_func_name(f.start_ea) or "",
+            "prototype": idc.get_type(f.start_ea) or ""}
+
+
+def _agent_impl_function_arguments(args):
+    f = _agent_get_func(args)
+    return {"address": _hex(f.start_ea), "arguments": _agent_lvar_rows(f, only_args=True)}
+
+
+def _agent_impl_function_locals(args):
+    f = _agent_get_func(args)
+    return {"address": _hex(f.start_ea), "locals": _agent_lvar_rows(f, only_args=False)}
+
+
+def _agent_impl_function_calls(args):
+    f = _agent_get_func(args)
+    out = []
+    for tgt in _agent_callee_targets(f):
+        cf = ida_funcs.get_func(tgt)
+        out.append({"address": _hex(tgt),
+                    "name": (ida_funcs.get_func_name(tgt) if cf else idc.get_name(tgt)) or ""})
+    return {"address": _hex(f.start_ea), "callees": out}
+
+
+def _agent_impl_callers(args):
+    ea = _agent_ea(args, "address")
+    f = ida_funcs.get_func(ea)
+    target = f.start_ea if f else ea
+    limit = _agent_limit(args)
+    by_func = {}
+    for ref in idautils.CodeRefsTo(target, 0):
+        cf = ida_funcs.get_func(ref.frm)
+        key = cf.start_ea if cf else ref.frm
+        by_func.setdefault(key, []).append(ref.frm)
+    out = []
+    for key in sorted(by_func):
+        cf = ida_funcs.get_func(key)
+        out.append({"address": _hex(key),
+                    "name": (ida_funcs.get_func_name(key) if cf else idc.get_name(key)) or "",
+                    "call_sites": [_hex(s) for s in by_func[key]]})
+    return {"target": _hex(target), "callers": out[:limit]}
+
+
+def _agent_impl_basic_blocks(args):
+    f = _agent_get_func(args)
+    out = []
+    for bb in idautils.FlowChart(f):
+        out.append({"start": _hex(bb.start_ea), "end": _hex(bb.end_ea),
+                    "successors": [_hex(s) for s in bb.succs()],
+                    "predecessors": [_hex(p) for p in bb.preds()]})
+    return {"address": _hex(f.start_ea), "blocks": out}
+
+
+def _agent_impl_call_graph(args):
+    f = _agent_get_func(args)
+    depth = max(1, min(5, int(args.get("depth") or 2)))
+
+    def walk(ea, d, seen):
+        node = {"address": _hex(ea), "name": ida_funcs.get_func_name(ea) or ""}
+        if d <= 0 or ea in seen:
+            node["callees"] = []
+            return node
+        seen.add(ea)
+        cf = ida_funcs.get_func(ea)
+        node["callees"] = [walk(t, d - 1, seen) for t in (_agent_callee_targets(cf) if cf else [])]
+        return node
+
+    return walk(f.start_ea, depth, set())
+
+
+def _agent_impl_xrefs_to(args):
+    ea = _agent_ea(args, "address")
+    limit = _agent_limit(args)
+    out = []
+    for x in idautils.XrefsTo(ea, 0):
+        out.append({"from": _hex(x.frm), "is_code": x.iscode, "type": x.type})
+        if len(out) >= limit:
+            break
+    return {"address": _hex(ea), "xrefs": out}
+
+
+def _agent_impl_xrefs_from(args):
+    ea = _agent_ea(args, "address")
+    limit = _agent_limit(args)
+    out = []
+    for x in idautils.XrefsFrom(ea, 0):
+        out.append({"to": _hex(x.to), "is_code": x.iscode, "type": x.type})
+        if len(out) >= limit:
+            break
+    return {"address": _hex(ea), "xrefs": out}
+
+
+def _agent_impl_function_summary(args):
+    f = _agent_get_func(args)
+    info = _agent_func_info(f)
+    info["disassembly"] = _agent_func_disasm_text(f)
+    if ida_hexrays is not None:
+        cfunc = ida_hexrays.decompile(f.start_ea)
+        info["pseudocode"] = str(cfunc) if cfunc else None
+    else:
+        info["pseudocode"] = None
+    callees = []
+    for tgt in _agent_callee_targets(f):
+        cf = ida_funcs.get_func(tgt)
+        callees.append({"address": _hex(tgt),
+                        "name": (ida_funcs.get_func_name(tgt) if cf else idc.get_name(tgt)) or ""})
+    info["callees"] = callees
+    by_func = {}
+    for ref in idautils.CodeRefsTo(f.start_ea, 0):
+        cf = ida_funcs.get_func(ref.frm)
+        key = cf.start_ea if cf else ref.frm
+        by_func.setdefault(key, []).append(ref.frm)
+    info["callers"] = [{"address": _hex(k), "call_sites": [_hex(s) for s in v]}
+                       for k, v in sorted(by_func.items())]
+    return info
+
+
+def _agent_impl_read_bytes(args):
+    ea = _agent_ea(args, "address")
+    size = max(1, min(65536, int(args.get("size") or 16)))
+    data = ida_bytes.get_bytes(ea, size)
+    if data is None:
+        raise _AgentError("cannot read %d bytes at %s" % (size, _hex(ea)))
+    ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return {"address": _hex(ea), "size": len(data), "hex": data.hex(), "ascii": ascii_}
+
+
+def _agent_impl_read_memory(args):
+    ea = _agent_ea(args, "address")
+    size = max(1, min(65536, int(args.get("size") or 16)))
+    data = idaapi.get_memstr(ea, size)
+    if data is None:
+        raise _AgentError("cannot read memory at %s" % _hex(ea))
+    ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return {"address": _hex(ea), "size": len(data), "hex": data.hex(), "ascii": ascii_}
+
+
+def _agent_impl_data_at(args):
+    ea = _agent_ea(args, "address")
+    size = idc.get_item_size(ea)
+    return {
+        "address": _hex(ea),
+        "is_code": bool(idc.is_code(ea)),
+        "size": size,
+        "name": idc.get_name(ea) or "",
+        "type": idc.get_type(ea) or "",
+        "rendered": idc.generate_disassembly(ea),
+    }
+
+
+def _agent_impl_globals(args):
+    filt = (args.get("filter") or "").lower()
+    offset = max(0, int(args.get("offset") or 0))
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    out = []
+    for ea in idautils.Dirs():
+        name = idc.get_name(ea)
+        if not name:
+            continue
+        if filt and filt not in name.lower():
+            continue
+        out.append({"address": _hex(ea), "name": name,
+                    "size": idc.get_item_size(ea), "type": idc.get_type(ea) or ""})
+    total = len(out)
+    return {"total": total, "offset": offset, "limit": limit, "globals": out[offset:offset + limit]}
+
+
+def _agent_impl_variable_at(args):
+    ea = _agent_ea(args, "address")
+    return {"address": _hex(ea), "name": idc.get_name(ea) or "",
+            "size": idc.get_item_size(ea), "type": idc.get_type(ea) or ""}
+
+
+def _agent_impl_list_structs(args):
+    filt = (args.get("filter") or "").lower()
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    out = []
+    for i in range(idaapi.get_struc_qty()):
+        s = idaapi.get_struc_by_idx(i)
+        if s is None:
+            continue
+        name = idaapi.get_struc_name(s)
+        if not name:
+            continue
+        if filt and filt not in name.lower():
+            continue
+        out.append({"name": name, "size": idaapi.get_struc_size(s),
+                    "id": idaapi.get_struc_id(name)})
+    return {"total": len(out), "structs": out[:limit]}
+
+
+def _agent_impl_get_struct(args):
+    name = _agent_name(args, "name")
+    sid = idaapi.get_struc_id(name)
+    if sid == idaapi.BADADDR:
+        raise _AgentError("struct not found: %s" % name)
+    return _agent_struct_dump(sid)
+
+
+def _agent_impl_struct_at(args):
+    ea = _agent_ea(args, "address")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_type(ea, None, 0):
+        raise _AgentError("no type at %s" % _hex(ea))
+    if not tif.is_struct():
+        return {"address": _hex(ea), "type": str(tif), "struct": None}
+    tname = tif.get_type_name()
+    sid = idaapi.get_struc_id(tname) if tname else idaapi.BADADDR
+    if sid == idaapi.BADADDR:
+        return {"address": _hex(ea), "type": str(tif), "struct": None}
+    return {"address": _hex(ea), "type": str(tif), "struct": _agent_struct_dump(sid)}
+
+
+def _agent_impl_list_enums(args):
+    filt = (args.get("filter") or "").lower()
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    out = []
+    for i in range(idaapi.get_enum_qty()):
+        e = idaapi.get_enum_by_idx(i)
+        if e is None:
+            continue
+        name = idaapi.get_enum_name(e)
+        if not name:
+            continue
+        if filt and filt not in name.lower():
+            continue
+        out.append({"name": name, "id": idaapi.get_enum_id(name), "size": idaapi.get_enum_size(e)})
+    return {"total": len(out), "enums": out[:limit]}
+
+
+def _agent_impl_get_enum(args):
+    name = _agent_name(args, "name")
+    eid = idaapi.get_enum_id(name)
+    if eid == idaapi.BADADDR:
+        raise _AgentError("enum not found: %s" % name)
+    e = idaapi.get_enum(eid)
+    members = []
+    for i in range(idaapi.get_enum_size(e)):
+        members.append({"value": idaapi.get_enum_val_by_idx(e, i),
+                        "name": idaapi.get_enum_name_by_idx(e, i) or ""})
+    return {"name": name, "members": members}
+
+
+def _agent_impl_type_at(args):
+    ea = _agent_ea(args, "address")
+    tif = ida_typeinf.tinfo_t()
+    t = ""
+    if tif.get_type(ea, None, 0):
+        t = str(tif)
+    if not t:
+        t = idc.get_type(ea) or ""
+    return {"address": _hex(ea), "type": t}
+
+
+def _agent_impl_list_local_types(args):
+    filt = (args.get("filter") or "").lower()
+    limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
+    names = [n for n in idautils.LocalTypes() if not filt or filt in n.lower()]
+    return {"total": len(names), "types": names[:limit]}
+
+
+# --- mutation tools --------------------------------------------------------
+
+
+def _agent_impl_rename_function(args):
+    f = _agent_get_func(args)
+    name = _agent_name(args, "name")
+    if not ida_name.set_name(f.start_ea, name, ida_name.SN_NOCHECK | ida_name.SN_NOWARN):
+        raise _AgentError("rename failed for %s" % name)
+    return {"address": _hex(f.start_ea), "name": ida_funcs.get_func_name(f.start_ea) or name}
+
+
+def _agent_impl_set_name(args):
+    """Shared by renameGlobal / renameData / createLabel."""
+    ea = _agent_ea(args, "address")
+    name = _agent_name(args, "name")
+    flags = ida_name.SN_NOCHECK | ida_name.SN_NOWARN
+    if args.get("force"):
+        flags |= ida_name.SN_FORCE
+    if not ida_name.set_name(ea, name, flags):
+        raise _AgentError("set_name failed for %s at %s" % (name, _hex(ea)))
+    return {"address": _hex(ea), "name": idc.get_name(ea) or name}
+
+
+def _agent_impl_rename_variable(args):
+    f = _agent_get_func(args)
+    var = (args.get("variable") or "").strip()
+    name = _agent_name(args, "name")
+    if not var:
+        raise _AgentError("missing required argument 'variable'")
+    if ida_hexrays is None:
+        raise _AgentError("Hex-Rays decompiler is not available (needed for variable renames)")
+    if not _set_lvar_name(f.start_ea, var, name):
+        raise _AgentError("variable not found: %s" % var)
+    return {"function": _hex(f.start_ea), "variable": var, "new_name": name}
+
+
+def _agent_impl_set_variable_type(args):
+    f = _agent_get_func(args)
+    var = (args.get("variable") or "").strip()
+    tstr = (args.get("type") or "").strip()
+    if not var or not tstr:
+        raise _AgentError("missing required argument 'variable' or 'type'")
+    if ida_hexrays is None:
+        raise _AgentError("Hex-Rays decompiler is not available (needed for variable types)")
+    if not _set_lvar_type(f.start_ea, var, tstr):
+        raise _AgentError("variable not found or bad type: %s : %s" % (var, tstr))
+    return {"function": _hex(f.start_ea), "variable": var, "type": tstr}
+
+
+def _agent_impl_set_function_prototype(args):
+    f = _agent_get_func(args)
+    sig = (args.get("prototype") or "").strip()
+    if not sig:
+        raise _AgentError("missing required argument 'prototype'")
+    if not _apply_function_signature(f.start_ea, sig):
+        raise _AgentError("could not apply prototype: %s" % sig)
+    return {"address": _hex(f.start_ea), "prototype": idc.get_type(f.start_ea) or sig}
+
+
+def _agent_impl_set_function_type(args):
+    f = _agent_get_func(args)
+    tstr = (args.get("type") or "").strip()
+    if not tstr:
+        raise _AgentError("missing required argument 'type'")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.parse_decl(None, 0, tstr, ida_typeinf.PT_SIL):
+        raise _AgentError("cannot parse type: %s" % tstr)
+    if not ida_typeinf.set_tinfo(f.start_ea, tif, 1):
+        raise _AgentError("set_tinfo failed for %s" % tstr)
+    return {"address": _hex(f.start_ea), "type": idc.get_type(f.start_ea) or tstr}
+
+
+def _agent_impl_set_comment(args):
+    ea = _agent_ea(args, "address")
+    cmt = (args.get("comment") or "")
+    repeatable = bool(args.get("repeatable") or False)
+    if not idc.set_cmt(ea, cmt, repeatable):
+        raise _AgentError("set_cmt failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "comment": cmt, "repeatable": repeatable}
+
+
+def _agent_impl_set_function_comment(args):
+    f = _agent_get_func(args)
+    cmt = (args.get("comment") or "")
+    if not ida_funcs.set_func_cmt(f, cmt, False):
+        raise _AgentError("set_func_cmt failed")
+    return {"address": _hex(f.start_ea), "comment": cmt}
+
+
+def _agent_impl_make_function(args):
+    ea = _agent_ea(args, "address")
+    end = _agent_opt_ea(args, "end")
+    if ida_funcs.add_func(ea, end if end != idaapi.BADADDR else 0) is None:
+        raise _AgentError("add_func failed at %s" % _hex(ea))
+    f = ida_funcs.get_func(ea)
+    return {"address": _hex(ea), "end": _hex(f.end_ea) if f else ""}
+
+
+def _agent_impl_delete_function(args):
+    f = _agent_get_func(args)
+    if not ida_funcs.del_func(f.start_ea):
+        raise _AgentError("del_func failed")
+    return {"address": _hex(f.start_ea), "deleted": True}
+
+
+def _agent_impl_define_code(args):
+    ea = _agent_ea(args, "address")
+    size = int(args.get("size") or 0)
+    if size > 0:
+        if not ida_bytes.define_code(ea, size):
+            raise _AgentError("define_code failed at %s" % _hex(ea))
+    else:
+        if not ida_bytes.create_insn(ea):
+            raise _AgentError("create_insn failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "size": size}
+
+
+def _agent_impl_undefine(args):
+    ea = _agent_ea(args, "address")
+    size = max(1, int(args.get("size") or 1))
+    ida_bytes.undefine_items(ea, ea + size, ida_bytes.UDF_KEEP_NAMES)
+    return {"address": _hex(ea), "size": size}
+
+
+def _agent_impl_create_data(args):
+    ea = _agent_ea(args, "address")
+    tstr = (args.get("type") or "").strip()
+    if not tstr:
+        raise _AgentError("missing required argument 'type'")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.parse_decl(None, 0, tstr, ida_typeinf.PT_SIL):
+        raise _AgentError("cannot parse type: %s" % tstr)
+    size = tif.get_size()
+    if not size or size == idaapi.BADSIZE:
+        raise _AgentError("type has no fixed size: %s" % tstr)
+    if not ida_bytes.create_data(ea, ida_bytes.DATA_COMPLEX, 0, size, True):
+        raise _AgentError("create_data failed at %s" % _hex(ea))
+    ida_typeinf.set_tinfo(ea, tif, 1)
+    return {"address": _hex(ea), "type": tstr, "size": size}
+
+
+def _agent_impl_create_struct(args):
+    name = _agent_name(args, "name")
+    fields = args.get("fields") or []
+    if not isinstance(fields, list) or not fields:
+        raise _AgentError("missing required argument 'fields' (list of {name, type})")
+    decl_fields = []
+    for fdef in fields:
+        if not isinstance(fdef, dict):
+            raise _AgentError("each field must be an object {name, type}")
+        fname = (fdef.get("name") or "").strip()
+        ftype = (fdef.get("type") or "int").strip() or "int"
+        if not fname:
+            raise _AgentError("each field needs a 'name'")
+        decl_fields.append("%s %s" % (ftype, fname))
+    decl = "struct %s { %s }" % (name, "; ".join(decl_fields))
+    if not _create_struct_type(decl):
+        raise _AgentError("failed to create struct %s" % name)
+    return {"name": name, "decl": decl + ";"}
+
+
+def _agent_impl_delete_struct(args):
+    name = _agent_name(args, "name")
+    sid = idaapi.get_struc_id(name)
+    if sid == idaapi.BADADDR:
+        raise _AgentError("struct not found: %s" % name)
+    if not idaapi.del_struc(sid):
+        raise _AgentError("del_struc failed for %s" % name)
+    return {"name": name, "deleted": True}
+
+
+def _agent_impl_set_bookmark(args):
+    if ida_bookmark is None:
+        raise _AgentError("bookmarks are not supported by this IDA version")
+    ea = _agent_ea(args, "address")
+    text = (args.get("text") or "").strip()
+    bm = ida_bookmark.create_bookmark(ea, text, 0xFFFFFF)
+    if bm is None:
+        raise _AgentError("create_bookmark failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "text": text}
+
+
+def _agent_impl_get_bookmarks(args):
+    if ida_bookmark is None:
+        raise _AgentError("bookmarks are not supported by this IDA version")
+    out = []
+    for bm in ida_bookmark.get_bookmarks():
+        out.append({"address": _hex(bm.ea), "text": bm.text})
+    return {"bookmarks": out}
+
+
+def _agent_impl_delete_bookmark(args):
+    if ida_bookmark is None:
+        raise _AgentError("bookmarks are not supported by this IDA version")
+    ea = _agent_ea(args, "address")
+    if not ida_bookmark.delete_bookmark(ea):
+        raise _AgentError("no bookmark at %s" % _hex(ea))
+    return {"address": _hex(ea), "deleted": True}
+
+
+def _agent_impl_patch_bytes(args):
+    ea = _agent_ea(args, "address")
+    hx = (args.get("hex") or "").replace(" ", "").replace(",", "")
+    if not hx or len(hx) % 2:
+        raise _AgentError("'hex' must be a non-empty, even-length hex string")
+    try:
+        data = bytes.fromhex(hx)
+    except ValueError:
+        raise _AgentError("'hex' is not valid hex")
+    if not ida_bytes.patch_bytes(ea, data):
+        raise _AgentError("patch_bytes failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "patched": len(data)}
+
+
+def _agent_impl_run_ida_script(args):
+    code = (args.get("code") or "").strip()
+    if not code:
+        raise _AgentError("missing required argument 'code'")
+    import io
+    import contextlib
+    buf = io.StringIO()
+    namespace = {
+        "idc": idc, "idaapi": idaapi, "idautils": idautils, "ida_funcs": ida_funcs,
+        "ida_bytes": ida_bytes, "ida_name": ida_name, "ida_typeinf": ida_typeinf,
+        "ida_segment": ida_segment, "ida_nalt": ida_nalt, "ida_kernwin": ida_kernwin,
+        "ida_auto": ida_auto, "ida_hexrays": ida_hexrays,
+    }
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(compile(code, "<agent script>", "exec"), namespace)
+    except Exception as exc:
+        raise _AgentError("script failed: %s: %s" % (type(exc).__name__, exc))
+    result = namespace.get("result")
+    try:
+        json.dumps(result)
+        serializable = result
+    except (TypeError, ValueError):
+        serializable = repr(result)
+    return {"result": serializable, "stdout": buf.getvalue()}
+
+
+# --- tool registry ---------------------------------------------------------
+# Single source of truth: dispatch AND the /tools self-description both come
+# from here. "gated" ties a tool to an extra config flag (patches/scripts).
+AGENT_TOOLS = {
+    # session / meta
+    "getMetadata": {"description": "IDB name/path, processor, bitness, image base, entry points, IDA version.",
+                   "params": {}, "fn": _agent_impl_metadata},
+    "getAnalysisStatus": {"description": "Whether IDA autoanalysis has finished.",
+                         "params": {}, "fn": _agent_impl_analysis_status},
+    "getCurrentCursor": {"description": "The address/function the human is currently viewing in IDA.",
+                        "params": {}, "fn": _agent_impl_current_cursor},
+    "showInIda": {"description": "Jump the IDA UI to an address (human-in-the-loop).",
+                 "params": {"address": "address or name"}, "fn": _agent_impl_show_in_ida},
+    # discovery
+    "getFunctions": {"description": "List functions (paginated, optional name filter / min size).",
+                    "params": {"filter": "name substring (optional)", "min_size": "int (optional)",
+                               "offset": "int (optional)", "limit": "int <= 500 (default 100)"},
+                    "fn": _agent_impl_functions},
+    "getFunctionAt": {"description": "The function containing an address.",
+                     "params": {"address": "address or name"}, "fn": _agent_impl_function_at},
+    "getFunctionInfo": {"description": "Name/size/prototype/flags/comment for a function.",
+                       "params": {"address": "function address or name"}, "fn": _agent_impl_function_info},
+    "getStrings": {"description": "List strings (paginated, optional filter / min length).",
+                  "params": {"filter": "substring (optional)", "min_length": "int (optional)",
+                             "offset": "int (optional)", "limit": "int <= 500 (default 100)"},
+                  "fn": _agent_impl_strings},
+    "getImports": {"description": "Import table (optional module filter).",
+                  "params": {"module": "module name substring (optional)", "limit": "int <= 500"},
+                  "fn": _agent_impl_imports},
+    "getExports": {"description": "Export table (optional name filter).",
+                  "params": {"filter": "name substring (optional)", "limit": "int <= 500"},
+                  "fn": _agent_impl_exports},
+    "getSegments": {"description": "Segments with name/range/permissions/class.",
+                   "params": {}, "fn": _agent_impl_segments},
+    "getEntryPoints": {"description": "All entry points.", "params": {}, "fn": _agent_impl_entry_points},
+    "searchBytes": {"description": "Find a byte pattern (IDA syntax, '??' wildcards, e.g. \"48 8B ?? FF\").",
+                   "params": {"pattern": "hex byte pattern with '??' wildcards",
+                              "start": "address (optional, default image base)",
+                              "end": "address (optional, default end of IDB)", "limit": "int <= 500"},
+                   "fn": _agent_impl_search_bytes},
+    "searchText": {"description": "Search disassembly text line-by-line in an address range.",
+                  "params": {"text": "text to find", "start": "address (optional)",
+                             "end": "address (optional)", "limit": "int <= 500"},
+                  "fn": _agent_impl_search_text},
+    # code reading
+    "getDisassembly": {"description": "Disassembly of N instructions starting at an address.",
+                      "params": {"address": "address or name", "count": "int instructions (default 100, max 1000)"},
+                      "fn": _agent_impl_disassembly},
+    "getFunctionDisassembly": {"description": "Full disassembly of a function.",
+                              "params": {"address": "function address or name"},
+                              "fn": _agent_impl_function_disassembly},
+    "getDecompilation": {"description": "Hex-Rays pseudocode of a function.",
+                        "params": {"address": "function address or name"},
+                        "fn": _agent_impl_decompilation},
+    "getFunctionPrototype": {"description": "C prototype of a function.",
+                            "params": {"address": "function address or name"},
+                            "fn": _agent_impl_function_prototype},
+    "getFunctionArguments": {"description": "Arguments (name/type/location) of a function.",
+                            "params": {"address": "function address or name"},
+                            "fn": _agent_impl_function_arguments},
+    "getFunctionLocals": {"description": "Local variables (name/type/location) of a function.",
+                          "params": {"address": "function address or name"},
+                          "fn": _agent_impl_function_locals},
+    "getFunctionCalls": {"description": "Direct callees of a function.",
+                        "params": {"address": "function address or name"},
+                        "fn": _agent_impl_function_calls},
+    "getCallers": {"description": "Functions that call a target, with call-site addresses.",
+                  "params": {"address": "target function address or name", "limit": "int <= 500"},
+                  "fn": _agent_impl_callers},
+    "getBasicBlocks": {"description": "Control-flow graph (basic blocks + edges) of a function.",
+                      "params": {"address": "function address or name"},
+                      "fn": _agent_impl_basic_blocks},
+    "getCallGraph": {"description": "Nested call tree from a root function, depth-limited.",
+                    "params": {"address": "root function address or name", "depth": "int 1-5 (default 2)"},
+                    "fn": _agent_impl_call_graph},
+    "getCrossReferencesTo": {"description": "All references pointing at an address.",
+                            "params": {"address": "address or name", "limit": "int <= 500"},
+                            "fn": _agent_impl_xrefs_to},
+    "getCrossReferencesFrom": {"description": "All references originating at an address.",
+                              "params": {"address": "address or name", "limit": "int <= 500"},
+                              "fn": _agent_impl_xrefs_from},
+    "getFunctionSummary": {"description": "One-shot bundle: info + disassembly + pseudocode + callees + callers.",
+                          "params": {"address": "function address or name"},
+                          "fn": _agent_impl_function_summary},
+    # data & types
+    "readBytes": {"description": "Read raw bytes from the IDB (hex + ASCII).",
+                 "params": {"address": "address or name", "size": "int <= 65536 (default 16)"},
+                 "fn": _agent_impl_read_bytes},
+    "readMemory": {"description": "Read live processor memory (works outside the IDB).",
+                  "params": {"address": "address or name", "size": "int <= 65536 (default 16)"},
+                  "fn": _agent_impl_read_memory},
+    "getDataAt": {"description": "Item kind/size/name/type/rendered value at an address.",
+                 "params": {"address": "address or name"}, "fn": _agent_impl_data_at},
+    "getGlobalVariables": {"description": "Named global/data variables (paginated, optional filter).",
+                          "params": {"filter": "name substring (optional)", "offset": "int (optional)",
+                                     "limit": "int <= 500"}, "fn": _agent_impl_globals},
+    "getVariableAt": {"description": "Name/size/type of the global at an address.",
+                     "params": {"address": "address or name"}, "fn": _agent_impl_variable_at},
+    "listStructs": {"description": "List struct definitions (optional filter).",
+                   "params": {"filter": "name substring (optional)", "limit": "int <= 500"},
+                   "fn": _agent_impl_list_structs},
+    "getStruct": {"description": "A struct's fields (offset/size/type/name).",
+                 "params": {"name": "struct name"}, "fn": _agent_impl_get_struct},
+    "getStructAt": {"description": "The struct type applied at an address, if any.",
+                   "params": {"address": "address or name"}, "fn": _agent_impl_struct_at},
+    "listEnums": {"description": "List enum definitions (optional filter).",
+                 "params": {"filter": "name substring (optional)", "limit": "int <= 500"},
+                 "fn": _agent_impl_list_enums},
+    "getEnum": {"description": "An enum's members (value/name).",
+               "params": {"name": "enum name"}, "fn": _agent_impl_get_enum},
+    "getTypeAt": {"description": "The C type at an address.",
+                 "params": {"address": "address or name"}, "fn": _agent_impl_type_at},
+    "listLocalTypes": {"description": "User/local type names (optional filter).",
+                      "params": {"filter": "name substring (optional)", "limit": "int <= 500"},
+                      "fn": _agent_impl_list_local_types},
+    # mutation
+    "renameFunction": {"description": "Rename a function.",
+                      "params": {"address": "function address or name", "name": "new name"},
+                      "fn": _agent_impl_rename_function},
+    "renameGlobal": {"description": "Rename a global variable.",
+                    "params": {"address": "address or name", "name": "new name", "force": "bool (optional)"},
+                    "fn": _agent_impl_set_name},
+    "renameData": {"description": "Rename a data item.",
+                  "params": {"address": "address or name", "name": "new name", "force": "bool (optional)"},
+                  "fn": _agent_impl_set_name},
+    "createLabel": {"description": "Create a user label at any address.",
+                   "params": {"address": "address or name", "name": "label", "force": "bool (optional)"},
+                   "fn": _agent_impl_set_name},
+    "renameVariable": {"description": "Rename a function local/argument (Hex-Rays).",
+                      "params": {"address": "function address or name", "variable": "current var name",
+                                 "name": "new name"}, "fn": _agent_impl_rename_variable},
+    "setVariableType": {"description": "Set a function local/argument's type (Hex-Rays).",
+                       "params": {"address": "function address or name", "variable": "var name", "type": "C type"},
+                       "fn": _agent_impl_set_variable_type},
+    "setFunctionPrototype": {"description": "Apply a C prototype to a function.",
+                            "params": {"address": "function address or name", "prototype": "C prototype"},
+                            "fn": _agent_impl_set_function_prototype},
+    "setFunctionType": {"description": "Set a function's return/arg type from a C type string.",
+                       "params": {"address": "function address or name", "type": "C type"},
+                       "fn": _agent_impl_set_function_type},
+    "setComment": {"description": "Set a comment on an address.",
+                  "params": {"address": "address or name", "comment": "text", "repeatable": "bool (optional)"},
+                  "fn": _agent_impl_set_comment},
+    "setFunctionComment": {"description": "Set a function's comment.",
+                          "params": {"address": "function address or name", "comment": "text"},
+                          "fn": _agent_impl_set_function_comment},
+    "makeFunction": {"description": "Create a function at an address.",
+                    "params": {"address": "address or name", "end": "address (optional)"},
+                    "fn": _agent_impl_make_function},
+    "deleteFunction": {"description": "Delete a function.",
+                      "params": {"address": "function address or name"},
+                      "fn": _agent_impl_delete_function},
+    "defineCode": {"description": "Define code (one or more instructions) at an address.",
+                  "params": {"address": "address or name", "size": "int bytes (optional)"},
+                  "fn": _agent_impl_define_code},
+    "undefine": {"description": "Undefine (clear) items at an address.",
+                "params": {"address": "address or name", "size": "int bytes (default 1)"},
+                "fn": _agent_impl_undefine},
+    "createData": {"description": "Create typed data at an address (e.g. int, char[16], struct X).",
+                  "params": {"address": "address or name", "type": "C type"},
+                  "fn": _agent_impl_create_data},
+    "createStruct": {"description": "Create a struct type from fields.",
+                    "params": {"name": "struct name", "fields": "list of {name, type}"},
+                    "fn": _agent_impl_create_struct},
+    "deleteStruct": {"description": "Delete a struct type.",
+                    "params": {"name": "struct name"}, "fn": _agent_impl_delete_struct},
+    "setBookmark": {"description": "Set a bookmark (agent scratch note) at an address.",
+                   "params": {"address": "address or name", "text": "note"},
+                   "fn": _agent_impl_set_bookmark},
+    "getBookmarks": {"description": "List all bookmarks.", "params": {},
+                    "fn": _agent_impl_get_bookmarks},
+    "deleteBookmark": {"description": "Delete the bookmark at an address.",
+                      "params": {"address": "address or name"}, "fn": _agent_impl_delete_bookmark},
+    # gated
+    "patchBytes": {"description": "Patch bytes in the IDB. GATED by agent_allow_patches (off by default).",
+                  "params": {"address": "address or name", "hex": "hex bytes to write"},
+                  "gated": "patches", "fn": _agent_impl_patch_bytes},
+    "runIdaScript": {"description": "Run arbitrary Python with IDA imports. Set a variable named 'result' to return it. GATED by agent_allow_scripts (off by default).",
+                    "params": {"code": "Python source"},
+                    "gated": "scripts", "fn": _agent_impl_run_ida_script},
+}
+
+
+def _agent_dispatch(server, name, args):
+    """Dispatch one tool call. Returns (http_status, json_body)."""
+    tool = AGENT_TOOLS.get(name)
+    if tool is None:
+        return 404, {"ok": False, "error": "Unknown tool: %s. See GET /tools." % name}
+    if not isinstance(args, dict):
+        return 400, {"ok": False, "error": "'args' must be an object"}
+    gate = tool.get("gated")
+    if gate == "patches" and not server._config.agent_allow_patches:
+        return 403, {"ok": False, "error": "patchBytes is disabled (agent_allow_patches is off)"}
+    if gate == "scripts" and not server._config.agent_allow_scripts:
+        return 403, {"ok": False, "error": "runIdaScript is disabled (agent_allow_scripts is off)"}
+    try:
+        result = _run_on_ida(lambda: tool["fn"](args))
+    except _AgentTimeout as exc:
+        return 408, {"ok": False, "error": str(exc)}
+    except _AgentError as exc:
+        return 400, {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return 500, {"ok": False, "error": "IDA error: %s: %s" % (type(exc).__name__, exc)}
+    result, _trunc = _truncate_result(result, server._max_out)
+    return 200, {"ok": True, "result": result}
+
+
+class AgentServer(threading.Thread):
+    """A localhost HTTP server exposing AGENT_TOOLS to an external agent.
+    Runs on its own thread; all IDA work is marshalled to the main thread
+    by _run_on_ida. See the module docstring above for the protocol."""
+
+    def __init__(self, config):
+        super().__init__(daemon=True)
+        self._config = config
+        self._token = (config.agent_server_token or "").strip() or secrets.token_hex(16)
+        self._host = (config.agent_server_host or "").strip() or "127.0.0.1"
+        self._port = int(config.agent_server_port or 0)
+        self._max_out = max(1000, int(config.agent_max_output_chars))
+        self._httpd = None
+        self._bound_port = None
+        self._bind_error = None
+
+    @property
+    def token(self):
+        return self._token
+
+    @property
+    def bound_port(self):
+        return self._bound_port
+
+    @property
+    def url(self):
+        port = self._bound_port if self._bound_port is not None else self._port
+        return "http://%s:%d" % (self._host, port)
+
+    def run(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):  # keep IDA's output window quiet
+                pass
+
+            def _send_json(self, code, obj):
+                body = json.dumps(obj, default=str).encode("utf-8", "replace")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _authorized(self):
+                auth = self.headers.get("Authorization", "")
+                return auth == "Bearer " + server._token
+
+            def _read_body(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                return json.loads(raw.decode("utf-8", "replace")) if raw else {}
+
+            def do_GET(self):
+                if self.path == "/health":
+                    return self._send_json(200, {"ok": True, "server": PLUGIN_NAME + " agent", 
+                                                 "tools": len(AGENT_TOOLS)})
+                if self.path == "/tools":
+                    if not self._authorized():
+                        return self._send_json(401, {"ok": False, "error": "unauthorized"})
+                    catalog = {name: {"description": t["description"], "params": t["params"],
+                                      "gated": t.get("gated")}
+                               for name, t in AGENT_TOOLS.items()}
+                    return self._send_json(200, {"ok": True, "tools": catalog})
+                return self._send_json(404, {"ok": False, "error": "not found"})
+
+            def do_POST(self):
+                if not self._authorized():
+                    return self._send_json(401, {"ok": False, "error": "unauthorized"})
+                try:
+                    payload = self._read_body()
+                except (ValueError, json.JSONDecodeError):
+                    return self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+                if self.path == "/call":
+                    name = payload.get("name")
+                    if not isinstance(name, str):
+                        return self._send_json(400, {"ok": False, "error": "missing 'name'"})
+                    status, body = _agent_dispatch(server, name, payload.get("args", {}))
+                    return self._send_json(status, body)
+                if self.path == "/batch":
+                    calls = payload.get("calls")
+                    if not isinstance(calls, list):
+                        return self._send_json(400, {"ok": False, "error": "'calls' must be a list"})
+                    results = []
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            results.append({"ok": False, "error": "each call must be an object"})
+                            continue
+                        status, body = _agent_dispatch(server, call.get("name"), call.get("args", {}))
+                        results.append(body)
+                    return self._send_json(200, {"ok": True, "results": results})
+                return self._send_json(404, {"ok": False, "error": "not found"})
+
+        try:
+            self._httpd = ThreadingHTTPServer((self._host, self._port), Handler)
+        except OSError as exc:
+            self._bind_error = str(exc)
+            return
+        self._bound_port = self._httpd.server_address[1]
+        try:
+            self._httpd.serve_forever(poll_interval=0.2)
+        finally:
+            self._httpd.server_close()
+            self._httpd = None
+
+    def shutdown(self):
+        httpd = self._httpd
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # IDA action / popup / plugin glue
 # ---------------------------------------------------------------------------
 
@@ -11440,6 +12913,28 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._popup_hooks = PopupHooks()
         self._popup_hooks.hook()
 
+        # Agent server (optional): a localhost HTTP API an external agent
+        # can use to drive IDA. Started on its own thread; the URL + token
+        # are logged so the agent can be pointed at it.
+        self._agent_server = None
+        if self.config.agent_server_enabled:
+            agent_srv = AgentServer(self.config)
+            agent_srv.start()
+            for _ in range(100):  # up to ~5s for the bind to settle
+                if agent_srv.bound_port is not None or agent_srv._bind_error:
+                    break
+                time.sleep(0.05)
+            if agent_srv.bound_port is not None:
+                self._agent_server = agent_srv
+                ida_kernwin.msg(
+                    "[%s] Agent server: %s  token: %s\n" % (PLUGIN_NAME, agent_srv.url, agent_srv.token)
+                )
+            else:
+                ida_kernwin.msg(
+                    "[%s] Agent server could not bind %s:%s (%s) - is the port in use?\n"
+                    % (PLUGIN_NAME, agent_srv._host, agent_srv._port, agent_srv._bind_error)
+                )
+
         ida_kernwin.msg(
             "[%s] v%s loaded. Server(s): %s\n"
             % (
@@ -11450,12 +12945,40 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         )
         return idaapi.PLUGIN_KEEP
 
+    def _restart_agent_server(self):
+        """(Re)start or stop the agent server to match the current config."""
+        if getattr(self, "_agent_server", None) is not None:
+            try:
+                self._agent_server.shutdown()
+            except Exception:
+                pass
+            self._agent_server = None
+        if not self.config.agent_server_enabled:
+            return
+        agent_srv = AgentServer(self.config)
+        agent_srv.start()
+        for _ in range(100):
+            if agent_srv.bound_port is not None or agent_srv._bind_error:
+                break
+            time.sleep(0.05)
+        if agent_srv.bound_port is not None:
+            self._agent_server = agent_srv
+            ida_kernwin.msg(
+                "[%s] Agent server: %s  token: %s\n" % (PLUGIN_NAME, agent_srv.url, agent_srv.token)
+            )
+        else:
+            ida_kernwin.msg(
+                "[%s] Agent server could not bind %s:%s (%s) - is the port in use?\n"
+                % (PLUGIN_NAME, agent_srv._host, agent_srv._port, agent_srv._bind_error)
+            )
+
     def run(self, arg):
         dlg = SettingsDialog(self.config)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted and dlg.result_config is not None:
             old_hotkey = self.config.explain_hotkey
             self.config = dlg.result_config
             self.config.save()
+            self._restart_agent_server()
             if self.config.explain_hotkey != old_hotkey:
                 try:
                     ida_kernwin.update_action_shortcut(ACTION_ID_EXPLAIN, self.config.explain_hotkey or None)
@@ -11476,6 +12999,12 @@ class LLMExplainerPlugin(idaapi.plugin_t):
                     )
 
     def term(self):
+        if getattr(self, "_agent_server", None) is not None:
+            try:
+                self._agent_server.shutdown()
+            except Exception:
+                pass
+            self._agent_server = None
         for dlg in list(self._open_dialogs):
             try:
                 dlg.close()

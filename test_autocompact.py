@@ -50,7 +50,9 @@ _stub("idaapi", get_user_idadir=lambda: os.path.join(os.path.dirname(__file__), 
 _stub("idautils", XrefsTo=lambda *a, **k: iter(()))
 _stub("idc")
 _stub("ida_kernwin", MFF_FAST=1, MFF_WRITE=2, msg=lambda s: print("[msg]", s),
-      execute_sync=lambda fn, *a: (fn(), 0), UI_Hooks=_UIHooks,
+      # real execute_sync returns non-zero on success; the stub runs the
+      # callable inline and reports success
+      execute_sync=lambda fn, *a: (fn(), 1), UI_Hooks=_UIHooks,
       action_handler_t=_ActionHandler)
 for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_name",
               "ida_nalt", "ida_segment", "ida_typeinf", "ida_ua", "ida_xref",
@@ -315,6 +317,91 @@ try:
           L.query_server_context_size("http://fallback-shape.test", "m") == 4096)
 finally:
     _ur.urlopen = _real_urlopen
+
+# 10. agent server: protocol layer (real HTTP on localhost)
+import urllib.error
+
+agent_cfg = L.PluginConfig(server_urls=[URL], agent_server_enabled=True,
+                           agent_server_port=0, agent_server_token="test-token-123")
+asrv = L.AgentServer(agent_cfg)
+asrv.start()
+for _ in range(100):
+    if asrv.bound_port is not None or asrv._bind_error:
+        break
+    time.sleep(0.05)
+check("agent server binds (port %s)" % asrv.bound_port, asrv.bound_port is not None)
+
+def _http(method, path, body=None, token="test-token-123"):
+    req = urllib.request.Request(asrv.url + path, method=method)
+    if token is not None:
+        req.add_header("Authorization", "Bearer " + token)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+status, body = _http("GET", "/health")
+check("/health open (no auth)", status == 200 and body.get("ok") is True)
+
+status, body = _http("GET", "/tools", token=None)
+check("/tools requires auth", status == 401)
+
+status, body = _http("GET", "/tools")
+tools = body.get("tools", {})
+check("/tools lists %d tools" % len(tools), status == 200 and len(tools) >= 40)
+check("every tool has description+params",
+      all(isinstance(t.get("description"), str) and isinstance(t.get("params"), dict) for t in tools.values()))
+check("registry fns all callable", all(callable(t["fn"]) for t in L.AGENT_TOOLS.values()))
+check("gated tools flagged in catalog",
+      tools.get("patchBytes", {}).get("gated") == "patches"
+      and tools.get("runIdaScript", {}).get("gated") == "scripts")
+
+status, body = _http("POST", "/call", {"name": "getMetadata", "args": {}}, token="wrong")
+check("bad token -> 401", status == 401)
+
+status, body = _http("POST", "/call", {"name": "noSuchTool", "args": {}})
+check("unknown tool -> 404", status == 404)
+
+status, body = _http("POST", "/call", {"name": "getMetadata", "args": "nope"})
+check("non-object args -> 400", status == 400)
+
+status, body = _http("POST", "/call", {"name": "patchBytes", "args": {"address": "0x1000", "hex": "90"}})
+check("gated patchBytes refused when disabled -> 403", status == 403)
+
+status, body = _http("POST", "/call", {"name": "runIdaScript", "args": {"code": "result=1"}})
+check("gated runIdaScript refused when disabled -> 403", status == 403)
+
+status, body = _http("POST", "/call", {"name": "getMetadata", "args": {}})
+check("IDA-backed call surfaces IDA error cleanly (stub env)",
+      status == 500 and "IDA error" in body.get("error", ""))
+
+status, body = _http("POST", "/batch",
+                     {"calls": [{"name": "noSuchTool", "args": {}},
+                                {"name": "patchBytes", "args": {}}]})
+check("/batch returns per-call results",
+      status == 200 and len(body.get("results", [])) == 2
+      and body["results"][0].get("ok") is False and body["results"][1].get("ok") is False)
+
+# 11. result truncation
+obj, trunc = L._truncate_result({"a": "x" * 5000, "b": [1, {"c": "y" * 5000}]}, 100)
+check("truncation caps strings + flags",
+      trunc and len(obj["a"]) <= 115 and obj.get("_truncated") is True)
+
+# 12. address resolver (int path; name path needs a real IDB)
+check("_agent_ea int passthrough", L._agent_ea({"address": 0x1400}, "address") == 0x1400)
+try:
+    L._agent_ea({}, "address")
+    check("_agent_ea missing -> _AgentError", False)
+except L._AgentError:
+    check("_agent_ea missing -> _AgentError", True)
+
+asrv.shutdown()
+asrv.join(5)
 
 srv.shutdown()
 print()
