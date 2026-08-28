@@ -134,10 +134,11 @@ _stub("ida_kernwin", MFF_FAST=1, MFF_WRITE=2, msg=lambda s: print("[msg]", s),
       # real execute_sync returns non-zero on success; the stub runs the
       # callable inline and reports success
       execute_sync=lambda fn, *a: (fn(), 1), UI_Hooks=_UIHooks,
-      action_handler_t=_ActionHandler)
-for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_name",
-              "ida_nalt", "ida_segment", "ida_typeinf", "ida_ua", "ida_xref",
-              "ida_x86", "ida_arm"):
+      action_handler_t=_ActionHandler, get_kernel_version=lambda: "stub",
+      get_screen_ea=lambda: 0x1000)
+for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_loader",
+              "ida_name", "ida_nalt", "ida_segment", "ida_typeinf", "ida_ua",
+              "ida_xref", "ida_x86", "ida_arm"):
     _stub(extra)
 _stub("ida_funcs", get_func=lambda ea: None, get_func_name=lambda ea: "sub_%X" % ea)
 _stub("ida_graph", GraphViewer=_dummy_class("GraphViewer"))

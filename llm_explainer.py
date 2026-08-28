@@ -213,6 +213,7 @@ import ida_idp
 import ida_lines
 import ida_name
 import ida_nalt
+import ida_loader
 import ida_segment
 import ida_typeinf
 import ida_ua
@@ -1114,7 +1115,7 @@ def gather_data_refs(func, max_refs, max_string_len):
                 result.append(DataRef(ea=ref, kind="string", text=text))
             else:
                 try:
-                    name = idc.get_name(ref)
+                    name = idaapi.get_name(ref)
                 except Exception:
                     name = None
                 if name:
@@ -1241,7 +1242,7 @@ def gather_codegen_globals(func, config):
             except Exception:
                 pass
             try:
-                name = idc.get_name(ref) or ""
+                name = idaapi.get_name(ref) or ""
             except Exception:
                 name = ""
             if not name:
@@ -6798,7 +6799,7 @@ class ExplainResultDialog(QtWidgets.QDialog):
             self._suggested_global_renames = result.suggested_global_renames
             global_labels = []
             for global_ea, global_new_name in result.suggested_global_renames:
-                old_global_name = idc.get_name(global_ea) or ("%#x" % global_ea)
+                old_global_name = idaapi.get_name(global_ea) or ("%#x" % global_ea)
                 global_labels.append("%s -> %s" % (old_global_name, global_new_name))
             self.globalrename_label.setText(", ".join(global_labels))
             self.globalrename_check.setEnabled(True)
@@ -10547,7 +10548,7 @@ def _apply_cfg_trace_and_refresh(config, items, jump_patches=None, start_ea=None
                 if color is not None:
                     idc.set_color(ea, idc.CIC_ITEM, color)
                 if idx == 0 and item.comment:
-                    idc.set_cmt(ea, item.comment, 0)
+                    ida_bytes.set_cmt(ea, item.comment, 0)
             except Exception:
                 pass
 
@@ -11419,7 +11420,8 @@ def _run_on_ida(fn, timeout_ms=AGENT_CALL_TIMEOUT_MS):
         except Exception as exc:
             error.append(exc)
 
-    ok = ida_kernwin.execute_sync(_wrap, ida_kernwin.MFF_FAST, timeout_ms)
+    # IDA 9.x execute_sync(callable, mask) takes no timeout parameter.
+    ok = ida_kernwin.execute_sync(_wrap, ida_kernwin.MFF_FAST)
     if not ok:
         raise _AgentTimeout(
             "IDA main thread did not respond within %ds (a long operation or "
@@ -11493,7 +11495,7 @@ def _agent_func_disasm_text(f):
     lines = []
     ea = f.start_ea
     while ea < f.end_ea:
-        lines.append(idc.generate_disassembly(ea))
+        lines.append(ida_lines.generate_disasm_line(ea, 0))
         ea = idc.next_head(ea, f.end_ea)
     return "\n".join(lines)
 
@@ -11506,7 +11508,7 @@ def _agent_callee_targets(f):
     insn = ida_ua.insn_t()
     while ea < f.end_ea:
         if ida_ua.decode_insn(insn, ea):
-            if insn.is_call():
+            if bool(insn.get_canon_feature() & ida_idp.CF_CALL):
                 tgt = insn.get_op_addr(0)
                 if tgt != idaapi.BADADDR and tgt not in seen_set:
                     seen_set.add(tgt)
@@ -11596,26 +11598,32 @@ def _truncate_result(obj, max_chars):
 
 def _agent_impl_metadata(args):
     entries = []
-    for ea in idautils.Entries():
-        entries.append({"address": _hex(ea), "name": idc.get_name(ea) or ""})
+    for _i, _ordinal, ea, name in idautils.Entries():
+        entries.append({"address": _hex(ea), "name": name or idaapi.get_name(ea) or ""})
     return {
         "idb_name": ida_nalt.get_root_filename() or "",
-        "idb_path": idaapi.get_path(idaapi.PATH_IDB) or "",
-        "input_file": ida_nalt.get_root_filename(idaapi.PATH_INPUT) or "",
+        "idb_path": ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or "",
+        "input_file": ida_nalt.get_root_filename() or "",
         "processor": get_procname(),
         "bits": _pointer_size_bits(),
         "image_base": _hex(_image_base()),
         "entry_points": entries,
-        "ida_version": idaapi.get_version(),
+        "ida_version": ida_kernwin.get_kernel_version() or "",
     }
 
 
 def _agent_impl_analysis_status(args):
-    return {"analysis_done": not ida_auto.autoanalysis_required(ida_auto.WF_DEFER)}
+    # IDA 9.x removed autoanalysis_required(); use the autoanalyzer state flags.
+    try:
+        state = ida_auto.get_auto_state()
+        flag = getattr(ida_auto, "AS_ANALYSIS", 0x8)
+        return {"analysis_done": not (state & flag)}
+    except Exception:
+        return {"analysis_done": True}
 
 
 def _agent_impl_current_cursor(args):
-    ea = idc.get_screen_ea()
+    ea = ida_kernwin.get_screen_ea()
     f = ida_funcs.get_func(ea)
     return {
         "address": _hex(ea),
@@ -11752,16 +11760,34 @@ def _agent_impl_segments(args):
             "end": _hex(s.end_ea),
             "size": s.end_ea - s.start_ea,
             "permissions": perm,
-            "class": s.get_class(),
+            "class": ida_segment.get_segm_class(s) or "",
         })
     return {"segments": out}
 
 
 def _agent_impl_entry_points(args):
     out = []
-    for ea in idautils.Entries():
-        out.append({"address": _hex(ea), "name": idc.get_name(ea) or ""})
+    for _i, _ordinal, ea, name in idautils.Entries():
+        out.append({"address": _hex(ea), "name": name or idaapi.get_name(ea) or ""})
     return {"entry_points": out}
+
+
+def _inf_upper_bound():
+    """Return the database upper bound, tolerating IDA 9.x module moves where
+    get_inf_structure() is not on ida_idp. Falls back to a 64-bit max so
+    range-bounded scans (searchBytes/searchText/disassembly) still work."""
+    for _mod in (ida_idp, ida_loader, idaapi):
+        try:
+            _s = _mod.get_inf_structure()
+            if _s is not None:
+                return _s.upper_bound
+        except Exception:
+            pass
+    try:
+        return idc.get_inf_attr(idc.INF_ATTR_UPPERR)
+    except Exception:
+        pass
+    return 0xFFFFFFFFFFFFFFFF
 
 
 def _agent_impl_search_bytes(args):
@@ -11773,12 +11799,22 @@ def _agent_impl_search_bytes(args):
     if start == idaapi.BADADDR:
         start = _image_base()
     if end == idaapi.BADADDR:
-        end = idaapi.get_inf_structure().upper_bound
+        end = _inf_upper_bound()
     limit = _agent_limit(args)
+    # parse "48 8B ?? FF" into image + mask for ida_bytes.bin_search
+    _img = bytearray()
+    _msk = bytearray()
+    for _tok in pattern.split():
+        if _tok == "??":
+            _img.append(0)
+            _msk.append(0)
+        else:
+            _img.append(int(_tok, 16))
+            _msk.append(0xFF)
     out = []
     ea = start
     while ea != idaapi.BADADDR and ea < end and len(out) < limit:
-        ea = idc.find_binary(ea, end, pattern, 16)
+        ea = ida_bytes.bin_search(ea, end, bytes(_img), bytes(_msk), len(_img), 0)
         if ea == idaapi.BADADDR:
             break
         out.append(_hex(ea))
@@ -11796,12 +11832,12 @@ def _agent_impl_search_text(args):
     end = _agent_opt_ea(args, "end")
     limit = _agent_limit(args)
     ea = start if start != idaapi.BADADDR else _image_base()
-    stop = end if end != idaapi.BADADDR else idaapi.get_inf_structure().upper_bound
+    stop = end if end != idaapi.BADADDR else _inf_upper_bound()
     out = []
     ea = idc.next_head(ea, stop)
     while ea != idaapi.BADADDR and ea < stop and len(out) < limit:
         try:
-            line = idc.generate_disassembly(ea)
+            line = ida_lines.generate_disasm_line(ea, 0)
         except Exception:
             line = ""
         if needle in line.lower():
@@ -11813,13 +11849,13 @@ def _agent_impl_search_text(args):
 def _agent_impl_disassembly(args):
     ea = _agent_ea(args, "address")
     count = max(1, min(1000, int(args.get("count") or 100)))
-    stop = idaapi.get_inf_structure().upper_bound
+    stop = _inf_upper_bound()
     start = ea
     lines = []
     for _ in range(count):
         if ea == idaapi.BADADDR or ea >= stop:
             break
-        lines.append(idc.generate_disassembly(ea))
+        lines.append(ida_lines.generate_disasm_line(ea, 0))
         ea = idc.next_head(ea, stop)
     return {"address": _hex(start), "instruction_count": len(lines), "text": "\n".join(lines)}
 
@@ -11865,7 +11901,7 @@ def _agent_impl_function_calls(args):
     for tgt in _agent_callee_targets(f):
         cf = ida_funcs.get_func(tgt)
         out.append({"address": _hex(tgt),
-                    "name": (ida_funcs.get_func_name(tgt) if cf else idc.get_name(tgt)) or ""})
+                    "name": (ida_funcs.get_func_name(tgt) if cf else idaapi.get_name(tgt)) or ""})
     return {"address": _hex(f.start_ea), "callees": out}
 
 
@@ -11883,7 +11919,7 @@ def _agent_impl_callers(args):
     for key in sorted(by_func):
         cf = ida_funcs.get_func(key)
         out.append({"address": _hex(key),
-                    "name": (ida_funcs.get_func_name(key) if cf else idc.get_name(key)) or "",
+                    "name": (ida_funcs.get_func_name(key) if cf else idaapi.get_name(key)) or "",
                     "call_sites": [_hex(s) for s in by_func[key]]})
     return {"target": _hex(target), "callers": out[:limit]}
 
@@ -11950,7 +11986,7 @@ def _agent_impl_function_summary(args):
     for tgt in _agent_callee_targets(f):
         cf = ida_funcs.get_func(tgt)
         callees.append({"address": _hex(tgt),
-                        "name": (ida_funcs.get_func_name(tgt) if cf else idc.get_name(tgt)) or ""})
+                        "name": (ida_funcs.get_func_name(tgt) if cf else idaapi.get_name(tgt)) or ""})
     info["callees"] = callees
     by_func = {}
     for ref in idautils.CodeRefsTo(f.start_ea, 0):
@@ -11989,9 +12025,9 @@ def _agent_impl_data_at(args):
         "address": _hex(ea),
         "is_code": bool(idc.is_code(ea)),
         "size": size,
-        "name": idc.get_name(ea) or "",
+        "name": idaapi.get_name(ea) or "",
         "type": idc.get_type(ea) or "",
-        "rendered": idc.generate_disassembly(ea),
+        "rendered": ida_lines.generate_disasm_line(ea, 0),
     }
 
 
@@ -12001,7 +12037,7 @@ def _agent_impl_globals(args):
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
     for ea in idautils.Dirs():
-        name = idc.get_name(ea)
+        name = idaapi.get_name(ea)
         if not name:
             continue
         if filt and filt not in name.lower():
@@ -12014,7 +12050,7 @@ def _agent_impl_globals(args):
 
 def _agent_impl_variable_at(args):
     ea = _agent_ea(args, "address")
-    return {"address": _hex(ea), "name": idc.get_name(ea) or "",
+    return {"address": _hex(ea), "name": idaapi.get_name(ea) or "",
             "size": idc.get_item_size(ea), "type": idc.get_type(ea) or ""}
 
 
@@ -12126,7 +12162,7 @@ def _agent_impl_set_name(args):
         flags |= ida_name.SN_FORCE
     if not ida_name.set_name(ea, name, flags):
         raise _AgentError("set_name failed for %s at %s" % (name, _hex(ea)))
-    return {"address": _hex(ea), "name": idc.get_name(ea) or name}
+    return {"address": _hex(ea), "name": idaapi.get_name(ea) or name}
 
 
 def _agent_impl_rename_variable(args):
@@ -12182,7 +12218,7 @@ def _agent_impl_set_comment(args):
     ea = _agent_ea(args, "address")
     cmt = (args.get("comment") or "")
     repeatable = bool(args.get("repeatable") or False)
-    if not idc.set_cmt(ea, cmt, repeatable):
+    if not ida_bytes.set_cmt(ea, cmt, repeatable):
         raise _AgentError("set_cmt failed at %s" % _hex(ea))
     return {"address": _hex(ea), "comment": cmt, "repeatable": repeatable}
 

@@ -128,6 +128,12 @@ The prose answer itself is kept to one sentence — it becomes the function comm
 
 ![Trace/Recover CFG live view](tracer.png)
 
+## Changelog
+
+- **IDA 9.3 compatibility fixes** — field-tested against IDA 9.3: `idc.get_name` → `idaapi.get_name`, `idc.set_cmt` → `ida_bytes.set_cmt`, `idc.generate_disassembly` → `ida_lines.generate_disasm_line`, `idc.find_binary` → `ida_bytes.bin_search` (image/mask), `insn.is_call()` → `CF_CALL` canon feature, `idautils.Entries()` 4-tuples, `ida_auto.get_auto_state()` (autoanalysis_required is gone), `ida_loader.get_path` / `get_kernel_version` / `get_screen_ea` / `get_segm_class`, and `execute_sync` without the timeout argument. The agent server is now verified working on IDA 9.3.
+- **v1.11.0** — agent server: localhost HTTP API (61 tools, bearer-token auth, self-describing `GET /tools`, `/call` + `/batch`) for external agents to read code/data/types and mutate the database; `patchBytes`/`runIdaScript` gated off by default. Settings dialog reorganized into five tabs (Server / Explain / CFG trace / C export / Agent server), each scrollable.
+- **v1.10.0** — auto-compact (LLM-summarizes older turns when the conversation nears the server's context window, with mechanical fallback), live context gauge with tokens/s in the Explain and Export-C dialogs, and a clean conversation per run.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). © 2026 Peter Garba
