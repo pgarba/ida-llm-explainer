@@ -127,7 +127,7 @@ class _PluginT:
 
 _stub("idaapi", get_user_idadir=lambda: os.path.join(os.path.dirname(__file__), "test_idadir"),
       BADADDR=0xFFFFFFFFFFFFFFFF, action_handler_t=_ActionHandler, plugin_t=_PluginT,
-      PLUGIN_KEEP=1)
+      PLUGIN_KEEP=1, get_name=lambda ea: None, get_memstr=lambda ea, sz: None)
 _stub("idautils", XrefsTo=lambda *a, **k: iter(()))
 _stub("idc")
 _stub("ida_kernwin", MFF_FAST=1, MFF_WRITE=2, msg=lambda s: print("[msg]", s),
@@ -142,6 +142,88 @@ for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_loader",
     _stub(extra)
 _stub("ida_funcs", get_func=lambda ea: None, get_func_name=lambda ea: "sub_%X" % ea)
 _stub("ida_graph", GraphViewer=_dummy_class("GraphViewer"))
+
+# Functional ida_dbg/ida_idd stubs so the agent's debugger tools can run
+# against a fake "suspended" debuggee.
+class _StubRegval:
+    def __init__(self, ival):
+        self.rvtype = 0  # RVT_INT
+        self.ival = ival
+    def pyval(self, dtype):
+        return self.ival
+
+class _StubRegvals:
+    def __init__(self, vals):
+        self._vals = vals
+    def size(self):
+        return len(self._vals)
+    def __getitem__(self, i):
+        return self._vals[i]
+
+class _StubBpt:
+    ea = 0x140001234
+    type = 0
+    pass_count = 0
+    def enabled(self):
+        return True
+    def is_active(self):
+        return True
+
+class _StubFrame:
+    def __init__(self, callea, funcea, funcok=True):
+        self.callea = callea
+        self.funcea = funcea
+        self.funcok = funcok
+
+class _StubCallStack:
+    def __init__(self):
+        self.frames = []
+    def __iter__(self):
+        return iter(self.frames)
+
+_dbg_state = {"state": 0}  # 0 = DSTATE_SUSP
+
+_stub("ida_dbg",
+      DSTATE_SUSP=0, DSTATE_NOTASK=1, DSTATE_RUN=2, dbg_process_attach=1,
+      is_debugger_on=lambda: True,
+      get_process_state=lambda: _dbg_state["state"],
+      dbg_can_query=lambda: True,
+      get_thread_qty=lambda: 1,
+      getn_thread=lambda n: 1,
+      getn_thread_name=lambda n: "main",
+      get_current_thread=lambda: 1,
+      get_ip_val=lambda: 0x140001000,
+      get_sp_val=lambda: 0x200000000,
+      get_reg_vals=lambda tid, clsmask=-1: _StubRegvals([_StubRegval(0x11223344), _StubRegval(0x55)]),
+      get_bpt_qty=lambda: 1,
+      bpt_t=_StubBpt,
+      getn_bpt=lambda n, bpt: True,
+      exist_bpt=lambda ea: False,
+      add_bpt=lambda *a: True,
+      del_bpt=lambda ea: True,
+      set_reg_val=lambda name, val: True,
+      suspend_process=lambda: (_dbg_state.update(state=0) or True),
+      continue_process=lambda: (_dbg_state.update(state=2) or True),
+      step_into=lambda: True,
+      step_over=lambda: True,
+      step_until_ret=lambda: True,
+      run_to=lambda ea: True,
+      detach_process=lambda: (_dbg_state.update(state=1) or True),
+      exit_process=lambda: (_dbg_state.update(state=1) or True),
+      attach_process=lambda pid, ev: (_dbg_state.update(state=0) or 1),
+      start_process=lambda path, args="", sdir="": (_dbg_state.update(state=0) or 1),
+      collect_stack_trace=lambda tid, trace: (trace.frames.append(_StubFrame(0x140001234, 0x140001000)) or True),
+      get_module_info=lambda ea, mi: False,
+      )
+_stub("ida_idd",
+      RVT_INT=0, RVT_FLOAT=1, RVT_UNAVAILABLE=2,
+      dbg_get_name=lambda: "stubdbg",
+      dbg_get_registers=lambda: [("rax", 0, 0, 5, None, 0), ("rbx", 0, 0, 5, None, 0)],
+      dbg_read_memory=lambda ea, sz: b"hello-live",
+      dbg_get_memory_info=lambda: [(0x140000000, 0x140001000, "stub.exe", "TEXT", 0x140000000, 2, "r-x")],
+      call_stack_t=_StubCallStack,
+      modinfo_t=_dummy_class("modinfo_t"),
+      )
 
 # PySide6 stubs: dummy classes (subclassable, instantiable with anything)
 _QT_WIDGETS = ["QDialog", "QDialogButtonBox", "QWidget", "QFormLayout", "QPlainTextEdit", "QLineEdit",
@@ -454,7 +536,8 @@ check("every tool has description+params",
 check("registry fns all callable", all(callable(t["fn"]) for t in L.AGENT_TOOLS.values()))
 check("gated tools flagged in catalog",
       tools.get("patchBytes", {}).get("gated") == "patches"
-      and tools.get("runIdaScript", {}).get("gated") == "scripts")
+      and tools.get("runIdaScript", {}).get("gated") == "scripts"
+      and tools.get("debugContinue", {}).get("gated") == "debug")
 
 status, body = _http("POST", "/call", {"name": "getMetadata", "args": {}}, token="wrong")
 check("bad token -> 401", status == 401)
@@ -470,6 +553,62 @@ check("gated patchBytes refused when disabled -> 403", status == 403)
 
 status, body = _http("POST", "/call", {"name": "runIdaScript", "args": {"code": "result=1"}})
 check("gated runIdaScript refused when disabled -> 403", status == 403)
+
+# 10b. debugger tools (functional ida_dbg/ida_idd stubs, fake suspended process)
+status, body = _http("POST", "/call", {"name": "getDebugState", "args": {}})
+check("getDebugState reports suspended + IP",
+      status == 200 and body["result"]["process_state"] == "suspended"
+      and body["result"]["instruction_pointer"] == "0x140001000"
+      and body["result"]["debugger_name"] == "stubdbg")
+
+status, body = _http("POST", "/call", {"name": "getLiveRegisters", "args": {}})
+check("getLiveRegisters dumps named registers",
+      status == 200 and body["result"]["registers"].get("rax") == "0x11223344"
+      and body["result"]["registers"].get("rbx") == "0x55")
+
+status, body = _http("POST", "/call", {"name": "getLiveMemory", "args": {"address": 0x140000000, "size": 32}})
+check("getLiveMemory reads live bytes",
+      status == 200 and body["result"]["ascii"] == "hello-live")
+
+status, body = _http("POST", "/call", {"name": "getLiveMemoryMap", "args": {}})
+check("getLiveMemoryMap lists regions",
+      status == 200 and body["result"]["regions"][0]["name"] == "stub.exe")
+
+status, body = _http("POST", "/call", {"name": "getBreakpoints", "args": {}})
+check("getBreakpoints lists bpts",
+      status == 200 and body["result"]["count"] == 1
+      and body["result"]["breakpoints"][0]["address"] == "0x140001234")
+
+status, body = _http("POST", "/call", {"name": "getStackTrace", "args": {}})
+check("getStackTrace returns frames",
+      status == 200 and body["result"]["frames"][0]["return_address"] == "0x140001234")
+
+status, body = _http("POST", "/call", {"name": "getThreads", "args": {}})
+check("getThreads lists the current thread",
+      status == 200 and body["result"]["threads"][0]["current"] is True)
+
+for _tool in ("debugStart", "debugSuspend", "debugContinue", "debugStep",
+              "debugRunTo", "debugDetach", "debugExit", "setBreakpoint",
+              "removeBreakpoint", "setRegisterValue"):
+    status, body = _http("POST", "/call", {"name": _tool, "args": {}})
+    check("gated %s refused when disabled -> 403" % _tool, status == 403)
+
+# enable the debug gate and drive the fake process through a step
+asrv._config.agent_allow_debug = True
+status, body = _http("POST", "/call", {"name": "setBreakpoint", "args": {"address": 0x140001000}})
+check("setBreakpoint works when gated open", status == 200 and body["result"]["set"] is True)
+status, body = _http("POST", "/call", {"name": "setRegisterValue", "args": {"name": "rax", "value": "0xDEAD"}})
+check("setRegisterValue works when gated open", status == 200 and body["result"]["value"] == "0xdead")
+status, body = _http("POST", "/call", {"name": "debugStep", "args": {"kind": "over"}})
+check("debugStep completes (fake stays suspended)",
+      status == 200 and body["result"]["process_state"] == "suspended")
+_dbg_state["state"] = 2  # DSTATE_RUN
+status, body = _http("POST", "/call", {"name": "getLiveRegisters", "args": {}})
+check("getLiveRegisters refuses while running -> 400",
+      status == 400 and "not suspended" in body.get("error", ""))
+status, body = _http("POST", "/call", {"name": "debugSuspend", "args": {}})
+check("debugSuspend transitions running -> suspended",
+      status == 200 and body["result"]["process_state"] == "suspended")
 
 status, body = _http("POST", "/call", {"name": "getMetadata", "args": {}})
 check("IDA-backed call surfaces IDA error cleanly (stub env)",

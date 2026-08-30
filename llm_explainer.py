@@ -239,11 +239,21 @@ try:
 except ImportError:
     ida_bookmark = None
 
+try:
+    import ida_dbg
+except ImportError:
+    ida_dbg = None
+
+try:
+    import ida_idd
+except ImportError:
+    ida_idd = None
+
 from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.11.0"
+PLUGIN_VERSION = "1.12.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -797,10 +807,12 @@ DEFAULT_CONFIG = {
     # --- agent server (external-agent HTTP API) ---------------------------
     # A local HTTP API an external agent (an LLM agent loop, a script,
     # another tool) can use to drive IDA: read code/data/types, search,
-    # and mutate the database (renames, comments, types, functions). Bearer-
-    # token auth, bound to localhost by default. patchBytes and runIdaScript
-    # are additionally gated by their own flags (both off by default). See
-    # the AGENT_TOOLS registry and AgentServer class near the bottom.
+    # mutate the database (renames, comments, types, functions), and drive
+    # the debugger for dynamic analysis. Bearer-token auth, bound to
+    # localhost by default. patchBytes, runIdaScript and the debugger
+    # control tools are additionally gated by their own flags (all off by
+    # default). See the AGENT_TOOLS registry and AgentServer class near
+    # the bottom.
     "agent_server_enabled": False,
     "agent_server_host": "127.0.0.1",
     # Fixed default port; 0 = auto-assign. The bound URL + token are always
@@ -810,6 +822,12 @@ DEFAULT_CONFIG = {
     "agent_server_token": "",
     "agent_allow_patches": False,
     "agent_allow_scripts": False,
+    # Gate for the debugger CONTROL tools (debugStart/Suspend/Continue/
+    # Step/RunTo/Detach/Exit, setBreakpoint, removeBreakpoint,
+    # setRegisterValue). They act on a live process, so off by default.
+    # The read-only debugger tools (getDebugState, getLiveRegisters,
+    # getLiveMemory, ...) need no gate.
+    "agent_allow_debug": False,
     # Per-result truncation cap (agents have context budgets too).
     "agent_max_output_chars": 20000,
     "include_data_refs": True,
@@ -4666,6 +4684,7 @@ class PluginConfig(object):
         self.agent_server_token = (self.agent_server_token or "").strip()
         self.agent_allow_patches = bool(self.agent_allow_patches)
         self.agent_allow_scripts = bool(self.agent_allow_scripts)
+        self.agent_allow_debug = bool(self.agent_allow_debug)
         try:
             self.agent_max_output_chars = max(1000, min(1000000, int(self.agent_max_output_chars)))
         except (TypeError, ValueError):
@@ -8000,6 +8019,16 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow(self.agent_allow_scripts_check)
 
+        self.agent_allow_debug_check = QtWidgets.QCheckBox("Allow agent to control the debugger (debug* tools)")
+        self.agent_allow_debug_check.setToolTip(
+            "Lets the agent start/attach to the debuggee, suspend/continue/"
+            "step it, set breakpoints and write registers. Reading live "
+            "state (getDebugState, getLiveRegisters, getLiveMemory, ...) "
+            "does NOT need this - those tools are read-only. Off by "
+            "default."
+        )
+        form.addRow(self.agent_allow_debug_check)
+
         self.agent_max_output_spin = QtWidgets.QSpinBox()
         self.agent_max_output_spin.setRange(1000, 1000000)
         self.agent_max_output_spin.setSingleStep(1000)
@@ -8093,6 +8122,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.agent_token_edit.setText(config.agent_server_token)
         self.agent_allow_patches_check.setChecked(config.agent_allow_patches)
         self.agent_allow_scripts_check.setChecked(config.agent_allow_scripts)
+        self.agent_allow_debug_check.setChecked(config.agent_allow_debug)
         self.agent_max_output_spin.setValue(config.agent_max_output_chars)
 
     def _on_restore_defaults(self):
@@ -8175,6 +8205,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.agent_server_token = self.agent_token_edit.text().strip()
         cfg.agent_allow_patches = self.agent_allow_patches_check.isChecked()
         cfg.agent_allow_scripts = self.agent_allow_scripts_check.isChecked()
+        cfg.agent_allow_debug = self.agent_allow_debug_check.isChecked()
         cfg.agent_max_output_chars = self.agent_max_output_spin.value()
         cfg._validate()
         self.result_config = cfg
@@ -12383,6 +12414,368 @@ def _agent_impl_run_ida_script(args):
     return {"result": serializable, "stdout": buf.getvalue()}
 
 
+# --- debugger tools ---------------------------------------------------------
+# These expose IDA's debugger (ida_dbg) to the agent so it can do dynamic
+# analysis: inspect a live process (state, registers, memory, threads,
+# stack, breakpoints) and drive it (start/attach, suspend, step, run-to,
+# breakpoints, register writes). The read-only tools are always available
+# and simply report "no process is being debugged"; the control tools are
+# gated by agent_allow_debug (off by default) because they act on a live
+# process.
+#
+# IDA debugger control calls are ASYNCHRONOUS: they post a request and
+# return immediately. Each control tool below therefore polls
+# get_process_state() (on the IDA main thread, in 50 ms slices) until the
+# expected state is reached or the timeout expires. While a wait is
+# pending the IDA UI is briefly blocked - acceptable for explicit debugger
+# operations, and it keeps every IDA call on the main thread.
+
+def _agent_dbg_required():
+    if ida_dbg is None:
+        raise _AgentError("ida_dbg is not available in this IDA build")
+
+
+def _agent_dbg_state_name():
+    s = ida_dbg.get_process_state()
+    if s == ida_dbg.DSTATE_SUSP:
+        return "suspended"
+    if s == ida_dbg.DSTATE_RUN:
+        return "running"
+    if s == ida_dbg.DSTATE_NOTASK:
+        return "none"
+    return "unknown(%d)" % s
+
+
+def _agent_dbg_need_suspended():
+    st = _agent_dbg_state_name()
+    if st != "suspended":
+        raise _AgentError("the debugged process is not suspended (state: %s)" % st)
+
+
+def _agent_dbg_wait_state(target, timeout_s):
+    """Poll the process state until it is one of `target` (a state name or
+    a list of them) or the timeout expires. Returns the final state name."""
+    if isinstance(target, str):
+        target = (target,)
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        st = _agent_dbg_state_name()
+        if st in target:
+            return st
+        time.sleep(0.05)
+    return _agent_dbg_state_name()
+
+
+def _agent_dbg_ip():
+    try:
+        v = int(ida_dbg.get_ip_val() or 0)
+    except (TypeError, ValueError):
+        return None
+    return _hex(v) if v else None
+
+
+def _agent_impl_debug_state(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    out = {
+        "debugger_loaded": bool(ida_dbg.is_debugger_on()),
+        "debugger_name": (ida_idd.dbg_get_name() if ida_idd else None) or "",
+        "process_state": st,
+        "can_query": bool(ida_dbg.dbg_can_query()),
+    }
+    if st != "none":
+        out["thread_count"] = int(ida_dbg.get_thread_qty())
+        out["current_thread"] = int(ida_dbg.get_current_thread())
+    if st == "suspended":
+        out["instruction_pointer"] = _agent_dbg_ip()
+        try:
+            sp = int(ida_dbg.get_sp_val() or 0)
+        except (TypeError, ValueError):
+            sp = 0
+        out["stack_pointer"] = _hex(sp) if sp else None
+    return out
+
+
+def _agent_impl_debug_threads(args):
+    _agent_dbg_required()
+    if _agent_dbg_state_name() == "none":
+        raise _AgentError("no process is being debugged")
+    cur = ida_dbg.get_current_thread()
+    out = []
+    for i in range(int(ida_dbg.get_thread_qty())):
+        tid = ida_dbg.getn_thread(i)
+        out.append({"tid": int(tid), "name": ida_dbg.getn_thread_name(i) or "",
+                    "current": tid == cur})
+    return {"threads": out}
+
+
+def _agent_impl_debug_registers(args):
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    tid = args.get("thread")
+    tid = int(tid) if tid is not None else ida_dbg.get_current_thread()
+    regvals = ida_dbg.get_reg_vals(tid)
+    if regvals is None or regvals.size() == 0:
+        raise _AgentError("could not read register values for thread %d" % int(tid))
+    infos = ida_idd.dbg_get_registers() if ida_idd else None
+    regs = {}
+    for i in range(regvals.size()):
+        rv = regvals[i]
+        if rv.rvtype == getattr(ida_idd, "RVT_UNAVAILABLE", 2):
+            continue
+        name, dtype = "reg%d" % i, None
+        if infos and i < len(infos):
+            name = infos[i][0] or name
+            dtype = infos[i][3]
+        try:
+            val = rv.pyval(dtype) if dtype is not None else rv.ival
+        except Exception:
+            val = rv.ival
+        if isinstance(val, (bytes, bytearray)):
+            regs[name] = "0x" + bytes(val).hex()
+        elif isinstance(val, float):
+            regs[name] = val
+        else:
+            try:
+                regs[name] = "0x%x" % int(val)
+            except (TypeError, ValueError):
+                regs[name] = str(val)
+    return {"thread": int(tid), "registers": regs}
+
+
+def _agent_impl_debug_read_memory(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st == "none":
+        raise _AgentError("no process is being debugged")
+    ea = _agent_ea(args, "address")
+    size = max(1, min(65536, int(args.get("size") or 16)))
+    data = ida_idd.dbg_read_memory(ea, size) if ida_idd else None
+    if not data:
+        data = idaapi.get_memstr(ea, size)
+    if not data:
+        raise _AgentError("cannot read %d live bytes at %s (process state: %s)"
+                          % (size, _hex(ea), st))
+    data = bytes(data)
+    ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+    return {"address": _hex(ea), "size": len(data), "hex": data.hex(), "ascii": ascii_}
+
+
+def _agent_impl_debug_memory_map(args):
+    _agent_dbg_required()
+    if ida_idd is None:
+        raise _AgentError("ida_idd is not available in this IDA build")
+    info = ida_idd.dbg_get_memory_info()
+    if not info:
+        raise _AgentError("no process is being debugged")
+    regions = [{"start": _hex(t[0]), "end": _hex(t[1]), "name": t[2] or "",
+                "class": t[3] or "", "base": _hex(t[4]) if t[4] else None,
+                "bitness": t[5], "perm": t[6]} for t in info]
+    return {"regions": regions}
+
+
+def _agent_impl_debug_breakpoints(args):
+    _agent_dbg_required()
+    out = []
+    for i in range(int(ida_dbg.get_bpt_qty())):
+        bpt = ida_dbg.bpt_t()
+        if not ida_dbg.getn_bpt(i, bpt):
+            continue
+        out.append({"address": _hex(bpt.ea), "type": int(bpt.type),
+                    "enabled": bool(bpt.enabled()), "active": bool(bpt.is_active()),
+                    "pass_count": int(bpt.pass_count)})
+    return {"count": len(out), "breakpoints": out}
+
+
+def _agent_impl_debug_stack_trace(args):
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    if ida_idd is None:
+        raise _AgentError("ida_idd is not available in this IDA build")
+    tid = args.get("thread")
+    tid = int(tid) if tid is not None else ida_dbg.get_current_thread()
+    limit = max(1, min(200, int(args.get("limit") or 50)))
+    trace = ida_idd.call_stack_t()
+    if not ida_dbg.collect_stack_trace(tid, trace):
+        raise _AgentError("could not collect a stack trace for thread %d" % int(tid))
+    frames = []
+    for frame in trace:
+        if len(frames) >= limit:
+            break
+        ea = frame.callea
+        entry = {"return_address": _hex(ea)}
+        name = idaapi.get_name(ea)
+        if name:
+            entry["name"] = name
+        if frame.funcok:
+            entry["function"] = _hex(frame.funcea)
+        mi = ida_idd.modinfo_t()
+        if ida_dbg.get_module_info(ea, mi):
+            entry["module"] = os.path.basename(mi.name or "")
+        frames.append(entry)
+    return {"thread": int(tid), "frames": frames}
+
+
+# --- debugger control (gated by agent_allow_debug) --------------------------
+
+def _agent_impl_debug_start(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st != "none":
+        raise _AgentError("a process is already being debugged (state: %s)" % st)
+    pid = args.get("attach_pid")
+    if pid is not None:
+        ok = ida_dbg.attach_process(int(pid), ida_dbg.dbg_process_attach)
+        if ok == -3:
+            raise _AgentError("attaching is not supported by the loaded debugger")
+        if ok < 0:
+            raise _AgentError("attach_process(%d) failed (code %d)" % (int(pid), ok))
+        if ok == 0:
+            raise _AgentError("the attach was cancelled by the user in the IDA dialog")
+    else:
+        path = (args.get("path") or "").strip()
+        if not path:
+            raise _AgentError("provide 'path' (start a new process) or "
+                              "'attach_pid' (attach to a running one)")
+        ok = ida_dbg.start_process(path, args.get("args") or "",
+                                   args.get("working_dir") or "")
+        if ok == -1:
+            raise _AgentError("could not create the process (check the path; "
+                              "a debugger backend must be selected: IDA menu "
+                              "Debug > Select debugger)")
+        if ok == 0:
+            raise _AgentError("starting the process was cancelled by the user")
+    st = _agent_dbg_wait_state(("suspended", "running"), 30)
+    return {"started": True, "process_state": st}
+
+
+def _agent_impl_debug_suspend(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st != "running":
+        raise _AgentError("the process is not running (state: %s)" % st)
+    if not ida_dbg.suspend_process():
+        raise _AgentError("suspend_process() failed")
+    st = _agent_dbg_wait_state("suspended", 10)
+    return {"process_state": st, "suspended": st == "suspended",
+            "instruction_pointer": _agent_dbg_ip() if st == "suspended" else None}
+
+
+def _agent_impl_debug_continue(args):
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    if not ida_dbg.continue_process():
+        raise _AgentError("continue_process() failed")
+    return {"continued": True,
+            "note": "the process is now running; poll getDebugState until "
+                    "process_state is 'suspended' again (breakpoint hit or "
+                    "exception)"}
+
+
+def _agent_impl_debug_step(args):
+    kind = (args.get("kind") or "into")
+    if kind not in ("into", "over", "out"):
+        raise _AgentError("'kind' must be 'into', 'over' or 'out'")
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    fn = {"into": ida_dbg.step_into, "over": ida_dbg.step_over,
+          "out": ida_dbg.step_until_ret}[kind]
+    if not fn():
+        raise _AgentError("step request failed")
+    st = _agent_dbg_wait_state("suspended", 10)
+    return {"stepped": kind, "process_state": st,
+            "instruction_pointer": _agent_dbg_ip() if st == "suspended" else None}
+
+
+def _agent_impl_debug_run_to(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st == "none":
+        raise _AgentError("no process is being debugged")
+    ea = _agent_ea(args, "address")
+    timeout = max(1, min(300, int(args.get("timeout_seconds") or 30)))
+    if not ida_dbg.run_to(ea):
+        raise _AgentError("run_to() failed")
+    st = _agent_dbg_wait_state("suspended", timeout)
+    out = {"target": _hex(ea), "process_state": st}
+    if st == "suspended":
+        ip = _agent_dbg_ip()
+        out["instruction_pointer"] = ip
+        out["reached"] = (ip == _hex(ea))
+    else:
+        out["reached"] = False
+        out["note"] = "timed out waiting for the process to stop"
+    return out
+
+
+def _agent_impl_debug_detach(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st == "none":
+        raise _AgentError("no process is being debugged")
+    if not ida_dbg.detach_process():
+        raise _AgentError("detach_process() failed")
+    st = _agent_dbg_wait_state("none", 15)
+    return {"process_state": st, "detached": st == "none"}
+
+
+def _agent_impl_debug_exit(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st == "none":
+        raise _AgentError("no process is being debugged")
+    if not ida_dbg.exit_process():
+        raise _AgentError("exit_process() failed")
+    st = _agent_dbg_wait_state("none", 15)
+    return {"process_state": st, "exited": st == "none"}
+
+
+def _agent_impl_debug_set_breakpoint(args):
+    _agent_dbg_required()
+    st = _agent_dbg_state_name()
+    if st == "none":
+        raise _AgentError("no process is being debugged (start or attach one first)")
+    ea = _agent_ea(args, "address")
+    if ida_dbg.exist_bpt(ea):
+        return {"address": _hex(ea), "already_set": True}
+    if not ida_dbg.add_bpt(ea):
+        raise _AgentError("add_bpt failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "set": True}
+
+
+def _agent_impl_debug_remove_breakpoint(args):
+    _agent_dbg_required()
+    ea = _agent_ea(args, "address")
+    if not ida_dbg.exist_bpt(ea):
+        raise _AgentError("no breakpoint at %s" % _hex(ea))
+    if not ida_dbg.del_bpt(ea):
+        raise _AgentError("del_bpt failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "removed": True}
+
+
+def _agent_impl_debug_set_register(args):
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    name = (args.get("name") or "").strip()
+    if not name:
+        raise _AgentError("missing required argument 'name' (e.g. 'rax')")
+    raw = args.get("value")
+    if isinstance(raw, bool) or raw is None:
+        raise _AgentError("missing required argument 'value' (integer or hex string)")
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, str):
+        try:
+            val = int(raw, 0)
+        except ValueError:
+            raise _AgentError("'value' is not a valid integer: %r" % raw)
+    else:
+        raise _AgentError("'value' must be an integer or a hex/dec string")
+    if not ida_dbg.set_reg_val(name, val):
+        raise _AgentError("set_reg_val(%s) failed" % name)
+    return {"register": name, "value": "0x%x" % (val & 0xFFFFFFFFFFFFFFFF)}
+
+
 # --- tool registry ---------------------------------------------------------
 # Single source of truth: dispatch AND the /tools self-description both come
 # from here. "gated" ties a tool to an extra config flag (patches/scripts).
@@ -12556,7 +12949,57 @@ AGENT_TOOLS = {
                     "fn": _agent_impl_get_bookmarks},
     "deleteBookmark": {"description": "Delete the bookmark at an address.",
                       "params": {"address": "address or name"}, "fn": _agent_impl_delete_bookmark},
+    # debugger (live process; read-only tools always available, control tools
+    # gated by agent_allow_debug)
+    "getDebugState": {"description": "Debugger status: loaded backend, process state (running/suspended/none), current thread, instruction/stack pointers.",
+                     "params": {}, "fn": _agent_impl_debug_state},
+    "getThreads": {"description": "Threads of the debugged process (id, name, current).",
+                  "params": {}, "fn": _agent_impl_debug_threads},
+    "getLiveRegisters": {"description": "Live register values of a thread (process must be suspended).",
+                        "params": {"thread": "thread id (optional, default current)"},
+                        "fn": _agent_impl_debug_registers},
+    "getLiveMemory": {"description": "Read live memory of the debugged process (hex + ASCII).",
+                     "params": {"address": "address", "size": "int <= 65536 (default 16)"},
+                     "fn": _agent_impl_debug_read_memory},
+    "getLiveMemoryMap": {"description": "Memory regions of the debugged process.",
+                        "params": {}, "fn": _agent_impl_debug_memory_map},
+    "getBreakpoints": {"description": "All debugger breakpoints.", "params": {},
+                      "fn": _agent_impl_debug_breakpoints},
+    "getStackTrace": {"description": "Return-address stack trace of a thread (process must be suspended).",
+                     "params": {"thread": "thread id (optional, default current)",
+                                "limit": "int frames (default 50, max 200)"},
+                     "fn": _agent_impl_debug_stack_trace},
     # gated
+    "debugStart": {"description": "Start the debuggee (path/args) or attach to a running process (attach_pid). GATED by agent_allow_debug (off by default).",
+                  "params": {"path": "executable path (for start)", "args": "command line args (optional)",
+                             "working_dir": "starting directory (optional)",
+                             "attach_pid": "pid to attach to (alternative to path)"},
+                  "gated": "debug", "fn": _agent_impl_debug_start},
+    "debugSuspend": {"description": "Suspend the running debuggee and wait for it to stop. GATED by agent_allow_debug (off by default).",
+                    "params": {}, "gated": "debug", "fn": _agent_impl_debug_suspend},
+    "debugContinue": {"description": "Resume the debuggee; it runs until a breakpoint or exception. GATED by agent_allow_debug (off by default).",
+                     "params": {}, "gated": "debug", "fn": _agent_impl_debug_continue},
+    "debugStep": {"description": "Step the current thread: into / over / out (step until return). GATED by agent_allow_debug (off by default).",
+                 "params": {"kind": "'into' | 'over' | 'out' (default 'into')"},
+                 "gated": "debug", "fn": _agent_impl_debug_step},
+    "debugRunTo": {"description": "Run until an address is reached (temporary breakpoint), then stop. GATED by agent_allow_debug (off by default).",
+                  "params": {"address": "target address or name",
+                             "timeout_seconds": "int (default 30, max 300)"},
+                  "gated": "debug", "fn": _agent_impl_debug_run_to},
+    "debugDetach": {"description": "Detach the debugger (the process keeps running). GATED by agent_allow_debug (off by default).",
+                   "params": {}, "gated": "debug", "fn": _agent_impl_debug_detach},
+    "debugExit": {"description": "Terminate the debugged process. GATED by agent_allow_debug (off by default).",
+                 "params": {}, "gated": "debug", "fn": _agent_impl_debug_exit},
+    "setBreakpoint": {"description": "Set a software breakpoint at an address. GATED by agent_allow_debug (off by default).",
+                     "params": {"address": "address or name"},
+                     "gated": "debug", "fn": _agent_impl_debug_set_breakpoint},
+    "removeBreakpoint": {"description": "Remove the breakpoint at an address. GATED by agent_allow_debug (off by default).",
+                        "params": {"address": "address or name"},
+                        "gated": "debug", "fn": _agent_impl_debug_remove_breakpoint},
+    "setRegisterValue": {"description": "Write a value to a register (process must be suspended). GATED by agent_allow_debug (off by default).",
+                        "params": {"name": "register name (e.g. 'rax')",
+                                   "value": "integer or hex string"},
+                        "gated": "debug", "fn": _agent_impl_debug_set_register},
     "patchBytes": {"description": "Patch bytes in the IDB. GATED by agent_allow_patches (off by default).",
                   "params": {"address": "address or name", "hex": "hex bytes to write"},
                   "gated": "patches", "fn": _agent_impl_patch_bytes},
@@ -12574,10 +13017,14 @@ def _agent_dispatch(server, name, args):
     if not isinstance(args, dict):
         return 400, {"ok": False, "error": "'args' must be an object"}
     gate = tool.get("gated")
-    if gate == "patches" and not server._config.agent_allow_patches:
-        return 403, {"ok": False, "error": "patchBytes is disabled (agent_allow_patches is off)"}
-    if gate == "scripts" and not server._config.agent_allow_scripts:
-        return 403, {"ok": False, "error": "runIdaScript is disabled (agent_allow_scripts is off)"}
+    if gate:
+        gate_flag = {"patches": "agent_allow_patches",
+                     "scripts": "agent_allow_scripts",
+                     "debug": "agent_allow_debug"}.get(gate)
+        if gate_flag and not getattr(server._config, gate_flag, False):
+            return 403, {"ok": False,
+                         "error": "%s is disabled (the '%s' setting is off)"
+                                 % (name, gate_flag)}
     try:
         result = _run_on_ida(lambda: tool["fn"](args))
     except _AgentTimeout as exc:

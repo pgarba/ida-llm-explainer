@@ -73,6 +73,36 @@ If `GET /health` fails, IDA (or the plugin) is not running — stop and say so.
    does and what you changed. The human sees all changes in IDA and can undo
    anything.
 
+### Dynamic analysis (when a process is being debugged)
+
+`getDebugState` tells you whether a live process is attached
+(`process_state`: `running` / `suspended` / `none`). If one is, you can
+confirm static hypotheses against live values:
+
+1. **When stopped** (`suspended`): `getLiveRegisters` for the register file,
+   `getStackTrace` for the call chain, `getLiveMemory` to dereference the
+   pointers you see in registers (it reads the *process*, so addresses
+   outside the IDB work too), `getLiveMemoryMap` to see the process layout.
+2. **Feed live values back into the database** — a register that always holds
+   a `this` pointer, a stack slot that is a length: name and type the
+   corresponding variables (`renameVariable`, `setVariableType`,
+   `setFunctionPrototype`). Dynamic evidence is the strongest confirmation a
+   name is right.
+3. **Driving the process** (needs the human to have enabled the debug gate):
+   `setBreakpoint` at a function entry → `debugContinue` → poll
+   `getDebugState` until `suspended` again → inspect → repeat.
+   `debugStep` (`into`/`over`/`out`) for stepping, `debugRunTo` to jump to an
+   address, `debugSuspend` to stop a running process. When done, leave the
+   process in a sane state (`debugContinue` or `debugDetach`) and say so in
+   your report.
+4. **The process must be `suspended`** to read registers or stack traces;
+   `readMemory`-style reads may work while running. If a tool says
+   "not suspended", the process is running — `debugSuspend` first.
+5. **While the process is `running`**, only `getDebugState` is meaningful —
+   everything else needs it stopped. Do not busy-poll: a few `getDebugState`
+   calls spaced out are enough; the process stops when it hits a breakpoint
+   or an exception.
+
 ## 4. Tool catalog
 
 ### Session / meta
@@ -154,11 +184,32 @@ If `GET /health` fails, IDA (or the plugin) is not running — stop and say so.
 | `getBookmarks` | — | list bookmarks |
 | `deleteBookmark` | `address` | delete a bookmark |
 
+### Debugger — live state (read-only, always available)
+| Tool | Args | Purpose |
+|---|---|---|
+| `getDebugState` | — | backend, process state (`running`/`suspended`/`none`), current thread, IP/SP |
+| `getThreads` | — | threads of the debugged process |
+| `getLiveRegisters` | `thread?` | live register values (needs `suspended`) |
+| `getLiveMemory` | `address`, `size?` | live process memory (hex + ASCII) |
+| `getLiveMemoryMap` | — | the process's memory regions |
+| `getBreakpoints` | — | all debugger breakpoints |
+| `getStackTrace` | `thread?`, `limit?` | return-address stack trace (needs `suspended`) |
+
 ### Gated (return 403 unless the human enabled them)
 | Tool | Args | Purpose |
 |---|---|---|
 | `patchBytes` | `address`, `hex` | write bytes into the IDB |
 | `runIdaScript` | `code` | run arbitrary Python with IDA imports; set a variable named `result` to return it |
+| `debugStart` | `path`, `args?`, `working_dir?` **or** `attach_pid` | start the debuggee or attach to a running process |
+| `debugSuspend` | — | stop a running process (waits for it) |
+| `debugContinue` | — | resume; runs until a breakpoint/exception |
+| `debugStep` | `kind: into\|over\|out` | step the current thread |
+| `debugRunTo` | `address`, `timeout_seconds?` | run until an address is reached |
+| `debugDetach` | — | detach (process keeps running) |
+| `debugExit` | — | terminate the debugged process |
+| `setBreakpoint` | `address` | set a software breakpoint |
+| `removeBreakpoint` | `address` | remove a breakpoint |
+| `setRegisterValue` | `name`, `value` | write a register (needs `suspended`) |
 
 If a gated tool returns 403, do **not** try to work around it — say what you
 would have done and let the human decide.
