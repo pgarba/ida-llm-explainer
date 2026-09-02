@@ -138,8 +138,9 @@ _stub("ida_kernwin", MFF_FAST=1, MFF_WRITE=2, msg=lambda s: print("[msg]", s),
       get_screen_ea=lambda: 0x1000)
 for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_loader",
               "ida_name", "ida_nalt", "ida_segment", "ida_typeinf", "ida_ua",
-              "ida_xref", "ida_x86", "ida_arm"):
+              "ida_xref", "ida_x86", "ida_arm", "ida_entry", "ida_strlist"):
     _stub(extra)
+_stub("ida_netnode", BADNODE=0xFFFFFFFF)
 _stub("ida_funcs", get_func=lambda ea: None, get_func_name=lambda ea: "sub_%X" % ea)
 _stub("ida_graph", GraphViewer=_dummy_class("GraphViewer"))
 
@@ -192,6 +193,7 @@ _stub("ida_dbg",
       getn_thread=lambda n: 1,
       getn_thread_name=lambda n: "main",
       get_current_thread=lambda: 1,
+      select_thread=lambda tid: True,
       get_ip_val=lambda: 0x140001000,
       get_sp_val=lambda: 0x200000000,
       get_reg_vals=lambda tid, clsmask=-1: _StubRegvals([_StubRegval(0x11223344), _StubRegval(0x55)]),
@@ -220,6 +222,7 @@ _stub("ida_idd",
       dbg_get_name=lambda: "stubdbg",
       dbg_get_registers=lambda: [("rax", 0, 0, 5, None, 0), ("rbx", 0, 0, 5, None, 0)],
       dbg_read_memory=lambda ea, sz: b"hello-live",
+      dbg_write_memory=lambda ea, buf: True,
       dbg_get_memory_info=lambda: [(0x140000000, 0x140001000, "stub.exe", "TEXT", 0x140000000, 2, "r-x")],
       call_stack_t=_StubCallStack,
       modinfo_t=_dummy_class("modinfo_t"),
@@ -350,7 +353,7 @@ check("estimate_prompt_tokens ~2000", abs(est - 2000.0) < 10)
 # 3. config fields
 cfg = L.PluginConfig(server_urls=[URL], model="test-model",
                      auto_compact_enabled=True, auto_compact_threshold=0.9,
-                     server_context_size=0, chars_per_token=3.5)
+                     server_context_size=0, chars_per_token=3.5, max_tokens=200)
 check("config defaults round-trip", cfg.auto_compact_enabled and abs(cfg.auto_compact_threshold - 0.9) < 1e-9)
 bad = L.PluginConfig(auto_compact_threshold=5.0)
 check("threshold clamped to <=1.0", bad.auto_compact_threshold == 1.0)
@@ -364,6 +367,43 @@ runner.messages = [{"role": "system", "content": "s" * 1000},
                    {"role": "assistant", "content": "a" * 1000},
                    {"role": "user", "content": "q" * 1000}]
 check("no compact under threshold", runner._maybe_compact() is False)
+
+# 4b. headroom must account for max_tokens, not just the fraction: a large
+# reply budget relative to a small context window should force an earlier
+# (tighter) limit than the flat 90% threshold would alone.
+cfg_big_reply = L.PluginConfig(server_urls=[URL], model="test-model",
+                               auto_compact_enabled=True, auto_compact_threshold=0.9,
+                               server_context_size=0, chars_per_token=3.5, max_tokens=1900)
+runner_headroom = _new_runner(cfg_big_reply)
+runner_headroom._detect_context_size()
+check("limit tightened by max_tokens",
+      runner_headroom._compact_limit_tokens() == max(1000, CONTEXT_SIZE - 1900))
+runner_headroom.messages = [{"role": "system", "content": "s" * 1000},
+                            {"role": "user", "content": "u" * 1000},
+                            {"role": "assistant", "content": "a" * 1000},
+                            {"role": "user", "content": "q" * 1000}]  # ~1143 tokens > 1000-token limit
+check("large max_tokens forces earlier compaction",
+      runner_headroom._maybe_compact() is True)
+
+# 4c. force_compact(): manual trigger, idle-only, does not re-issue a
+# request when there is no pending user turn to answer.
+runner_manual = _new_runner(cfg)
+runner_manual._detect_context_size()
+runner_manual.messages = [{"role": "system", "content": "sys"},
+                          {"role": "user", "content": "u" * 500},
+                          {"role": "assistant", "content": "reply"},
+                          {"role": "user", "content": "another question"}]
+check("force_compact starts when idle", runner_manual.force_compact() is True)
+import time
+for _ in range(100):
+    if not runner_manual._compacting:
+        break
+    time.sleep(0.05)
+check("force_compact does not spawn a worker", runner_manual.worker is None)
+runner_short = _new_runner(cfg)
+runner_short.messages = [{"role": "system", "content": "sys"},
+                         {"role": "user", "content": "u"}]
+check("force_compact no-ops with too little history", runner_short.force_compact() is False)
 
 # 5. runner: over threshold -> compact path (fake server answers the
 #    summarizer request synchronously; execute_sync stub runs inline)

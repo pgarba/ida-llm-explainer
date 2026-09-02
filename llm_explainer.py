@@ -207,6 +207,7 @@ import idc
 import ida_kernwin
 import ida_auto
 import ida_bytes
+import ida_entry
 import ida_funcs
 import ida_graph
 import ida_idp
@@ -214,7 +215,9 @@ import ida_lines
 import ida_name
 import ida_nalt
 import ida_loader
+import ida_netnode
 import ida_segment
+import ida_strlist
 import ida_typeinf
 import ida_ua
 import ida_xref
@@ -228,11 +231,6 @@ try:
     import ida_ida
 except ImportError:
     ida_ida = None
-
-try:
-    import ida_idaapi
-except ImportError:
-    ida_idaapi = None
 
 try:
     import ida_bookmark
@@ -253,7 +251,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.12.0"
+PLUGIN_VERSION = "1.12.1"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -793,7 +791,10 @@ DEFAULT_CONFIG = {
     # keep working instead of overflowing the window.
     "auto_compact_enabled": True,
     # Fraction of the server context at which compaction triggers (0.9 =
-    # 90%, leaving headroom for the model's reply).
+    # 90%, leaving headroom for the model's reply). The actual trigger is
+    # the TIGHTER of this fraction and (context_size - max_tokens), so a
+    # large configured reply size on a small context window still gets a
+    # reserve that actually fits the reply (see _compact_limit_tokens).
     "auto_compact_threshold": 0.9,
     # Server context window in tokens. 0 = auto-detect from the server's
     # /v1/models endpoint (llama.cpp reports context.size per model). Set
@@ -5542,6 +5543,7 @@ class ConversationRunner(object):
         self._context_size = None  # server context in tokens (None = unknown)
         self._cpt = float(getattr(config, "chars_per_token", 3.5))
         self._compacting = False
+        self._compact_reissue = False  # re-send the request once compaction finishes?
         self._last_sent_chars = 0
         # Dialog UIs set this to (est_tokens, context_size, tokens_per_sec)
         # -> None to show a live "context: N%" gauge; (0, 0, ...) means the
@@ -5648,6 +5650,12 @@ class ConversationRunner(object):
         # re-triggering while a summarization request is in flight.
         if self.config.auto_compact_enabled and not self._compacting and self._maybe_compact():
             return
+        self._send_now()
+
+    def _send_now(self):
+        """Actually dispatch self.messages to the model. Split out of
+        _issue_request so the sync-truncate path in _maybe_compact can jump
+        straight here instead of recursing back through the compact check."""
         self._last_sent_chars = sum(len(m.get("content") or "") for m in self.messages)
         self._notify_context_usage()
         self.worker = LlamaStreamWorker(
@@ -5703,6 +5711,17 @@ class ConversationRunner(object):
             self.server_url, self.config.model, self.config.api_key
         )
 
+    def _compact_limit_tokens(self):
+        """The prompt-token ceiling that triggers/targets compaction: the
+        tighter of the configured fraction of the context window and
+        (context window - reply budget). The fraction alone isn't enough -
+        on a small context window with a large configured max_tokens, a
+        flat 10% reserve can be smaller than the reply itself needs, so the
+        reserve must also fit config.max_tokens."""
+        by_fraction = int(self._context_size * self.config.auto_compact_threshold)
+        by_reply_budget = self._context_size - self.config.max_tokens
+        return max(1000, min(by_fraction, by_reply_budget))
+
     def _maybe_compact(self):
         """Check the current prompt against the server's context window.
         Returns True (and starts shrinking) when it is at/over the
@@ -5710,7 +5729,7 @@ class ConversationRunner(object):
         the post-compact path re-enters _issue_request itself."""
         if not self._context_size:
             return False
-        limit_tokens = int(self._context_size * self.config.auto_compact_threshold)
+        limit_tokens = self._compact_limit_tokens()
         est_tokens = estimate_prompt_tokens(self.messages, self._cpt)
         if est_tokens < limit_tokens:
             return False
@@ -5723,12 +5742,30 @@ class ConversationRunner(object):
                 "truncating context..." % (pct, self._context_size)
             )
             self._hard_truncate(limit_tokens)
+            self._send_now()
             return True
         self._on_status(
             "Prompt is ~%d%% of the server's %d-token context window; "
             "compacting conversation..." % (pct, self._context_size)
         )
         self._compacting = True
+        self._compact_reissue = True
+        threading.Thread(target=self._compact_thread, daemon=True).start()
+        return True
+
+    def force_compact(self):
+        """Manually triggered compaction (e.g. a 'Compact now' button),
+        bypassing the threshold check. No-ops quietly if a request/compact
+        is already in flight or there's no history worth summarizing."""
+        if self._compacting or self.worker is not None:
+            self._on_status("Busy - try again once the current request finishes.")
+            return False
+        if len(self.messages) <= 3:
+            self._on_status("Nothing to compact yet.")
+            return False
+        self._on_status("Compacting conversation...")
+        self._compacting = True
+        self._compact_reissue = False
         threading.Thread(target=self._compact_thread, daemon=True).start()
         return True
 
@@ -5772,11 +5809,14 @@ class ConversationRunner(object):
         self._compacting = False
         if self._closed:
             return 0
-        limit_tokens = int(self._context_size * self.config.auto_compact_threshold)
+        reissue = self._compact_reissue
+        self._compact_reissue = False
+        limit_tokens = self._compact_limit_tokens()
         if summary and summary.strip():
             self._apply_summary(summary.strip())
             self._on_status(
-                "Conversation compacted (%d-char summary); resuming..." % len(summary)
+                "Conversation compacted (%d-char summary)%s"
+                % (len(summary), "; resuming..." if reissue else ".")
             )
         else:
             self._on_status("Auto-compact summarization failed; eliding older messages instead.")
@@ -5786,7 +5826,10 @@ class ConversationRunner(object):
         # request actually fits.
         if estimate_prompt_tokens(self.messages, self._cpt) >= limit_tokens:
             self._hard_truncate(limit_tokens)
-        self._issue_request()
+        if reissue:
+            self._issue_request()
+        else:
+            self._notify_context_usage()
 
     def _apply_summary(self, summary):
         """Replace the history with [system, user(summary)] and re-attach
@@ -6537,6 +6580,14 @@ class ExplainResultDialog(QtWidgets.QDialog):
             "history is summarized so the conversation can continue."
         )
         status_layout.addWidget(self.context_label)
+        self.compact_button = QtWidgets.QPushButton("Compact now")
+        self.compact_button.setToolTip(
+            "Summarize the conversation so far to free up context space, "
+            "without waiting for the auto-compact threshold."
+        )
+        self.compact_button.clicked.connect(self.on_compact_now)
+        self.compact_button.setEnabled(False)
+        status_layout.addWidget(self.compact_button)
         layout.addLayout(status_layout)
 
         self.stream_edit = QtWidgets.QPlainTextEdit()
@@ -6692,9 +6743,23 @@ class ExplainResultDialog(QtWidgets.QDialog):
         self._gauge_timer = QtCore.QTimer(self)
         self._gauge_timer.setInterval(2000)
         self._gauge_timer.timeout.connect(self.runner.refresh_context_gauge)
+        self._gauge_timer.timeout.connect(self._refresh_compact_button)
         self._gauge_timer.start()
         self._begin_request("Querying model...")
         self.runner.start(self._on_conversation_result, self._on_conversation_error)
+
+    def on_compact_now(self):
+        self.runner.force_compact()
+        self._refresh_compact_button()
+
+    def _refresh_compact_button(self):
+        try:
+            self.compact_button.setEnabled(
+                not self.runner._compacting and self.runner.worker is None
+                and len(self.runner.messages) > 3
+            )
+        except RuntimeError:
+            pass  # widget already destroyed
 
     def _on_context_usage(self, est_tokens, context_size, tps=None):
         """Live context-window gauge, refreshed by the runner before every
@@ -7116,6 +7181,14 @@ class CodeGenDialog(QtWidgets.QDialog):
             "history is summarized so the conversation can continue."
         )
         status_layout.addWidget(self.context_label)
+        self.compact_button = QtWidgets.QPushButton("Compact now")
+        self.compact_button.setToolTip(
+            "Summarize the conversation so far to free up context space, "
+            "without waiting for the auto-compact threshold."
+        )
+        self.compact_button.clicked.connect(self.on_compact_now)
+        self.compact_button.setEnabled(False)
+        status_layout.addWidget(self.compact_button)
         layout.addLayout(status_layout)
 
         self.tabs = QtWidgets.QTabWidget()
@@ -7222,9 +7295,23 @@ class CodeGenDialog(QtWidgets.QDialog):
         self._gauge_timer = QtCore.QTimer(self)
         self._gauge_timer.setInterval(2000)
         self._gauge_timer.timeout.connect(self.runner.refresh_context_gauge)
+        self._gauge_timer.timeout.connect(self._refresh_compact_button)
         self._gauge_timer.start()
         self._begin_request("Generating C source...")
         self.runner.start(self._on_result, self._on_error)
+
+    def on_compact_now(self):
+        self.runner.force_compact()
+        self._refresh_compact_button()
+
+    def _refresh_compact_button(self):
+        try:
+            self.compact_button.setEnabled(
+                not self.runner._compacting and self.runner.worker is None
+                and len(self.runner.messages) > 3
+            )
+        except RuntimeError:
+            pass  # widget already destroyed
 
     def _on_context_usage(self, est_tokens, context_size, tps=None):
         """Live context-window gauge, refreshed by the runner before every
@@ -11452,7 +11539,10 @@ def _run_on_ida(fn, timeout_ms=AGENT_CALL_TIMEOUT_MS):
             error.append(exc)
 
     # IDA 9.x execute_sync(callable, mask) takes no timeout parameter.
-    ok = ida_kernwin.execute_sync(_wrap, ida_kernwin.MFF_FAST)
+    # MFF_WRITE (not MFF_FAST) is required here: nearly every tool touches
+    # the database (reads included need the same serialization guarantee),
+    # and MFF_FAST must never touch the database per IDA's own contract.
+    ok = ida_kernwin.execute_sync(_wrap, ida_kernwin.MFF_WRITE)
     if not ok:
         raise _AgentTimeout(
             "IDA main thread did not respond within %ds (a long operation or "
@@ -11577,20 +11667,20 @@ def _agent_lvar_rows(f, only_args):
     return out
 
 
-def _agent_struct_dump(sid):
-    s = idaapi.get_struc(sid)
+def _agent_struct_dump(tid):
+    """Dump a struct's fields via the modern type system (IDA 9.x local
+    types) - the classic idaapi.get_struc*/get_struc_member API this used
+    to call was removed in IDA 9.x."""
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_type_by_tid(tid):
+        return {"name": "", "size": 0, "fields": []}
+    udt = ida_typeinf.udt_type_data_t()
     fields = []
-    i = 0
-    while True:
-        off = idaapi.get_struc_off_by_idx(sid, i)
-        if off == idaapi.BADADDR:
-            break
-        m = idaapi.get_struc_member(sid, off)
-        if m is None:
-            break
-        fields.append({"offset": off, "size": m.size, "name": m.name or "", "type": str(m.tif)})
-        i += 1
-    return {"name": idaapi.get_struc_name(s) or "", "size": idaapi.get_struc_size(s), "fields": fields}
+    if tif.get_udt_details(udt):
+        for m in udt:
+            fields.append({"offset": m.offset // 8, "size": m.size // 8,
+                            "name": m.name or "", "type": str(m.type)})
+    return {"name": tif.get_type_name() or "", "size": tif.get_size(), "fields": fields}
 
 
 def _truncate_result(obj, max_chars):
@@ -11708,22 +11798,71 @@ def _agent_impl_function_info(args):
     return _agent_func_info(_agent_get_func(args))
 
 
+_STRING_ENCODING_ALIASES = {
+    "utf8": "STRTYPE_C", "ascii": "STRTYPE_C", "c": "STRTYPE_C",
+    "utf16": "STRTYPE_C_16", "unicode": "STRTYPE_C_16", "c16": "STRTYPE_C_16",
+    "utf32": "STRTYPE_C_32", "c32": "STRTYPE_C_32",
+    "pascal": "STRTYPE_PASCAL", "pascal16": "STRTYPE_PASCAL_16", "pascal32": "STRTYPE_PASCAL_32",
+}
+
+
+def _resolve_string_encodings(names):
+    out = []
+    for n in names:
+        attr = _STRING_ENCODING_ALIASES.get((n or "").strip().lower())
+        if attr is None:
+            raise _AgentError(
+                "unknown string encoding: %r (expected one of %s)"
+                % (n, ", ".join(sorted(set(_STRING_ENCODING_ALIASES)))))
+        out.append(getattr(ida_nalt, attr))
+    return out
+
+
 def _agent_impl_strings(args):
     filt = (args.get("filter") or "").lower()
     min_len = max(0, int(args.get("min_length") or 0))
     offset = max(0, int(args.get("offset") or 0))
     limit = _agent_limit(args)
+    # ida_strlist.get_strlist_qty() reuses the saved/cached string list
+    # when one already exists; idautils.Strings() instead calls
+    # build_strlist() unconditionally on every instantiation, forcing a
+    # full re-scan of the binary on every getStrings call - expensive on
+    # large binaries. Only rebuild when the caller explicitly asks, or when
+    # the requested encodings aren't already covered by the current setup.
+    opts = ida_strlist.get_strlist_options()
+    encodings = args.get("encodings")
+    if encodings:
+        wanted = sorted(set(_resolve_string_encodings(encodings)))
+    else:
+        # IDA can scan for multiple encodings in a single build_strlist()
+        # pass, but its own factory default only enables 8-bit C strings,
+        # silently missing every wide-character ("Unicode") string - which
+        # matters a lot on Windows binaries. Default to both.
+        wanted = sorted(set(list(opts.strtypes) + [ida_nalt.STRTYPE_C, ida_nalt.STRTYPE_C_16]))
+    need_rebuild = bool(args.get("refresh")) or sorted(opts.strtypes) != wanted
+    if need_rebuild:
+        opts.strtypes = wanted
+        opts.only_7bit = False  # don't drop real multi-byte UTF-8/UTF-16 text
+        ida_strlist.build_strlist()
     out = []
-    for item in idautils.Strings():
+    qty = ida_strlist.get_strlist_qty()
+    si = ida_strlist.string_info_ex_t()
+    for i in range(qty):
+        if not ida_strlist.get_strlist_item_ex(si, i):
+            continue
         try:
-            value = str(item)
+            if si.type == ida_nalt.STRTYPE_DECOMP and si.decompiler_string:
+                value = si.decompiler_string
+            else:
+                raw = ida_bytes.get_strlit_contents(si.ea, si.length, si.type)
+                value = (raw or b"").decode("utf-8", "replace")
         except Exception:
             value = ""
         if len(value) < min_len:
             continue
         if filt and filt not in value.lower():
             continue
-        out.append({"address": _hex(item.ea), "value": value, "type": item.strtype})
+        out.append({"address": _hex(si.ea), "value": value, "type": si.type})
     total = len(out)
     return {"total": total, "offset": offset, "limit": limit, "strings": out[offset:offset + limit]}
 
@@ -11732,45 +11871,32 @@ def _agent_impl_imports(args):
     modf = (args.get("module") or "").lower()
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
-    i = 0
-    while True:
-        name = ida_nalt.get_import_name(i)
-        if name is None:
-            break
-        module = ""
-        try:
-            module = ida_nalt.get_import_module_name(i) or ""
-        except Exception:
-            try:
-                module = ida_nalt.get_import_module(i) or ""
-            except Exception:
-                module = ""
+    for mod_index in range(ida_nalt.get_import_module_qty()):
+        module = ida_nalt.get_import_module_name(mod_index) or ""
         if modf and modf not in module.lower():
-            i += 1
             continue
-        ea = ida_nalt.get_import_addr(i)
-        out.append({"address": _hex(ea) if ea != idaapi.BADADDR else "", "name": name, "module": module})
-        i += 1
+
+        def _cb(ea, name, ordinal, _module=module):
+            out.append({"address": _hex(ea) if ea != idaapi.BADADDR else "",
+                        "name": name or "", "ordinal": ordinal, "module": _module})
+            return len(out) < limit
+        ida_nalt.enum_import_names(mod_index, _cb)
         if len(out) >= limit:
             break
-    return {"total": len(out), "imports": out}
+    return {"total": len(out), "imports": out[:limit]}
 
 
 def _agent_impl_exports(args):
     filt = (args.get("filter") or "").lower()
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
-    i = 0
-    while True:
-        name = ida_nalt.enum_export_names(i)
-        if name is None:
-            break
+    for ordinal_idx in range(ida_entry.get_entry_qty()):
+        ordinal = ida_entry.get_entry_ordinal(ordinal_idx)
+        name = ida_entry.get_entry_name(ordinal) or ""
         if filt and filt not in name.lower():
-            i += 1
             continue
-        ea = ida_nalt.get_export_addr_by_name(name)
+        ea = ida_entry.get_entry(ordinal)
         out.append({"address": _hex(ea) if ea != idaapi.BADADDR else "", "name": name})
-        i += 1
         if len(out) >= limit:
             break
     return {"total": len(out), "exports": out}
@@ -12067,10 +12193,11 @@ def _agent_impl_globals(args):
     offset = max(0, int(args.get("offset") or 0))
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
-    for ea in idautils.Dirs():
-        name = idaapi.get_name(ea)
+    for ea, name in idautils.Names():
         if not name:
             continue
+        if ida_funcs.get_func(ea) is not None:
+            continue  # function/label names, not globals
         if filt and filt not in name.lower():
             continue
         out.append({"address": _hex(ea), "name": name,
@@ -12085,30 +12212,42 @@ def _agent_impl_variable_at(args):
             "size": idc.get_item_size(ea), "type": idc.get_type(ea) or ""}
 
 
+def _iter_local_types():
+    """Yield (name, tinfo_t) for every named local type (structs, enums,
+    unions, typedefs). Ordinal-based enumeration - IDA 9.x has no flat
+    idaapi.get_struc*/get_enum* API any more; everything lives in the type
+    system now."""
+    count = ida_typeinf.get_ordinal_count(None)
+    for ordinal in range(1, count + 1):
+        name = ida_typeinf.get_numbered_type_name(None, ordinal)
+        if not name:
+            continue
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(ordinal):
+            continue
+        yield name, tif
+
+
 def _agent_impl_list_structs(args):
     filt = (args.get("filter") or "").lower()
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
-    for i in range(idaapi.get_struc_qty()):
-        s = idaapi.get_struc_by_idx(i)
-        if s is None:
-            continue
-        name = idaapi.get_struc_name(s)
-        if not name:
+    for name, tif in _iter_local_types():
+        if not tif.is_struct():
             continue
         if filt and filt not in name.lower():
             continue
-        out.append({"name": name, "size": idaapi.get_struc_size(s),
-                    "id": idaapi.get_struc_id(name)})
+        out.append({"name": name, "size": tif.get_size(),
+                    "id": ida_typeinf.get_named_type_tid(name)})
     return {"total": len(out), "structs": out[:limit]}
 
 
 def _agent_impl_get_struct(args):
     name = _agent_name(args, "name")
-    sid = idaapi.get_struc_id(name)
-    if sid == idaapi.BADADDR:
+    tid = ida_typeinf.get_named_type_tid(name)
+    if tid == idaapi.BADADDR:
         raise _AgentError("struct not found: %s" % name)
-    return _agent_struct_dump(sid)
+    return _agent_struct_dump(tid)
 
 
 def _agent_impl_struct_at(args):
@@ -12119,39 +12258,35 @@ def _agent_impl_struct_at(args):
     if not tif.is_struct():
         return {"address": _hex(ea), "type": str(tif), "struct": None}
     tname = tif.get_type_name()
-    sid = idaapi.get_struc_id(tname) if tname else idaapi.BADADDR
-    if sid == idaapi.BADADDR:
+    tid = ida_typeinf.get_named_type_tid(tname) if tname else idaapi.BADADDR
+    if tid == idaapi.BADADDR:
         return {"address": _hex(ea), "type": str(tif), "struct": None}
-    return {"address": _hex(ea), "type": str(tif), "struct": _agent_struct_dump(sid)}
+    return {"address": _hex(ea), "type": str(tif), "struct": _agent_struct_dump(tid)}
 
 
 def _agent_impl_list_enums(args):
     filt = (args.get("filter") or "").lower()
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
     out = []
-    for i in range(idaapi.get_enum_qty()):
-        e = idaapi.get_enum_by_idx(i)
-        if e is None:
-            continue
-        name = idaapi.get_enum_name(e)
-        if not name:
+    for name, tif in _iter_local_types():
+        if not tif.is_enum():
             continue
         if filt and filt not in name.lower():
             continue
-        out.append({"name": name, "id": idaapi.get_enum_id(name), "size": idaapi.get_enum_size(e)})
+        out.append({"name": name, "id": ida_typeinf.get_named_type_tid(name), "size": tif.get_size()})
     return {"total": len(out), "enums": out[:limit]}
 
 
 def _agent_impl_get_enum(args):
     name = _agent_name(args, "name")
-    eid = idaapi.get_enum_id(name)
-    if eid == idaapi.BADADDR:
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(name) or not tif.is_enum():
         raise _AgentError("enum not found: %s" % name)
-    e = idaapi.get_enum(eid)
+    ei = ida_typeinf.enum_type_data_t()
     members = []
-    for i in range(idaapi.get_enum_size(e)):
-        members.append({"value": idaapi.get_enum_val_by_idx(e, i),
-                        "name": idaapi.get_enum_name_by_idx(e, i) or ""})
+    if tif.get_enum_details(ei):
+        for m in ei:
+            members.append({"value": m.value, "name": m.name or ""})
     return {"name": name, "members": members}
 
 
@@ -12265,7 +12400,7 @@ def _agent_impl_set_function_comment(args):
 def _agent_impl_make_function(args):
     ea = _agent_ea(args, "address")
     end = _agent_opt_ea(args, "end")
-    if ida_funcs.add_func(ea, end if end != idaapi.BADADDR else 0) is None:
+    if not ida_funcs.add_func(ea, end if end != idaapi.BADADDR else 0):
         raise _AgentError("add_func failed at %s" % _hex(ea))
     f = ida_funcs.get_func(ea)
     return {"address": _hex(ea), "end": _hex(f.end_ea) if f else ""}
@@ -12297,6 +12432,17 @@ def _agent_impl_undefine(args):
     return {"address": _hex(ea), "size": size}
 
 
+def _create_data_flag_by_size(size):
+    """ida_bytes.*_flag() lookup by element size, resolved lazily (not at
+    module import time) so this module still imports under a minimal IDA
+    stub that lacks these attributes."""
+    return {
+        1: ida_bytes.byte_flag, 2: ida_bytes.word_flag,
+        4: ida_bytes.dword_flag, 8: ida_bytes.qword_flag,
+        16: ida_bytes.oword_flag, 32: ida_bytes.yword_flag,
+    }.get(size, ida_bytes.byte_flag)()
+
+
 def _agent_impl_create_data(args):
     ea = _agent_ea(args, "address")
     tstr = (args.get("type") or "").strip()
@@ -12308,7 +12454,20 @@ def _agent_impl_create_data(args):
     size = tif.get_size()
     if not size or size == idaapi.BADSIZE:
         raise _AgentError("type has no fixed size: %s" % tstr)
-    if not ida_bytes.create_data(ea, ida_bytes.DATA_COMPLEX, 0, size, True):
+    # ida_bytes.create_data(ea, dataflag, size, tid) - dataflag is derived
+    # from the element size/kind; tid is only meaningful for structs
+    # (ida_netnode.BADNODE otherwise). idaapi.DATA_COMPLEX does not exist.
+    if tif.is_struct():
+        tname = tif.get_type_name()
+        tid = ida_typeinf.get_named_type_tid(tname) if tname else ida_netnode.BADNODE
+        dataflag = ida_bytes.stru_flag()
+    else:
+        tid = ida_netnode.BADNODE
+        if tif.is_floating() and size in (4, 8):
+            dataflag = ida_bytes.float_flag() if size == 4 else ida_bytes.double_flag()
+        else:
+            dataflag = _create_data_flag_by_size(size)
+    if not ida_bytes.create_data(ea, dataflag, size, tid):
         raise _AgentError("create_data failed at %s" % _hex(ea))
     ida_typeinf.set_tinfo(ea, tif, 1)
     return {"address": _hex(ea), "type": tstr, "size": size}
@@ -12336,11 +12495,10 @@ def _agent_impl_create_struct(args):
 
 def _agent_impl_delete_struct(args):
     name = _agent_name(args, "name")
-    sid = idaapi.get_struc_id(name)
-    if sid == idaapi.BADADDR:
+    if ida_typeinf.get_named_type_tid(name) == idaapi.BADADDR:
         raise _AgentError("struct not found: %s" % name)
-    if not idaapi.del_struc(sid):
-        raise _AgentError("del_struc failed for %s" % name)
+    if not ida_typeinf.del_named_type(None, name, ida_typeinf.NTF_TYPE):
+        raise _AgentError("del_named_type failed for %s" % name)
     return {"name": name, "deleted": True}
 
 
@@ -12509,6 +12667,22 @@ def _agent_impl_debug_threads(args):
     return {"threads": out}
 
 
+def _agent_impl_debug_set_thread(args):
+    _agent_dbg_required()
+    if _agent_dbg_state_name() == "none":
+        raise _AgentError("no process is being debugged")
+    raw = args.get("thread")
+    if raw is None:
+        raise _AgentError("missing required argument 'thread' (thread id)")
+    try:
+        tid = int(raw)
+    except (TypeError, ValueError):
+        raise _AgentError("'thread' must be an integer thread id")
+    if not ida_dbg.select_thread(tid):
+        raise _AgentError("select_thread(%d) failed" % tid)
+    return {"thread": tid}
+
+
 def _agent_impl_debug_registers(args):
     _agent_dbg_required()
     _agent_dbg_need_suspended()
@@ -12559,6 +12733,24 @@ def _agent_impl_debug_read_memory(args):
     data = bytes(data)
     ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
     return {"address": _hex(ea), "size": len(data), "hex": data.hex(), "ascii": ascii_}
+
+
+def _agent_impl_debug_write_memory(args):
+    _agent_dbg_required()
+    _agent_dbg_need_suspended()
+    if ida_idd is None:
+        raise _AgentError("ida_idd is not available in this IDA build")
+    ea = _agent_ea(args, "address")
+    hx = (args.get("hex") or "").replace(" ", "").replace(",", "")
+    if not hx or len(hx) % 2:
+        raise _AgentError("'hex' must be a non-empty, even-length hex string")
+    try:
+        data = bytes.fromhex(hx)
+    except ValueError:
+        raise _AgentError("'hex' is not valid hex")
+    if not ida_idd.dbg_write_memory(ea, data):
+        raise _AgentError("dbg_write_memory failed at %s" % _hex(ea))
+    return {"address": _hex(ea), "written": len(data)}
 
 
 def _agent_impl_debug_memory_map(args):
@@ -12798,9 +12990,11 @@ AGENT_TOOLS = {
                      "params": {"address": "address or name"}, "fn": _agent_impl_function_at},
     "getFunctionInfo": {"description": "Name/size/prototype/flags/comment for a function.",
                        "params": {"address": "function address or name"}, "fn": _agent_impl_function_info},
-    "getStrings": {"description": "List strings (paginated, optional filter / min length).",
+    "getStrings": {"description": "List strings (paginated, optional filter / min length). Scans for both utf8 and utf16 ('unicode') strings by default in one pass; uses the cached list when the requested encodings are already covered, otherwise rebuilds once.",
                   "params": {"filter": "substring (optional)", "min_length": "int (optional)",
-                             "offset": "int (optional)", "limit": "int <= 500 (default 100)"},
+                             "offset": "int (optional)", "limit": "int <= 500 (default 100)",
+                             "encodings": "list of 'utf8'|'utf16'|'utf32'|'pascal'|'pascal16'|'pascal32' (optional, default utf8+utf16)",
+                             "refresh": "bool (optional, default false) - force a full re-scan"},
                   "fn": _agent_impl_strings},
     "getImports": {"description": "Import table (optional module filter).",
                   "params": {"module": "module name substring (optional)", "limit": "int <= 500"},
@@ -13000,6 +13194,12 @@ AGENT_TOOLS = {
                         "params": {"name": "register name (e.g. 'rax')",
                                    "value": "integer or hex string"},
                         "gated": "debug", "fn": _agent_impl_debug_set_register},
+    "debugWriteMemory": {"description": "Write bytes to live process memory (process must be suspended). GATED by agent_allow_debug (off by default).",
+                        "params": {"address": "address", "hex": "hex bytes to write"},
+                        "gated": "debug", "fn": _agent_impl_debug_write_memory},
+    "setCurrentThread": {"description": "Select the current thread for subsequent getLiveRegisters/getStackTrace calls. GATED by agent_allow_debug (off by default).",
+                        "params": {"thread": "thread id"},
+                        "gated": "debug", "fn": _agent_impl_debug_set_thread},
     "patchBytes": {"description": "Patch bytes in the IDB. GATED by agent_allow_patches (off by default).",
                   "params": {"address": "address or name", "hex": "hex bytes to write"},
                   "gated": "patches", "fn": _agent_impl_patch_bytes},

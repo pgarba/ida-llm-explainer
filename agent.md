@@ -83,6 +83,9 @@ confirm static hypotheses against live values:
    `getStackTrace` for the call chain, `getLiveMemory` to dereference the
    pointers you see in registers (it reads the *process*, so addresses
    outside the IDB work too), `getLiveMemoryMap` to see the process layout.
+   `getThreads` lists every thread; `setCurrentThread` (needs the debug gate)
+   switches which one subsequent `getLiveRegisters`/`getStackTrace` calls
+   default to.
 2. **Feed live values back into the database** — a register that always holds
    a `this` pointer, a stack slot that is a length: name and type the
    corresponding variables (`renameVariable`, `setVariableType`,
@@ -92,9 +95,9 @@ confirm static hypotheses against live values:
    `setBreakpoint` at a function entry → `debugContinue` → poll
    `getDebugState` until `suspended` again → inspect → repeat.
    `debugStep` (`into`/`over`/`out`) for stepping, `debugRunTo` to jump to an
-   address, `debugSuspend` to stop a running process. When done, leave the
-   process in a sane state (`debugContinue` or `debugDetach`) and say so in
-   your report.
+   address, `debugSuspend` to stop a running process, `debugWriteMemory` to
+   patch live process memory. When done, leave the process in a sane state
+   (`debugContinue` or `debugDetach`) and say so in your report.
 4. **The process must be `suspended`** to read registers or stack traces;
    `readMemory`-style reads may work while running. If a tool says
    "not suspended", the process is running — `debugSuspend` first.
@@ -119,7 +122,7 @@ confirm static hypotheses against live values:
 | `getFunctions` | `filter?`, `min_size?`, `offset?`, `limit?` | list functions (paginated) |
 | `getFunctionAt` | `address` | the function containing an address |
 | `getFunctionInfo` | `address` | name/size/prototype/flags/comment |
-| `getStrings` | `filter?`, `min_length?`, `offset?`, `limit?` | list strings |
+| `getStrings` | `filter?`, `min_length?`, `offset?`, `limit?`, `encodings?`, `refresh?` | list strings (scans utf8 + utf16 by default in one pass; `encodings` narrows to specific types; `refresh` forces a full re-scan) |
 | `getImports` | `module?`, `limit?` | import table |
 | `getExports` | `filter?`, `limit?` | export table |
 | `getSegments` | — | segments (range/permissions/class) |
@@ -210,6 +213,8 @@ confirm static hypotheses against live values:
 | `setBreakpoint` | `address` | set a software breakpoint |
 | `removeBreakpoint` | `address` | remove a breakpoint |
 | `setRegisterValue` | `name`, `value` | write a register (needs `suspended`) |
+| `debugWriteMemory` | `address`, `hex` | write bytes into live process memory (needs `suspended`) |
+| `setCurrentThread` | `thread` | select the current thread for `getLiveRegisters`/`getStackTrace` |
 
 If a gated tool returns 403, do **not** try to work around it — say what you
 would have done and let the human decide.
