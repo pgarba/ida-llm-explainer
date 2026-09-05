@@ -18,11 +18,29 @@ Authorization: Bearer <token>
 
 If `GET /health` fails, IDA (or the plugin) is not running — stop and say so.
 
+### Multiple IDA sessions open at once
+
+If you weren't handed a specific URL/token — or several IDA windows might be
+open, each analyzing a different binary — don't guess a port. Every running
+agent server advertises itself in a shared local registry, and
+`list_ida_agents.py` (repo root, plain Python, no IDA needed) reads it for
+you:
+
+```
+python list_ida_agents.py
+```
+
+It prints a JSON array of the live sessions, each with `host`, `port`,
+`token`, `idb_name`, `input_file`, `ida_version`, and `url`. Match the entry
+whose `idb_name`/`input_file` is the binary you're asked about, then use its
+`url` + `token` as your base URL and bearer token for everything below. An
+empty array means no IDA session currently has its agent server enabled.
+
 ## 2. Protocol
 
 | Endpoint | Auth | Request | Response |
 |---|---|---|---|
-| `GET /health` | none | — | `{"ok": true, "tools": <count>}` |
+| `GET /health` | none | — | `{"ok": true, "tools": <count>, "pid": <int>, "idb_name": "<name>"}` |
 | `GET /tools` | token | — | `{"ok": true, "tools": {name: {description, params, gated?}}}` |
 | `POST /call` | token | `{"name": "<tool>", "args": {…}}` | `{"ok": true, "result": …}` or `{"ok": false, "error": "…"}` |
 | `POST /batch` | token | `{"calls": [{"name": …, "args": …}, …]}` | `{"ok": true, "results": [ …per-call… ]}` |
@@ -115,6 +133,7 @@ confirm static hypotheses against live values:
 | `getAnalysisStatus` | — | whether autoanalysis has finished |
 | `getCurrentCursor` | — | the address/function the human is viewing |
 | `showInIda` | `address` | jump the IDA UI to an address |
+| `openFile` | `path` | open another file in a brand-new IDA window; this session is untouched |
 
 ### Discovery
 | Tool | Args | Purpose |
@@ -215,6 +234,8 @@ confirm static hypotheses against live values:
 | `setRegisterValue` | `name`, `value` | write a register (needs `suspended`) |
 | `debugWriteMemory` | `address`, `hex` | write bytes into live process memory (needs `suspended`) |
 | `setCurrentThread` | `thread` | select the current thread for `getLiveRegisters`/`getStackTrace` |
+| `openFileInThisWindow` | `path` | save+close this database, open a different file in a new window, exit this process |
+| `closeDatabase` | `save?` | save (default) and close this database, then exit this process |
 
 If a gated tool returns 403, do **not** try to work around it — say what you
 would have done and let the human decide.
@@ -240,3 +261,13 @@ would have done and let the human decide.
    modest, and don't re-fetch the same function you already have.
 8. **Stay in scope.** Analyze what the task asks for. `showInIda` the
    interesting parts when you finish so the human can review.
+9. **Close the database when you're done with a session.** If you opened this
+   IDA session yourself (e.g. via `openFile`/`openFileInThisWindow`, or you
+   were told this session exists solely for your task), call `closeDatabase`
+   once you've finished and reported your findings, so it doesn't linger. If
+   the call returns `403`, the human hasn't enabled `agent_allow_close` —
+   just say you're finished and leave the session open for them; don't treat
+   the 403 as a failure. Either way, expect the connection to drop without a
+   response once `closeDatabase`/`openFileInThisWindow` actually runs — IDA
+   is exiting, that's the intended outcome, not an error. Do **not** close a
+   session a human is actively using unless they've asked you to.

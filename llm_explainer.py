@@ -183,6 +183,7 @@ at anything it doesn't fully recognize.
 """
 
 import base64
+import ctypes
 import functools
 import glob
 import hashlib
@@ -251,7 +252,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.12.1"
+PLUGIN_VERSION = "1.13.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -259,6 +260,10 @@ ACTION_ID_EXPLAIN_RECURSIVE = "llm_explainer:explain_recursive"
 ACTION_ID_TRACE_CFG = "llm_explainer:trace_cfg"
 ACTION_ID_EXPORT_C = "llm_explainer:export_c"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
+# Directory (under the IDA user dir, alongside CONFIG_FILENAME) where each
+# running agent server advertises itself so an external agent can discover
+# every open IDA session - see _write_agent_registry / list_ida_agents.py.
+AGENT_INSTANCES_DIRNAME = "agent_instances"
 
 
 def _add_copyright_footer(layout):
@@ -809,11 +814,12 @@ DEFAULT_CONFIG = {
     # A local HTTP API an external agent (an LLM agent loop, a script,
     # another tool) can use to drive IDA: read code/data/types, search,
     # mutate the database (renames, comments, types, functions), and drive
-    # the debugger for dynamic analysis. Bearer-token auth, bound to
-    # localhost by default. patchBytes, runIdaScript and the debugger
-    # control tools are additionally gated by their own flags (all off by
-    # default). See the AGENT_TOOLS registry and AgentServer class near
-    # the bottom.
+    # the debugger for dynamic analysis, open other files, and close itself
+    # when done. Bearer-token auth, bound to localhost by default.
+    # patchBytes, runIdaScript, the debugger control tools, and the
+    # session-closing tools (openFileInThisWindow, closeDatabase) are
+    # additionally gated by their own flags (all off by default). See the
+    # AGENT_TOOLS registry and AgentServer class near the bottom.
     "agent_server_enabled": False,
     "agent_server_host": "127.0.0.1",
     # Fixed default port; 0 = auto-assign. The bound URL + token are always
@@ -829,6 +835,12 @@ DEFAULT_CONFIG = {
     # The read-only debugger tools (getDebugState, getLiveRegisters,
     # getLiveMemory, ...) need no gate.
     "agent_allow_debug": False,
+    # Gate for openFileInThisWindow and closeDatabase: both save+close the
+    # current database and exit this IDA process (openFileInThisWindow then
+    # reopens a new IDA window on a different file). Off by default since
+    # they end the session out from under whoever is looking at this window.
+    # openFile (new window, this session untouched) needs no gate.
+    "agent_allow_close": False,
     # Per-result truncation cap (agents have context budgets too).
     "agent_max_output_chars": 20000,
     "include_data_refs": True,
@@ -4686,6 +4698,7 @@ class PluginConfig(object):
         self.agent_allow_patches = bool(self.agent_allow_patches)
         self.agent_allow_scripts = bool(self.agent_allow_scripts)
         self.agent_allow_debug = bool(self.agent_allow_debug)
+        self.agent_allow_close = bool(self.agent_allow_close)
         try:
             self.agent_max_output_chars = max(1000, min(1000000, int(self.agent_max_output_chars)))
         except (TypeError, ValueError):
@@ -8116,6 +8129,19 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow(self.agent_allow_debug_check)
 
+        self.agent_allow_close_check = QtWidgets.QCheckBox(
+            "Allow agent to close this session (openFileInThisWindow, closeDatabase)"
+        )
+        self.agent_allow_close_check.setToolTip(
+            "Lets the agent save+close the current database and exit this "
+            "IDA process (openFileInThisWindow does this then opens a "
+            "different file in a new window). Off by default since it ends "
+            "the session out from under whoever is looking at this window. "
+            "openFile (opens a file in a new window, leaving this session "
+            "untouched) does not need this."
+        )
+        form.addRow(self.agent_allow_close_check)
+
         self.agent_max_output_spin = QtWidgets.QSpinBox()
         self.agent_max_output_spin.setRange(1000, 1000000)
         self.agent_max_output_spin.setSingleStep(1000)
@@ -8210,6 +8236,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.agent_allow_patches_check.setChecked(config.agent_allow_patches)
         self.agent_allow_scripts_check.setChecked(config.agent_allow_scripts)
         self.agent_allow_debug_check.setChecked(config.agent_allow_debug)
+        self.agent_allow_close_check.setChecked(config.agent_allow_close)
         self.agent_max_output_spin.setValue(config.agent_max_output_chars)
 
     def _on_restore_defaults(self):
@@ -8293,6 +8320,7 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.agent_allow_patches = self.agent_allow_patches_check.isChecked()
         cfg.agent_allow_scripts = self.agent_allow_scripts_check.isChecked()
         cfg.agent_allow_debug = self.agent_allow_debug_check.isChecked()
+        cfg.agent_allow_close = self.agent_allow_close_check.isChecked()
         cfg.agent_max_output_chars = self.agent_max_output_spin.value()
         cfg._validate()
         self.result_config = cfg
@@ -12572,6 +12600,85 @@ def _agent_impl_run_ida_script(args):
     return {"result": serializable, "stdout": buf.getvalue()}
 
 
+def _current_ida_executable():
+    """Best-effort path to the executable hosting this IDA process, so a
+    new IDA GUI instance can be spawned on a different file. Uses the OS
+    to ask the running process for its own path rather than guessing a
+    binary name/bitness, since that's the one IDA build guaranteed to work
+    here."""
+    if os.name == "nt":
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            n = ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+            if n:
+                return buf.value
+        except Exception:
+            pass
+    else:
+        try:
+            p = os.readlink("/proc/self/exe")
+            if p:
+                return p
+        except OSError:
+            pass
+    if sys.executable and os.path.isfile(sys.executable):
+        return sys.executable
+    return None
+
+
+def _spawn_ida_on_file(path):
+    if not path:
+        raise _AgentError("missing required argument 'path'")
+    if not os.path.isfile(path):
+        raise _AgentError("file not found: %s" % path)
+    exe = _current_ida_executable()
+    if not exe:
+        raise _AgentError("could not determine the running IDA executable's own path")
+    try:
+        subprocess.Popen([exe, path], close_fds=(os.name != "nt"))
+    except OSError as exc:
+        raise _AgentError("failed to launch IDA on %s: %s" % (path, exc))
+    return exe
+
+
+def _schedule_delayed_qexit(delay=0.5):
+    """Exit this IDA process shortly - after (not during) the HTTP response
+    for the call that triggered it, since qexit() never returns."""
+    def _do_exit():
+        time.sleep(delay)
+        try:
+            _run_on_ida(lambda: idc.qexit(0))
+        except Exception:
+            pass
+    threading.Thread(target=_do_exit, daemon=True).start()
+
+
+def _agent_impl_open_file(args):
+    path = (args.get("path") or "").strip()
+    exe = _spawn_ida_on_file(path)
+    return {"path": path, "executable": exe,
+            "note": "opened in a new IDA window; this session is untouched"}
+
+
+def _agent_impl_open_file_here(args):
+    path = (args.get("path") or "").strip()
+    exe = _spawn_ida_on_file(path)
+    idc.save_database("", 0)
+    _schedule_delayed_qexit()
+    return {"path": path, "executable": exe,
+            "note": "this session is saving, closing, and exiting; "
+                    "the file is opening in a new IDA window"}
+
+
+def _agent_impl_close_database(args):
+    save = True if args.get("save") is None else bool(args.get("save"))
+    if save:
+        idc.save_database("", 0)
+    _schedule_delayed_qexit()
+    return {"ok": True, "saved": save, "closing": True,
+            "note": "IDA is exiting shortly; the connection may drop before you see this response"}
+
+
 # --- debugger tools ---------------------------------------------------------
 # These expose IDA's debugger (ida_dbg) to the agent so it can do dynamic
 # analysis: inspect a live process (state, registers, memory, threads,
@@ -13206,6 +13313,15 @@ AGENT_TOOLS = {
     "runIdaScript": {"description": "Run arbitrary Python with IDA imports. Set a variable named 'result' to return it. GATED by agent_allow_scripts (off by default).",
                     "params": {"code": "Python source"},
                     "gated": "scripts", "fn": _agent_impl_run_ida_script},
+    "openFile": {"description": "Open a binary/IDB file in a brand-new IDA window (process). This session is left untouched - use it to bring up another binary for analysis alongside this one. Use list_ida_agents.py afterwards to find the new session's port/token.",
+                "params": {"path": "filesystem path to the file to open"},
+                "fn": _agent_impl_open_file},
+    "openFileInThisWindow": {"description": "Save and close this session's database, then open a different file in a new IDA window and exit this process - as close as IDA's architecture gets to 'reuse this window' (IDA always opens a new file in a new process). GATED by agent_allow_close (off by default).",
+                            "params": {"path": "filesystem path to the file to open"},
+                            "gated": "close", "fn": _agent_impl_open_file_here},
+    "closeDatabase": {"description": "Save (unless save=false) and close this session's database, then exit this IDA process. Call this when you're done working in this session so it doesn't linger. GATED by agent_allow_close (off by default).",
+                      "params": {"save": "whether to save before closing (default true)"},
+                      "gated": "close", "fn": _agent_impl_close_database},
 }
 
 
@@ -13220,7 +13336,8 @@ def _agent_dispatch(server, name, args):
     if gate:
         gate_flag = {"patches": "agent_allow_patches",
                      "scripts": "agent_allow_scripts",
-                     "debug": "agent_allow_debug"}.get(gate)
+                     "debug": "agent_allow_debug",
+                     "close": "agent_allow_close"}.get(gate)
         if gate_flag and not getattr(server._config, gate_flag, False):
             return 403, {"ok": False,
                          "error": "%s is disabled (the '%s' setting is off)"
@@ -13235,6 +13352,42 @@ def _agent_dispatch(server, name, args):
         return 500, {"ok": False, "error": "IDA error: %s: %s" % (type(exc).__name__, exc)}
     result, _trunc = _truncate_result(result, server._max_out)
     return 200, {"ok": True, "result": result}
+
+
+def _agent_instances_dir():
+    """Shared local directory where every running agent server advertises
+    itself, so an external agent can discover all open IDA sessions."""
+    path = os.path.join(idaapi.get_user_idadir(), AGENT_INSTANCES_DIRNAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _write_agent_registry(entry):
+    """Atomically publish this instance's connection info. Returns the path
+    written, or None on failure (best-effort - discovery is a convenience,
+    not required for the agent server itself to function)."""
+    try:
+        directory = _agent_instances_dir()
+        path = os.path.join(directory, "instance_%d.json" % os.getpid())
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(entry, f)
+        os.replace(tmp_path, path)
+        return path
+    except OSError:
+        return None
+
+
+def _remove_agent_registry(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 class AgentServer(threading.Thread):
@@ -13252,6 +13405,17 @@ class AgentServer(threading.Thread):
         self._httpd = None
         self._bound_port = None
         self._bind_error = None
+        self._registry_path = None
+        # IDA API calls are only safe from the main thread; __init__ runs
+        # there (plugin init / settings-dialog accept), but run() and the
+        # HTTP handlers execute on other threads, so snapshot everything
+        # they need up front instead of calling into IDA from those threads.
+        self._idb_name = ida_nalt.get_root_filename() or ""
+        self._idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or ""
+        self._input_file = ida_nalt.get_input_file_path() or ""
+        self._processor = get_procname()
+        self._bits = _pointer_size_bits()
+        self._ida_version = ida_kernwin.get_kernel_version() or ""
 
     @property
     def token(self):
@@ -13295,8 +13459,9 @@ class AgentServer(threading.Thread):
 
             def do_GET(self):
                 if self.path == "/health":
-                    return self._send_json(200, {"ok": True, "server": PLUGIN_NAME + " agent", 
-                                                 "tools": len(AGENT_TOOLS)})
+                    return self._send_json(200, {"ok": True, "server": PLUGIN_NAME + " agent",
+                                                 "tools": len(AGENT_TOOLS), "pid": os.getpid(),
+                                                 "idb_name": server._idb_name})
                 if self.path == "/tools":
                     if not self._authorized():
                         return self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -13336,14 +13501,43 @@ class AgentServer(threading.Thread):
         try:
             self._httpd = ThreadingHTTPServer((self._host, self._port), Handler)
         except OSError as exc:
-            self._bind_error = str(exc)
-            return
+            if self._port != 0:
+                # Configured port is taken (e.g. another IDA session already
+                # bound it) - fall back to an OS-assigned free port instead
+                # of failing outright, so multiple sessions can run at once.
+                try:
+                    self._httpd = ThreadingHTTPServer((self._host, 0), Handler)
+                except OSError:
+                    self._bind_error = str(exc)
+                    return
+            else:
+                self._bind_error = str(exc)
+                return
         self._bound_port = self._httpd.server_address[1]
+        # Everything below is plain Python (no IDA API calls) - this runs on
+        # the server's own thread, and IDA API calls are only safe from the
+        # main thread (see the snapshot taken in __init__).
+        self._registry_path = _write_agent_registry({
+            "pid": os.getpid(),
+            "host": self._host,
+            "port": self._bound_port,
+            "token": self._token,
+            "idb_name": self._idb_name,
+            "idb_path": self._idb_path,
+            "input_file": self._input_file,
+            "processor": self._processor,
+            "bits": self._bits,
+            "ida_version": self._ida_version,
+            "plugin_version": PLUGIN_VERSION,
+            "started_at": time.time(),
+        })
         try:
             self._httpd.serve_forever(poll_interval=0.2)
         finally:
             self._httpd.server_close()
             self._httpd = None
+            _remove_agent_registry(self._registry_path)
+            self._registry_path = None
 
     def shutdown(self):
         httpd = self._httpd

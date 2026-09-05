@@ -24,7 +24,7 @@ loop of iterative, agent-based reverse engineering.
 - **Endpoints**
   | Endpoint | Purpose |
   |---|---|
-  | `GET /health` | liveness + `idb`, `processor`, `analysis_done` (no auth) |
+  | `GET /health` | liveness + `pid`, `idb_name` (no auth) |
   | `GET /tools` | self-describing catalog: every tool's name, description, JSON-schema params — the agent discovers the API itself |
   | `POST /call` | `{"name": "...", "args": {...}}` → `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}` |
   | `POST /batch` | `{"calls": [{name, args}, ...]}` executed sequentially, all results returned (saves agent round-trips) |
@@ -180,3 +180,70 @@ IDB).
   `ThreadingHTTPServer` keeps connections responsive otherwise.
 - **No decompiler**: `getDecompilation`/`getFunctionSummary` return a clear
   error; all other tools work.
+
+## 7. Multi-instance discovery (v1.13.0)
+
+> **STATUS: IMPLEMENTED in v1.13.0.**
+
+Opening several IDA sessions at once, each analyzing a different binary,
+used to fail: `agent_server_port` is a fixed default (8181) stored in one
+config file shared by every IDA process on the machine, so the second
+session's `ThreadingHTTPServer(...)` bind raised `OSError` and its agent
+server never started.
+
+- **Auto-fallback**: if the configured port is taken, `AgentServer.run()`
+  retries once with port `0` (OS-assigned) instead of giving up. Multiple
+  sessions now start automatically; only the *first* one gets the
+  configured/default port.
+- **Self-advertisement**: on successful bind, each instance writes
+  `agent_instances/instance_<pid>.json` under the IDA user directory
+  (`_write_agent_registry`) with its `host`, `port`, `token`, `idb_name`,
+  `idb_path`, `input_file`, `processor`, `bits`, `ida_version`,
+  `plugin_version`, `started_at`. The file is removed when the server
+  stops (plugin unload, settings-triggered restart, or IDA exit).
+- **Discovery**: `list_ida_agents.py` (repo root, no IDA dependency) reads
+  that registry, probes each entry's `GET /health` to confirm it's still
+  alive (pruning stale files left behind by crashed sessions), and prints
+  the live sessions as JSON. An agent runs this first when it isn't told a
+  fixed port up front, matches the session it wants by `idb_name`/
+  `input_file`, and uses that entry's `host`/`port`/`token` for everything
+  else.
+- **`/health` enhancement**: now includes `pid` and `idb_name` (still
+  unauthenticated — no more revealing than a local process listing), so a
+  caller with only network reach can confirm which binary is behind a port.
+
+## 8. Opening and closing files (v1.13.0)
+
+> **STATUS: IMPLEMENTED in v1.13.0.**
+
+An agent needed a way to bring up another binary and, when finished, end its
+own session. IDA's architecture constrains what's possible here: a running
+GUI process holds exactly one open database, and there is no supported way
+to swap the input file of a live process in place — per the IDA 9.0 release
+notes, opening a file while one is already open always spawns a **new IDA
+instance** (a new process). Three tools embrace that instead of fighting it:
+
+- **`openFile(path)`**: spawns a new IDA process on `path` via
+  `subprocess.Popen([exe, path])`, where `exe` is resolved by asking the OS
+  for *this process's own* executable path (`GetModuleFileNameW(None, ...)`
+  on Windows, `/proc/self/exe` on Linux, `sys.executable` as a last resort)
+  rather than guessing an install path/binary name — avoids the kind of
+  API-drift bug this plugin has been bitten by before. Current session is
+  untouched. Ungated (no more sensitive than launching any other program).
+- **`openFileInThisWindow(path)`**: same spawn, then `idc.save_database("",
+  0)` and a delayed `idc.qexit(0)` (run from a background thread ~0.5s
+  later, so the HTTP response for the call is sent before the process
+  exits). Net effect: the old window disappears, a new one appears for the
+  new file — the closest equivalent to "reuse this window" IDA allows.
+- **`closeDatabase(save=true)`**: same save + delayed-`qexit` pattern,
+  without opening anything new. This is what an agent calls when it's done
+  with a one-off analysis session.
+
+Both of the latter two are gated by a new `agent_allow_close` setting (off
+by default, alongside `agent_allow_patches`/`scripts`/`debug`) since they end
+the session out from under whoever is looking at that window; `openFile`
+needs no gate. `agents.md` instructs the agent to call `closeDatabase`
+when it finishes a session it opened itself, but to treat a `403` as "leave
+it open" rather than an error, and to expect the connection to drop without
+a response once either tool actually runs (the process is exiting by then —
+intended, not a bug).
