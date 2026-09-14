@@ -50,6 +50,14 @@ server is configured, batch explain (and the recursive auto-accept action
 below) runs up to one function per server concurrently, so listing N
 llama-server instances gives roughly an Nx speedup over a single server.
 
+Alternatively, build the batch incrementally while browsing: right-click any
+function in the disassembly, pseudocode, or Functions window and choose "Add
+function to batch" to queue it, one function at a time, then "Analyze Batch
+Queue..." (same right-click menu, or Edit > Plugins) to run the queued
+functions through the same batch dialog as above. The queue is in-memory
+only (cleared on IDA restart or via "Clear Batch Queue") and is separate
+from the one-off picker used by "Batch Explain Functions...".
+
 "Explain function with LLM (recursively)" (same right-click menu as the
 regular explain action) explains the target function plus its direct
 callees only (depth 1, not deeper), and - unlike every other action in
@@ -252,13 +260,16 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.13.0"
+PLUGIN_VERSION = "1.14.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
 ACTION_ID_EXPLAIN_RECURSIVE = "llm_explainer:explain_recursive"
 ACTION_ID_TRACE_CFG = "llm_explainer:trace_cfg"
 ACTION_ID_EXPORT_C = "llm_explainer:export_c"
+ACTION_ID_ADD_TO_BATCH = "llm_explainer:add_to_batch"
+ACTION_ID_ANALYZE_BATCH = "llm_explainer:analyze_batch_queue"
+ACTION_ID_CLEAR_BATCH = "llm_explainer:clear_batch_queue"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 # Directory (under the IDA user dir, alongside CONFIG_FILENAME) where each
 # running agent server advertises itself so an external agent can discover
@@ -1707,6 +1718,16 @@ def _resolve_func(ctx):
     if ea is None or ea == idaapi.BADADDR:
         ea = ida_kernwin.get_screen_ea()
     return ida_funcs.get_func(ea)
+
+
+def _resolve_func_for_action(ctx):
+    """Like _resolve_func, but also works in choosers over functions (e.g.
+    the Functions window), where ctx.cur_func names the row under the
+    cursor directly and cur_ea/get_screen_ea() aren't meaningful."""
+    func = getattr(ctx, "cur_func", None)
+    if func is not None:
+        return func
+    return _resolve_func(ctx)
 
 
 def _dedupe_name(desired, taken):
@@ -13654,6 +13675,79 @@ class BatchActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
 
+class AddToBatchActionHandler(ida_kernwin.action_handler_t):
+    """Queues the target function for later processing by
+    AnalyzeBatchQueueActionHandler, instead of explaining it immediately.
+    Available wherever a function can be resolved: disassembly, pseudocode,
+    and the Functions window (via ctx.cur_func - see _resolve_func_for_action).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        func = _resolve_func_for_action(ctx)
+        if not func:
+            ida_kernwin.warning("Place the cursor inside a function first.")
+            return 0
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.add_to_batch_queue(func)
+        return 1
+
+    def update(self, ctx):
+        widget = getattr(ctx, "widget", None)
+        wtype = ida_kernwin.get_widget_type(widget) if widget else -1
+        if wtype not in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM, ida_kernwin.BWN_FUNCS):
+            return ida_kernwin.AST_DISABLE_FOR_WIDGET
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET if _resolve_func_for_action(ctx) else ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
+class AnalyzeBatchQueueActionHandler(ida_kernwin.action_handler_t):
+    """Runs every function queued via AddToBatchActionHandler through the
+    same BatchProgressDialog used by "Batch Explain Functions..." - the
+    queue is consumed (cleared) once the dialog opens, so a second run
+    starts from an empty queue rather than reprocessing the same functions.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        funcs = plugin.get_batch_queue_funcs()
+        if not funcs:
+            ida_kernwin.warning(
+                "Batch queue is empty. Right-click a function and choose "
+                "'Add function to batch' first."
+            )
+            return 0
+        plugin.clear_batch_queue(quiet=True)
+        plugin.open_batch_dialog(funcs)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+class ClearBatchQueueActionHandler(ida_kernwin.action_handler_t):
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.clear_batch_queue()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 class CfgTraceActionHandler(ida_kernwin.action_handler_t):
     """Disassembly-only (see update()): unlike ExplainActionHandler, this
     does NOT gate on _resolve_func succeeding - the whole premise is a
@@ -13691,13 +13785,22 @@ class PopupHooks(ida_kernwin.UI_Hooks):
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPORT_C, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ADD_TO_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ANALYZE_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_CLEAR_BATCH, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_DISASM:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPORT_C, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_TRACE_CFG, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ADD_TO_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ANALYZE_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_CLEAR_BATCH, "LLM Explainer/")
         elif wtype == ida_kernwin.BWN_FUNCS:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ADD_TO_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_ANALYZE_BATCH, "LLM Explainer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_CLEAR_BATCH, "LLM Explainer/")
 
 
 class LLMExplainerPlugin(idaapi.plugin_t):
@@ -13714,7 +13817,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "struct typedefs, extern declarations, globals bound to image base + "
         "RVA) for the clipboard or a file, without touching the database. "
         "Right-click in the Functions window to "
-        "batch-explain multiple functions. In the disassembly view, "
+        "batch-explain multiple functions, or use 'Add function to batch' "
+        "(available in the disassembly, pseudocode, and Functions window "
+        "right-click menus) to queue functions one at a time and later run "
+        "them all via 'Analyze Batch Queue...'. In the disassembly view, "
         "'Trace/Recover CFG...' asks the LLM to walk an obfuscated "
         "function's real control flow branch by branch and mark real/dead "
         "code (color + comment by default; 'Patch in place' can "
@@ -13741,10 +13847,14 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._codegen_dialog = None
         self._trace_cache = OrderedDict()  # start_ea -> _CachedCfgTrace, oldest-first
         self._applied_cfg_patches = OrderedDict()  # start_ea -> _AppliedCfgPatch, oldest-first
+        self._batch_queue = []  # start_ea's queued via "Add function to batch", insertion order
         self._action_handler = ExplainActionHandler()
         self._recursive_action_handler = ExplainRecursiveActionHandler()
         self._export_c_action_handler = ExportCActionHandler()
         self._batch_action_handler = BatchActionHandler()
+        self._add_to_batch_action_handler = AddToBatchActionHandler()
+        self._analyze_batch_action_handler = AnalyzeBatchQueueActionHandler()
+        self._clear_batch_action_handler = ClearBatchQueueActionHandler()
         self._trace_cfg_action_handler = CfgTraceActionHandler()
 
         action = ida_kernwin.action_desc_t(
@@ -13799,6 +13909,45 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             )
         except Exception:
             pass
+
+        add_to_batch_action = ida_kernwin.action_desc_t(
+            ACTION_ID_ADD_TO_BATCH,
+            "Add function to batch",
+            self._add_to_batch_action_handler,
+            None,
+            "Queue this function for later batch analysis (see 'Analyze Batch Queue...')",
+            -1,
+        )
+        if not ida_kernwin.register_action(add_to_batch_action):
+            ida_kernwin.msg("[%s] Failed to register add-to-batch action.\n" % PLUGIN_NAME)
+
+        analyze_batch_action = ida_kernwin.action_desc_t(
+            ACTION_ID_ANALYZE_BATCH,
+            "Analyze Batch Queue (0)...",
+            self._analyze_batch_action_handler,
+            None,
+            "Explain every function queued via 'Add function to batch'",
+            -1,
+        )
+        if not ida_kernwin.register_action(analyze_batch_action):
+            ida_kernwin.msg("[%s] Failed to register analyze-batch action.\n" % PLUGIN_NAME)
+        try:
+            ida_kernwin.attach_action_to_menu(
+                "Edit/Plugins/", ACTION_ID_ANALYZE_BATCH, ida_kernwin.SETMENU_APP
+            )
+        except Exception:
+            pass
+
+        clear_batch_action = ida_kernwin.action_desc_t(
+            ACTION_ID_CLEAR_BATCH,
+            "Clear Batch Queue",
+            self._clear_batch_action_handler,
+            None,
+            "Remove every function currently queued for batch analysis",
+            -1,
+        )
+        if not ida_kernwin.register_action(clear_batch_action):
+            ida_kernwin.msg("[%s] Failed to register clear-batch action.\n" % PLUGIN_NAME)
 
         trace_cfg_action = ida_kernwin.action_desc_t(
             ACTION_ID_TRACE_CFG,
@@ -13921,6 +14070,7 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._open_graphs = []
         self._trace_cache = OrderedDict()
         self._applied_cfg_patches = OrderedDict()
+        self._batch_queue = []
         try:
             self._popup_hooks.unhook()
         except Exception:
@@ -13939,6 +14089,18 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             pass
         try:
             ida_kernwin.unregister_action(ACTION_ID_BATCH)
+        except Exception:
+            pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_ADD_TO_BATCH)
+        except Exception:
+            pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_ANALYZE_BATCH)
+        except Exception:
+            pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_CLEAR_BATCH)
         except Exception:
             pass
         try:
@@ -13992,6 +14154,57 @@ class LLMExplainerPlugin(idaapi.plugin_t):
     def open_batch_dialog(self, funcs):
         dlg = BatchProgressDialog(self.config, funcs)
         return self._track_dialog(dlg)
+
+    def add_to_batch_queue(self, func):
+        """Queue `func` for a later "Analyze Batch Queue..." run. Deduped by
+        start_ea and silently ignores a repeat add of the same function."""
+        ea = func.start_ea
+        name = ida_funcs.get_func_name(ea) or ("sub_%X" % ea)
+        if ea in self._batch_queue:
+            ida_kernwin.msg(
+                "[%s] '%s' is already in the batch queue (%d queued).\n"
+                % (PLUGIN_NAME, name, len(self._batch_queue))
+            )
+            return
+        self._batch_queue.append(ea)
+        ida_kernwin.msg(
+            "[%s] Added '%s' to batch queue (%d queued).\n"
+            % (PLUGIN_NAME, name, len(self._batch_queue))
+        )
+        self._update_batch_action_label()
+
+    def clear_batch_queue(self, quiet=False):
+        n = len(self._batch_queue)
+        self._batch_queue = []
+        if not quiet:
+            ida_kernwin.msg(
+                "[%s] Cleared batch queue (%d function(s) removed).\n" % (PLUGIN_NAME, n)
+            )
+        self._update_batch_action_label()
+
+    def get_batch_queue_funcs(self):
+        """Resolve queued start_ea's to live func_t objects, silently
+        dropping any whose function has since been undefined/deleted."""
+        funcs = []
+        stale = set()
+        for ea in self._batch_queue:
+            func = ida_funcs.get_func(ea)
+            if func is not None:
+                funcs.append(func)
+            else:
+                stale.add(ea)
+        if stale:
+            self._batch_queue = [ea for ea in self._batch_queue if ea not in stale]
+        return funcs
+
+    def _update_batch_action_label(self):
+        try:
+            ida_kernwin.update_action_label(
+                ACTION_ID_ANALYZE_BATCH,
+                "Analyze Batch Queue (%d)..." % len(self._batch_queue),
+            )
+        except Exception:
+            pass
 
     def open_cfg_trace_dialog(self, start_ea):
         dlg = CfgTraceDialog(self.config, start_ea)
