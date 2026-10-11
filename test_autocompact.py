@@ -136,10 +136,13 @@ _stub("ida_kernwin", MFF_FAST=1, MFF_WRITE=2, msg=lambda s: print("[msg]", s),
       execute_sync=lambda fn, *a: (fn(), 1), UI_Hooks=_UIHooks,
       action_handler_t=_ActionHandler, get_kernel_version=lambda: "stub",
       get_screen_ea=lambda: 0x1000)
-for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines", "ida_loader",
-              "ida_name", "ida_nalt", "ida_segment", "ida_typeinf", "ida_ua",
+for extra in ("ida_auto", "ida_bytes", "ida_idp", "ida_lines",
+              "ida_name", "ida_segment", "ida_typeinf", "ida_ua",
               "ida_xref", "ida_x86", "ida_arm", "ida_entry", "ida_strlist"):
     _stub(extra)
+_stub("ida_loader", get_path=lambda kind: "/tmp/stub.i64", PATH_TYPE_IDB=1)
+# AgentServer reads the IDB name for /health and the instance registry (v1.13+)
+_stub("ida_nalt", get_root_filename=lambda: "stub.bin", get_input_file_path=lambda: "/tmp/stub.bin")
 _stub("ida_netnode", BADNODE=0xFFFFFFFF)
 _stub("ida_funcs", get_func=lambda ea: None, get_func_name=lambda ea: "sub_%X" % ea)
 _stub("ida_graph", GraphViewer=_dummy_class("GraphViewer"))

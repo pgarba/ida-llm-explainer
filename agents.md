@@ -152,8 +152,8 @@ confirm static hypotheses against live values:
 ### Code reading
 | Tool | Args | Purpose |
 |---|---|---|
-| `getDisassembly` | `address`, `count?` | N instructions from an address |
-| `getFunctionDisassembly` | `address` | full disassembly of a function |
+| `getDisassembly` | `address`, `count?`, `plain?`, `addresses?` | N instructions from an address; `addresses: true` → plain text with an address per line + `lines: [{address, text}]` |
+| `getFunctionDisassembly` | `address`, `plain?`, `addresses?` | full disassembly of a function (same options) |
 | `getDecompilation` | `address` | Hex-Rays pseudocode (needs the decompiler) |
 | `getFunctionPrototype` | `address` | C prototype |
 | `getFunctionArguments` | `address` | args: name/type/location |
@@ -181,6 +181,7 @@ confirm static hypotheses against live values:
 | `getEnum` | `name` | an enum's members |
 | `getTypeAt` | `address` | the C type at an address |
 | `listLocalTypes` | `filter?`, `limit?` | user/local type names |
+| `getLocalType` | `name` | C declaration + size of a local type |
 
 ### Mutation (all undoable in IDA)
 | Tool | Args | Purpose |
@@ -195,13 +196,18 @@ confirm static hypotheses against live values:
 | `setFunctionType` | `address`, `type` | set return/arg types from a C type string |
 | `setComment` | `address`, `comment`, `repeatable?` | comment on an address |
 | `setFunctionComment` | `address`, `comment` | comment on a function |
-| `makeFunction` | `address`, `end?` | create a function |
+| `makeFunction` | `address`, `end?`, `force?` | create a function; `force` first turns data in the range into code (misanalysed code) |
 | `deleteFunction` | `address` | delete a function |
-| `defineCode` | `address`, `size?` | define code at an address |
+| `defineCode` | `address`, `size?` | define code at an address (with `size`: clear the range and decode instructions over it) |
 | `undefine` | `address`, `size?` | clear items at an address |
-| `createData` | `address`, `type` | create typed data (`int`, `char[16]`, `struct X`) |
+| `createData` | `address`, `type`, `undefine?` | create typed data (`int`, `char[16]`, `struct X`) |
 | `createStruct` | `name`, `fields: [{name, type}]` | create a struct type |
 | `deleteStruct` | `name` | delete a struct type |
+| `parseTypes` | `text`, `replace?` | parse C declarations (a whole header) into the local types |
+| `setGlobalType` | `address`, `type`, `name?`, `undefine?` | apply a C type to data (e.g. `struct Person[192]`), clearing the range first |
+| `clearDecompilerCache` | `address?` | drop cached pseudocode (one function or all) after type/name changes |
+| `reanalyze` | `start?`, `end?` | re-run auto-analysis over a range and wait |
+| `selfTest` | — | non-destructive check of the version-sensitive tools; run it first after an IDA update |
 | `setBookmark` | `address`, `text` | agent scratch note at an address |
 | `getBookmarks` | — | list bookmarks |
 | `deleteBookmark` | `address` | delete a bookmark |

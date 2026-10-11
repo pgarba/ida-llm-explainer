@@ -260,7 +260,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.14.0"
+PLUGIN_VERSION = "1.15.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -11554,7 +11554,7 @@ class CfgTraceDialog(QtWidgets.QDialog):
 # ---------------------------------------------------------------------------
 
 AGENT_DEFAULT_PORT = 8181
-AGENT_MAX_LIMIT = 500          # clamp for every per-call "limit" arg
+AGENT_MAX_LIMIT = 5000         # clamp for every per-call "limit" arg
 AGENT_CALL_TIMEOUT_MS = 60000  # max time a single call may hold the main thread
 
 
@@ -11674,17 +11674,70 @@ def _agent_callee_targets(f):
     """Unique direct call targets of a function, in order of first use."""
     seen = []
     seen_set = set()
-    ea = f.start_ea
-    insn = ida_ua.insn_t()
-    while ea < f.end_ea:
-        if ida_ua.decode_insn(insn, ea):
-            if bool(insn.get_canon_feature() & ida_idp.CF_CALL):
-                tgt = insn.get_op_addr(0)
-                if tgt != idaapi.BADADDR and tgt not in seen_set:
-                    seen_set.add(tgt)
-                    seen.append(tgt)
-        ea = idc.next_head(ea, f.end_ea)
+    for ea in idautils.FuncItems(f.start_ea):
+        insn = ida_ua.insn_t()
+        if not ida_ua.decode_insn(insn, ea) or not ida_idp.is_call_insn(insn):
+            continue
+        # flow=0: only the call target(s), not the fall-through to the next instruction
+        for tgt in idautils.CodeRefsFrom(ea, 0):
+            if tgt != idaapi.BADADDR and tgt not in seen_set:
+                seen_set.add(tgt)
+                seen.append(tgt)
     return seen
+
+
+def _agent_parse_type(type_str):
+    """Parse a C type expression ("int", "struct X *", "struct X[192]", "unsigned short[6]") into a
+    tinfo_t, or None. IDA 9.x has no tinfo_t.parse_decl: parse a dummy variable declaration with the
+    module-level ida_typeinf.parse_decl instead (array brackets go after the dummy name)."""
+    t = (type_str or "").strip().rstrip(";").strip()
+    if not t:
+        return None
+    candidates = []
+    if "(*)" in t:
+        candidates.append(t.replace("(*)", "(* __agent_t)", 1))  # function pointer: name inside (*)
+    b, p = t.find("["), t.find("(")
+    if p >= 0 and (b < 0 or p < b):
+        m = re.search(r"@<[^>]*>\s*\($", t[:p + 1])
+        q = m.start() if m else p                            # __usercall: name goes before the return location
+        candidates.append(t[:q] + " __agent_t" + t[q:])   # function type: name goes before the '('
+    if b >= 0:
+        candidates.append(t[:b] + " __agent_t" + t[b:])   # array: name goes before the '['
+    candidates += [t + " __agent_t", t]                     # plain type / complete declaration
+    for decl in candidates:
+        tif = ida_typeinf.tinfo_t()
+        try:
+            r = ida_typeinf.parse_decl(tif, None, decl + ";", ida_typeinf.PT_SIL | ida_typeinf.PT_VAR)
+        except Exception:
+            continue
+        if r is not None and not tif.empty():
+            return tif
+    return None
+
+
+def _agent_local_type_names():
+    """Names of all local types (IDA 9.x: by ordinal; idautils.LocalTypes does not exist)."""
+    til = ida_typeinf.get_idati()
+    if hasattr(ida_typeinf, "get_ordinal_limit"):
+        limit = ida_typeinf.get_ordinal_limit(til)
+    else:
+        limit = ida_typeinf.get_ordinal_qty(til) + 1
+    out = []
+    for ordinal in range(1, limit):
+        name = ida_typeinf.get_numbered_type_name(til, ordinal)
+        if name:
+            out.append(name)
+    return out
+
+
+def _agent_disasm_lines(start, stop, max_count):
+    """[(ea, plain text)] for up to max_count heads in [start, stop) (color tags removed)."""
+    out = []
+    ea = start
+    while ea != idaapi.BADADDR and ea < stop and len(out) < max_count:
+        out.append((ea, ida_lines.tag_remove(ida_lines.generate_disasm_line(ea, 0) or "")))
+        ea = idc.next_head(ea, stop)
+    return out
 
 
 def _agent_lvar_rows(f, only_args):
@@ -12052,8 +12105,21 @@ def _agent_impl_search_text(args):
     return {"text": text, "matches": out, "truncated": len(out) >= limit}
 
 
+def _agent_disasm_result(res, rows, args):
+    """Add the optional 'plain' / 'lines' views (with addresses, no color tags) to a disassembly result."""
+    if args.get("addresses"):
+        res["lines"] = [{"address": _hex(a), "text": t} for a, t in rows]
+    if args.get("plain") or args.get("addresses"):
+        res["text"] = "\n".join(("%s  %s" % (_hex(a), t)) if args.get("addresses") else t for a, t in rows)
+    return res
+
+
 def _agent_impl_disassembly(args):
     ea = _agent_ea(args, "address")
+    if args.get("plain") or args.get("addresses"):
+        count = max(1, min(5000, int(args.get("count") or 100)))
+        rows = _agent_disasm_lines(ea, _inf_upper_bound(), count)
+        return _agent_disasm_result({"address": _hex(ea), "instruction_count": len(rows)}, rows, args)
     count = max(1, min(1000, int(args.get("count") or 100)))
     stop = _inf_upper_bound()
     start = ea
@@ -12069,6 +12135,10 @@ def _agent_impl_disassembly(args):
 def _agent_impl_function_disassembly(args):
     f = _agent_get_func(args)
     info = _agent_func_info(f)
+    if args.get("plain") or args.get("addresses"):
+        rows = [(ea, ida_lines.tag_remove(ida_lines.generate_disasm_line(ea, 0) or ""))
+                for ea in idautils.FuncItems(f.start_ea)]
+        return _agent_disasm_result(info, rows, args)
     info["text"] = _agent_func_disasm_text(f)
     return info
 
@@ -12117,10 +12187,10 @@ def _agent_impl_callers(args):
     target = f.start_ea if f else ea
     limit = _agent_limit(args)
     by_func = {}
-    for ref in idautils.CodeRefsTo(target, 0):
-        cf = ida_funcs.get_func(ref.frm)
-        key = cf.start_ea if cf else ref.frm
-        by_func.setdefault(key, []).append(ref.frm)
+    for frm in idautils.CodeRefsTo(target, 0):  # yields addresses (ints), not xref objects
+        cf = ida_funcs.get_func(frm)
+        key = cf.start_ea if cf else frm
+        by_func.setdefault(key, []).append(frm)
     out = []
     for key in sorted(by_func):
         cf = ida_funcs.get_func(key)
@@ -12195,10 +12265,10 @@ def _agent_impl_function_summary(args):
                         "name": (ida_funcs.get_func_name(tgt) if cf else idaapi.get_name(tgt)) or ""})
     info["callees"] = callees
     by_func = {}
-    for ref in idautils.CodeRefsTo(f.start_ea, 0):
-        cf = ida_funcs.get_func(ref.frm)
-        key = cf.start_ea if cf else ref.frm
-        by_func.setdefault(key, []).append(ref.frm)
+    for frm in idautils.CodeRefsTo(f.start_ea, 0):  # yields addresses (ints)
+        cf = ida_funcs.get_func(frm)
+        key = cf.start_ea if cf else frm
+        by_func.setdefault(key, []).append(frm)
     info["callers"] = [{"address": _hex(k), "call_sites": [_hex(s) for s in v]}
                        for k, v in sorted(by_func.items())]
     return info
@@ -12353,7 +12423,7 @@ def _agent_impl_type_at(args):
 def _agent_impl_list_local_types(args):
     filt = (args.get("filter") or "").lower()
     limit = _agent_limit(args, default=AGENT_MAX_LIMIT)
-    names = [n for n in idautils.LocalTypes() if not filt or filt in n.lower()]
+    names = [n for n in _agent_local_type_names() if not filt or filt in n.lower()]
     return {"total": len(names), "types": names[:limit]}
 
 
@@ -12421,10 +12491,10 @@ def _agent_impl_set_function_type(args):
     tstr = (args.get("type") or "").strip()
     if not tstr:
         raise _AgentError("missing required argument 'type'")
-    tif = ida_typeinf.tinfo_t()
-    if not tif.parse_decl(None, 0, tstr, ida_typeinf.PT_SIL):
+    tif = _agent_parse_type(tstr)
+    if tif is None:
         raise _AgentError("cannot parse type: %s" % tstr)
-    if not ida_typeinf.set_tinfo(f.start_ea, tif, 1):
+    if not ida_typeinf.apply_tinfo(f.start_ea, tif, ida_typeinf.TINFO_DEFINITE):
         raise _AgentError("set_tinfo failed for %s" % tstr)
     return {"address": _hex(f.start_ea), "type": idc.get_type(f.start_ea) or tstr}
 
@@ -12449,8 +12519,30 @@ def _agent_impl_set_function_comment(args):
 def _agent_impl_make_function(args):
     ea = _agent_ea(args, "address")
     end = _agent_opt_ea(args, "end")
-    if not ida_funcs.add_func(ea, end if end != idaapi.BADADDR else 0):
-        raise _AgentError("add_func failed at %s" % _hex(ea))
+    end_arg = end if end != idaapi.BADADDR else idaapi.BADADDR
+    existing = ida_funcs.get_func(ea)
+    if existing is not None and existing.start_ea == ea:
+        raise _AgentError("there already is a function at %s (ends at %s)" % (_hex(ea), _hex(existing.end_ea)))
+    if not ida_funcs.add_func(ea, end_arg):
+        if not args.get("force"):
+            raise _AgentError("add_func failed at %s (try force=true to convert data in the range to code)" % _hex(ea))
+        # force: turn the range (or what auto-analysis reaches) into code, then retry
+        if end != idaapi.BADADDR:
+            ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, end - ea)
+            cur = ea
+            while cur < end:
+                length = ida_ua.create_insn(cur)
+                if length <= 0:
+                    ida_bytes.del_items(cur, ida_bytes.DELIT_SIMPLE, 1)
+                    length = ida_ua.create_insn(cur)
+                cur += length if length > 0 else 1
+        else:
+            ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, 1)
+            ida_ua.create_insn(ea)
+            ida_auto.auto_make_code(ea)
+            ida_auto.auto_wait()
+        if not ida_funcs.add_func(ea, end_arg):
+            raise _AgentError("add_func failed at %s even after converting to code" % _hex(ea))
     f = ida_funcs.get_func(ea)
     return {"address": _hex(ea), "end": _hex(f.end_ea) if f else ""}
 
@@ -12466,18 +12558,38 @@ def _agent_impl_define_code(args):
     ea = _agent_ea(args, "address")
     size = int(args.get("size") or 0)
     if size > 0:
-        if not ida_bytes.define_code(ea, size):
-            raise _AgentError("define_code failed at %s" % _hex(ea))
-    else:
-        if not ida_bytes.create_insn(ea):
+        # clear whatever is there (data items), then decode instructions over the range
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+        cur, n = ea, 0
+        while cur < ea + size:
+            length = ida_ua.create_insn(cur)
+            if length <= 0:
+                raise _AgentError("create_insn failed at %s (after %d instructions)" % (_hex(cur), n))
+            cur += length
+            n += 1
+        _agent_reanalyze_func_at(ea)
+        return {"address": _hex(ea), "size": cur - ea, "instructions": n}
+    if ida_ua.create_insn(ea) <= 0:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, 1)
+        if ida_ua.create_insn(ea) <= 0:
             raise _AgentError("create_insn failed at %s" % _hex(ea))
-    return {"address": _hex(ea), "size": size}
+    _agent_reanalyze_func_at(ea)
+    return {"address": _hex(ea), "size": ida_bytes.get_item_size(ea), "instructions": 1}
+
+
+def _agent_reanalyze_func_at(ea):
+    """Re-analyze the function containing ea (restores stack variables / flow after re-decoding)."""
+    f = ida_funcs.get_func(ea)
+    if f is not None:
+        ida_funcs.reanalyze_function(f)
+        ida_auto.auto_wait()
 
 
 def _agent_impl_undefine(args):
     ea = _agent_ea(args, "address")
     size = max(1, int(args.get("size") or 1))
-    ida_bytes.undefine_items(ea, ea + size, ida_bytes.UDF_KEEP_NAMES)
+    if not ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size):
+        raise _AgentError("del_items failed at %s" % _hex(ea))
     return {"address": _hex(ea), "size": size}
 
 
@@ -12497,8 +12609,8 @@ def _agent_impl_create_data(args):
     tstr = (args.get("type") or "").strip()
     if not tstr:
         raise _AgentError("missing required argument 'type'")
-    tif = ida_typeinf.tinfo_t()
-    if not tif.parse_decl(None, 0, tstr, ida_typeinf.PT_SIL):
+    tif = _agent_parse_type(tstr)
+    if tif is None:
         raise _AgentError("cannot parse type: %s" % tstr)
     size = tif.get_size()
     if not size or size == idaapi.BADSIZE:
@@ -12516,9 +12628,11 @@ def _agent_impl_create_data(args):
             dataflag = ida_bytes.float_flag() if size == 4 else ida_bytes.double_flag()
         else:
             dataflag = _create_data_flag_by_size(size)
+    if args.get("undefine", True):
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
     if not ida_bytes.create_data(ea, dataflag, size, tid):
         raise _AgentError("create_data failed at %s" % _hex(ea))
-    ida_typeinf.set_tinfo(ea, tif, 1)
+    ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
     return {"address": _hex(ea), "type": tstr, "size": size}
 
 
@@ -12536,7 +12650,7 @@ def _agent_impl_create_struct(args):
         if not fname:
             raise _AgentError("each field needs a 'name'")
         decl_fields.append("%s %s" % (ftype, fname))
-    decl = "struct %s { %s }" % (name, "; ".join(decl_fields))
+    decl = "struct %s { %s; }" % (name, "; ".join(decl_fields))
     if not _create_struct_type(decl):
         raise _AgentError("failed to create struct %s" % name)
     return {"name": name, "decl": decl + ";"}
@@ -12549,6 +12663,122 @@ def _agent_impl_delete_struct(args):
     if not ida_typeinf.del_named_type(None, name, ida_typeinf.NTF_TYPE):
         raise _AgentError("del_named_type failed for %s" % name)
     return {"name": name, "deleted": True}
+
+
+# --- types, analysis and maintenance tools (v1.15) -------------------------
+
+
+def _agent_impl_parse_types(args):
+    """Parse C declarations (a whole header is fine) into the local types library."""
+    text = args.get("text") or ""
+    if not text.strip():
+        raise _AgentError("missing required argument 'text'")
+    flags = ida_typeinf.PT_REPLACE if args.get("replace", True) else 0
+    errors = ida_typeinf.idc_parse_types(text, flags)
+    if errors:
+        raise _AgentError("%d error(s) while parsing the declarations (see the IDA output window)" % errors)
+    return {"errors": 0, "local_types": len(_agent_local_type_names())}
+
+
+def _agent_impl_get_local_type(args):
+    name = _agent_name(args, "name")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(None, name):
+        raise _AgentError("no local type named %s" % name)
+    flags = (ida_typeinf.PRTYPE_MULTI | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI
+             | ida_typeinf.PRTYPE_DEF)
+    try:
+        decl = tif._print(name, flags)
+    except Exception:
+        decl = str(tif)
+    return {"name": name, "size": tif.get_size(), "declaration": decl}
+
+
+def _agent_impl_set_global_type(args):
+    """Apply a C type to data at an address (struct, array, ...), clearing existing items in the range
+    first by default. Keeps the current name unless 'name' is given."""
+    ea = _agent_ea(args, "address")
+    tstr = (args.get("type") or "").strip()
+    tif = _agent_parse_type(tstr)
+    if tif is None:
+        raise _AgentError("cannot parse type: %s (are all used types defined? see parseTypes)" % tstr)
+    size = tif.get_size()
+    if not size or size == idaapi.BADSIZE:
+        raise _AgentError("type has no fixed size: %s" % tstr)
+    if args.get("undefine", True):
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+    if not ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
+        raise _AgentError("apply_tinfo failed at %s" % _hex(ea))
+    name = (args.get("name") or "").strip()
+    if name and not ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_NOWARN | ida_name.SN_FORCE):
+        raise _AgentError("type applied, but set_name failed for %s" % name)
+    return {"address": _hex(ea), "type": idc.get_type(ea) or str(tif), "size": size,
+            "name": idaapi.get_name(ea) or ""}
+
+
+def _agent_impl_clear_decompiler_cache(args):
+    """Drop cached pseudocode (one function or all) so the next getDecompilation reflects new types/names."""
+    if ida_hexrays is None:
+        raise _AgentError("Hex-Rays decompiler is not available")
+    ea = _agent_opt_ea(args, "address")
+    if ea != idaapi.BADADDR:
+        f = ida_funcs.get_func(ea)
+        if f is None:
+            raise _AgentError("no function at %s" % _hex(ea))
+        ida_hexrays.mark_cfunc_dirty(f.start_ea, False)
+        return {"cleared": _hex(f.start_ea)}
+    ida_hexrays.clear_cached_cfuncs()
+    return {"cleared": "all"}
+
+
+def _agent_impl_reanalyze(args):
+    """Re-run auto-analysis over a range (default: the whole database) and wait for it."""
+    start = _agent_opt_ea(args, "start")
+    end = _agent_opt_ea(args, "end")
+    start = start if start != idaapi.BADADDR else _image_base()
+    end = end if end != idaapi.BADADDR else _inf_upper_bound()
+    ida_auto.plan_range(start, end)
+    ida_auto.auto_wait()
+    return {"start": _hex(start), "end": _hex(end), "done": True}
+
+
+def _agent_impl_self_test(args):
+    """Non-destructive check of the tools that broke on IDA API changes; reports ok/error per tool."""
+    results = {}
+    funcs = list(idautils.Functions())
+    target = None
+    for fea in funcs:  # a function that has callers
+        if any(True for _ in idautils.CodeRefsTo(fea, 0)):
+            target = fea
+            break
+    caller = None
+    if target is not None:
+        caller = ida_funcs.get_func(next(iter(idautils.CodeRefsTo(target, 0))))
+    checks = [
+        ("getCallers", lambda: _agent_impl_callers({"address": target})["callers"]),
+        ("getFunctionCalls", lambda: _agent_impl_function_calls({"address": caller.start_ea})["callees"]),
+        ("getFunctionSummary", lambda: _agent_impl_function_summary({"address": target})["callers"]),
+        ("listLocalTypes", lambda: _agent_impl_list_local_types({"limit": 5})["total"]),
+        ("parseType", lambda: str(_agent_parse_type("struct __agent_selftest_t *") or _agent_parse_type("int[4]"))),
+        ("parseTypes+getLocalType", lambda: (_agent_impl_parse_types({"text": "struct __agent_selftest_t { int a; char b; };"}),
+                                              _agent_impl_get_local_type({"name": "__agent_selftest_t"})["size"])),
+        ("getDisassembly(addresses)", lambda: _agent_impl_disassembly({"address": target, "count": 3, "addresses": True})["lines"]),
+        ("getFunctionDisassembly(plain)", lambda: len(_agent_impl_function_disassembly({"address": target, "plain": True})["text"])),
+    ]
+    for name, fn in checks:
+        try:
+            v = fn()
+            results[name] = {"ok": True, "sample": str(v)[:120]}
+        except Exception as exc:
+            results[name] = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    try:  # do not leave the test type behind
+        ida_typeinf.del_named_type(None, "__agent_selftest_t", ida_typeinf.NTF_TYPE)
+    except Exception:
+        pass
+    api = {"ida_ua.create_insn": hasattr(ida_ua, "create_insn"), "ida_bytes.del_items": hasattr(ida_bytes, "del_items"),
+           "ida_typeinf.parse_decl": hasattr(ida_typeinf, "parse_decl"),
+           "ida_hexrays.clear_cached_cfuncs": ida_hexrays is not None and hasattr(ida_hexrays, "clear_cached_cfuncs")}
+    return {"ok": all(r["ok"] for r in results.values()) and all(api.values()), "tools": results, "apis": api}
 
 
 def _agent_impl_set_bookmark(args):
@@ -13143,11 +13373,12 @@ AGENT_TOOLS = {
                              "end": "address (optional)", "limit": "int <= 500"},
                   "fn": _agent_impl_search_text},
     # code reading
-    "getDisassembly": {"description": "Disassembly of N instructions starting at an address.",
-                      "params": {"address": "address or name", "count": "int instructions (default 100, max 1000)"},
+    "getDisassembly": {"description": "Disassembly of N instructions starting at an address. With addresses=true: plain text (no color tags) prefixed by addresses, plus 'lines' [{address, text}].",
+                      "params": {"address": "address or name", "count": "int instructions (default 100, max 1000; 5000 with plain/addresses)",
+                                 "plain": "bool (optional): strip IDA color tags", "addresses": "bool (optional): per-line addresses"},
                       "fn": _agent_impl_disassembly},
-    "getFunctionDisassembly": {"description": "Full disassembly of a function.",
-                              "params": {"address": "function address or name"},
+    "getFunctionDisassembly": {"description": "Full disassembly of a function (plain/addresses as in getDisassembly).",
+                              "params": {"address": "function address or name", "plain": "bool (optional)", "addresses": "bool (optional)"},
                               "fn": _agent_impl_function_disassembly},
     "getDecompilation": {"description": "Hex-Rays pseudocode of a function.",
                         "params": {"address": "function address or name"},
@@ -13244,26 +13475,43 @@ AGENT_TOOLS = {
     "setFunctionComment": {"description": "Set a function's comment.",
                           "params": {"address": "function address or name", "comment": "text"},
                           "fn": _agent_impl_set_function_comment},
-    "makeFunction": {"description": "Create a function at an address.",
-                    "params": {"address": "address or name", "end": "address (optional)"},
+    "makeFunction": {"description": "Create a function at an address. force=true first converts data in [address, end) (or at address) to code - for code that auto-analysis misread as data.",
+                    "params": {"address": "address or name", "end": "address (optional)", "force": "bool (optional)"},
                     "fn": _agent_impl_make_function},
     "deleteFunction": {"description": "Delete a function.",
                       "params": {"address": "function address or name"},
                       "fn": _agent_impl_delete_function},
-    "defineCode": {"description": "Define code (one or more instructions) at an address.",
+    "defineCode": {"description": "Define code at an address; with size: clear the range and decode instructions over it.",
                   "params": {"address": "address or name", "size": "int bytes (optional)"},
                   "fn": _agent_impl_define_code},
     "undefine": {"description": "Undefine (clear) items at an address.",
                 "params": {"address": "address or name", "size": "int bytes (default 1)"},
                 "fn": _agent_impl_undefine},
-    "createData": {"description": "Create typed data at an address (e.g. int, char[16], struct X).",
-                  "params": {"address": "address or name", "type": "C type"},
+    "createData": {"description": "Create typed data at an address (e.g. int, char[16], struct X). Clears existing items in the range first unless undefine=false.",
+                  "params": {"address": "address or name", "type": "C type", "undefine": "bool (optional, default true)"},
                   "fn": _agent_impl_create_data},
     "createStruct": {"description": "Create a struct type from fields.",
                     "params": {"name": "struct name", "fields": "list of {name, type}"},
                     "fn": _agent_impl_create_struct},
     "deleteStruct": {"description": "Delete a struct type.",
                     "params": {"name": "struct name"}, "fn": _agent_impl_delete_struct},
+    "parseTypes": {"description": "Parse C declarations (structs, unions, enums, typedefs - a whole header is fine) into the local types; replaces existing types of the same name by default.",
+                  "params": {"text": "C declarations", "replace": "bool (optional, default true)"},
+                  "fn": _agent_impl_parse_types},
+    "getLocalType": {"description": "C declaration and size of a local type.",
+                    "params": {"name": "type name"}, "fn": _agent_impl_get_local_type},
+    "setGlobalType": {"description": "Apply a C type (struct, array, ...) to data at an address, clearing existing items in the range first; optional new name. E.g. type='struct Person[192]'.",
+                     "params": {"address": "address or name", "type": "C type", "name": "new name (optional)",
+                                "undefine": "bool (optional, default true)"},
+                     "fn": _agent_impl_set_global_type},
+    "clearDecompilerCache": {"description": "Drop cached pseudocode of one function (address) or of all functions, so getDecompilation shows new types/names.",
+                            "params": {"address": "function (optional, default: all)"},
+                            "fn": _agent_impl_clear_decompiler_cache},
+    "reanalyze": {"description": "Re-run auto-analysis over a range (default: whole database) and wait for it.",
+                 "params": {"start": "address (optional)", "end": "address (optional)"},
+                 "fn": _agent_impl_reanalyze},
+    "selfTest": {"description": "Non-destructive self test of the tools that depend on version-specific IDA APIs; reports ok/error per tool.",
+                "params": {}, "fn": _agent_impl_self_test},
     "setBookmark": {"description": "Set a bookmark (agent scratch note) at an address.",
                    "params": {"address": "address or name", "text": "note"},
                    "fn": _agent_impl_set_bookmark},
