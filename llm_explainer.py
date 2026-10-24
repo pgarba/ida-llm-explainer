@@ -260,7 +260,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 
 PLUGIN_NAME = "LLM Explainer"
-PLUGIN_VERSION = "1.15.0"
+PLUGIN_VERSION = "1.16.0"
 PLUGIN_COPYRIGHT = "© 2026 Peter Garba"
 ACTION_ID_EXPLAIN = "llm_explainer:explain_function"
 ACTION_ID_BATCH = "llm_explainer:batch_explain"
@@ -270,6 +270,7 @@ ACTION_ID_EXPORT_C = "llm_explainer:export_c"
 ACTION_ID_ADD_TO_BATCH = "llm_explainer:add_to_batch"
 ACTION_ID_ANALYZE_BATCH = "llm_explainer:analyze_batch_queue"
 ACTION_ID_CLEAR_BATCH = "llm_explainer:clear_batch_queue"
+ACTION_ID_TASK_AGENT = "llm_explainer:task_agent"
 CONFIG_FILENAME = "llm_explainer.cfg.json"
 # Directory (under the IDA user dir, alongside CONFIG_FILENAME) where each
 # running agent server advertises itself so an external agent can discover
@@ -854,6 +855,20 @@ DEFAULT_CONFIG = {
     "agent_allow_close": False,
     # Per-result truncation cap (agents have context budgets too).
     "agent_max_output_chars": 20000,
+    # --- task agent (autonomous goal-driven analysis) ----------------------
+    # "Reverse-engineering task..." gives the local model a goal and lets it
+    # drive the AGENT_TOOLS catalog in-process until it can report. See
+    # TaskAgentRunner. These are the defaults the task dialog starts with.
+    # Model turns before the agent must write its report.
+    "task_agent_max_steps": 60,
+    # Offer renames/comments/types (all undoable) by default; the dialog can
+    # switch a run to read-only.
+    "task_agent_allow_writes": True,
+    # Use the server's native function calling (llama-server --jinja). If the
+    # server rejects it the run falls back to a text protocol automatically.
+    "task_agent_native_tools": True,
+    # Cap on one tool result as sent to the model, in characters.
+    "task_agent_max_result_chars": 12000,
     "include_data_refs": True,
     "max_data_refs": 20,
     "max_string_len": 150,
@@ -4724,6 +4739,17 @@ class PluginConfig(object):
             self.agent_max_output_chars = max(1000, min(1000000, int(self.agent_max_output_chars)))
         except (TypeError, ValueError):
             self.agent_max_output_chars = DEFAULT_CONFIG["agent_max_output_chars"]
+        # --- task agent ---
+        try:
+            self.task_agent_max_steps = max(5, min(500, int(self.task_agent_max_steps)))
+        except (TypeError, ValueError):
+            self.task_agent_max_steps = DEFAULT_CONFIG["task_agent_max_steps"]
+        self.task_agent_allow_writes = bool(self.task_agent_allow_writes)
+        self.task_agent_native_tools = bool(self.task_agent_native_tools)
+        try:
+            self.task_agent_max_result_chars = max(2000, min(200000, int(self.task_agent_max_result_chars)))
+        except (TypeError, ValueError):
+            self.task_agent_max_result_chars = DEFAULT_CONFIG["task_agent_max_result_chars"]
         self.include_data_refs = bool(self.include_data_refs)
         try:
             self.max_data_refs = max(0, int(self.max_data_refs))
@@ -5009,11 +5035,17 @@ class LlamaStreamWorker(threading.Thread):
     directly.
     """
 
-    def __init__(self, config, server_url, messages, on_delta, on_reasoning_delta, on_done, on_error):
+    def __init__(self, config, server_url, messages, on_delta, on_reasoning_delta, on_done, on_error,
+                 tools=None):
         super().__init__(daemon=True)
         self._config = config
         self._server_url = server_url
         self._messages = messages
+        # OpenAI-style function definitions (TaskAgentRunner only). When set,
+        # the request offers them as native tools and any tool calls the
+        # model makes are collected into self.tool_calls.
+        self._tools = tools
+        self._tool_call_slots = {}  # index -> {"id", "name", "arguments"}
         self._on_delta = on_delta
         self._on_reasoning_delta = on_reasoning_delta
         self._on_done = on_done
@@ -5066,6 +5098,9 @@ class LlamaStreamWorker(threading.Thread):
         }
         if self._config.model:
             payload["model"] = self._config.model
+        if self._tools:
+            payload["tools"] = self._tools
+            payload["parallel_tool_calls"] = True
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if self._config.api_key:
             headers["Authorization"] = "Bearer " + self._config.api_key
@@ -5141,6 +5176,8 @@ class LlamaStreamWorker(threading.Thread):
                             ida_kernwin.execute_sync(
                                 functools.partial(self._on_delta, piece), ida_kernwin.MFF_FAST
                             )
+                        for tool_call in delta.get("tool_calls") or ():
+                            self._accumulate_tool_call(tool_call)
         except (urllib.error.URLError, OSError) as exc:
             if self._cancel_event.is_set():
                 return
@@ -5183,6 +5220,30 @@ class LlamaStreamWorker(threading.Thread):
             ida_kernwin.execute_sync(
                 functools.partial(self._on_delta, content), ida_kernwin.MFF_FAST
             )
+        for index, tool_call in enumerate(message.get("tool_calls") or ()):
+            self._accumulate_tool_call(dict(tool_call, index=tool_call.get("index", index)))
+
+    def _accumulate_tool_call(self, tool_call):
+        """Merge one OpenAI tool_calls entry into its per-index slot. Streamed
+        entries arrive in pieces (id + name first, then argument fragments)."""
+        slot = self._tool_call_slots.setdefault(
+            tool_call.get("index", 0), {"id": "", "name": "", "arguments": ""}
+        )
+        if tool_call.get("id"):
+            slot["id"] = tool_call["id"]
+        fn = tool_call.get("function") or {}
+        if fn.get("name"):
+            slot["name"] += fn["name"]
+        arguments = fn.get("arguments")
+        if isinstance(arguments, dict):
+            slot["arguments"] = json.dumps(arguments)
+        elif arguments:
+            slot["arguments"] += arguments
+
+    @property
+    def tool_calls(self):
+        """Native tool calls of the finished reply, in index order."""
+        return [self._tool_call_slots[i] for i in sorted(self._tool_call_slots)]
 
 
 # ---------------------------------------------------------------------------
@@ -7744,6 +7805,7 @@ class SettingsDialog(QtWidgets.QDialog):
         trace_form = QtWidgets.QFormLayout()
         export_form = QtWidgets.QFormLayout()
         agent_form = QtWidgets.QFormLayout()
+        task_agent_form = QtWidgets.QFormLayout()
         form = server_form
 
         self.server_urls_edit = QtWidgets.QPlainTextEdit()
@@ -8173,6 +8235,48 @@ class SettingsDialog(QtWidgets.QDialog):
         )
         form.addRow("Agent max output chars:", self.agent_max_output_spin)
 
+        form = task_agent_form
+        task_agent_intro = QtWidgets.QLabel(
+            "Defaults for 'Reverse-engineering task (LLM agent)...': give the model a goal "
+            "and it investigates the binary on its own with the agent tools (the agent "
+            "server does not need to be enabled)."
+        )
+        task_agent_intro.setWordWrap(True)
+        form.addRow(task_agent_intro)
+
+        self.task_agent_max_steps_spin = QtWidgets.QSpinBox()
+        self.task_agent_max_steps_spin.setRange(5, 500)
+        self.task_agent_max_steps_spin.setToolTip(
+            "Model turns (each may call several tools) before the agent must write its report."
+        )
+        form.addRow("Max steps:", self.task_agent_max_steps_spin)
+
+        self.task_agent_allow_writes_check = QtWidgets.QCheckBox(
+            "Allow database changes by default (renames, comments, types)"
+        )
+        self.task_agent_allow_writes_check.setToolTip(
+            "The task dialog's checkbox starts in this state. Changes are all "
+            "undoable and listed on the dialog's Changes tab."
+        )
+        form.addRow(self.task_agent_allow_writes_check)
+
+        self.task_agent_native_tools_check = QtWidgets.QCheckBox("Use native tool calling")
+        self.task_agent_native_tools_check.setToolTip(
+            "Offer the tools through the server's function-calling API (llama-server "
+            "with --jinja). If the server rejects it, the run switches to a plain-text "
+            "TOOL_CALL protocol automatically. Turn off for models without tool-call training."
+        )
+        form.addRow(self.task_agent_native_tools_check)
+
+        self.task_agent_max_result_spin = QtWidgets.QSpinBox()
+        self.task_agent_max_result_spin.setRange(2000, 200000)
+        self.task_agent_max_result_spin.setSingleStep(1000)
+        self.task_agent_max_result_spin.setToolTip(
+            "Longest tool result sent to the model, in characters. Lower it for "
+            "small context windows."
+        )
+        form.addRow("Max tool result chars:", self.task_agent_max_result_spin)
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -8187,7 +8291,7 @@ class SettingsDialog(QtWidgets.QDialog):
         tabs = QtWidgets.QTabWidget()
         for _title, _f in (("Server", server_form), ("Explain", explain_form),
                            ("CFG trace", trace_form), ("C export", export_form),
-                           ("Agent server", agent_form)):
+                           ("Agent server", agent_form), ("Task agent", task_agent_form)):
             # Each tab scrolls if its content is taller than the dialog, so
             # the whole settings screen is reachable on any screen size.
             _page = QtWidgets.QScrollArea()
@@ -8259,6 +8363,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.agent_allow_debug_check.setChecked(config.agent_allow_debug)
         self.agent_allow_close_check.setChecked(config.agent_allow_close)
         self.agent_max_output_spin.setValue(config.agent_max_output_chars)
+        self.task_agent_max_steps_spin.setValue(config.task_agent_max_steps)
+        self.task_agent_allow_writes_check.setChecked(config.task_agent_allow_writes)
+        self.task_agent_native_tools_check.setChecked(config.task_agent_native_tools)
+        self.task_agent_max_result_spin.setValue(config.task_agent_max_result_chars)
 
     def _on_restore_defaults(self):
         answer = QtWidgets.QMessageBox.question(
@@ -8343,6 +8451,10 @@ class SettingsDialog(QtWidgets.QDialog):
         cfg.agent_allow_debug = self.agent_allow_debug_check.isChecked()
         cfg.agent_allow_close = self.agent_allow_close_check.isChecked()
         cfg.agent_max_output_chars = self.agent_max_output_spin.value()
+        cfg.task_agent_max_steps = self.task_agent_max_steps_spin.value()
+        cfg.task_agent_allow_writes = self.task_agent_allow_writes_check.isChecked()
+        cfg.task_agent_native_tools = self.task_agent_native_tools_check.isChecked()
+        cfg.task_agent_max_result_chars = self.task_agent_max_result_spin.value()
         cfg._validate()
         self.result_config = cfg
         self.accept()
@@ -13818,6 +13930,1092 @@ class AgentServer(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Task agent: autonomous, goal-driven reverse engineering
+#
+# The analyst types a task ("reverse engineer how the application detects a
+# VPN") and the local model investigates it on its own: it calls the same
+# AGENT_TOOLS catalog the agent server exposes (strings, imports, xrefs,
+# decompilation, renames, comments, ...) turn after turn, records findings,
+# and ends with a written report. Tools run in-process on the main thread -
+# the agent server does not need to be enabled.
+#
+# Tool calls use the server's native function calling (llama-server with
+# --jinja) when available; otherwise - or if the server rejects the "tools"
+# field - the runner falls back to a plain-text protocol (TOOL_CALL: {json}
+# lines) that works with any model.
+# ---------------------------------------------------------------------------
+
+TASK_AGENT_SYSTEM_PROMPT = (
+    "You are an autonomous reverse-engineering agent working inside IDA Pro "
+    "on the binary described in the first user message. The analyst gives "
+    "you ONE task - usually a question about the program's behavior, such "
+    "as \"how does it detect a VPN?\". You investigate it yourself by "
+    "calling tools, step by step, until you can answer it with evidence "
+    "from the binary.\n\n"
+    "HOW TO WORK\n"
+    "1. Plan briefly: what would the code implementing this behavior have "
+    "to touch? Turn that into concrete search terms - API imports, "
+    "strings, registry keys, file paths, URLs, constants, adapter/process/"
+    "product names. (For example, VPN detection typically involves "
+    "GetAdaptersAddresses/GetAdaptersInfo, WMI queries on network "
+    "adapters, adapter descriptions like \"TAP-Windows\", \"WireGuard\", "
+    "\"OpenVPN\", \"tun\"/\"utun\"/\"ppp\", known VPN process or service "
+    "names, routing-table or DNS checks, or IP-reputation web services.)\n"
+    "2. Find the entry points into the relevant code: getImports, "
+    "getStrings with a filter, searchText, getExports. Then use "
+    "getCrossReferencesTo on each hit to reach the functions that use it.\n"
+    "3. Read those functions with getFunctionSummary (or getDecompilation). "
+    "Follow callers (getCallers) up to where decisions are made and callees "
+    "down to the details. Behavior is often clearest at the call sites.\n"
+    "4. When database changes are enabled and you understand a function "
+    "that matters for the task, improve the database right away: "
+    "renameFunction, setFunctionComment (one sentence), renameVariable, "
+    "setFunctionPrototype, renameGlobal. Only rename what you have actually "
+    "read; leave a sub_ name alone rather than guess.\n"
+    "5. Record every important fact with noteFinding (one sentence plus the "
+    "address) as you go. Your context window is limited and old tool "
+    "results get elided to make room; findings are kept.\n"
+    "6. When you can answer the task - or a thorough search has run dry - "
+    "call finishTask with your final report.\n\n"
+    "RULES\n"
+    "- Be economical: filtered queries, small limits (limit <= 50), and "
+    "never re-fetch something you already have.\n"
+    "- Never invent addresses, names or strings; use only what appeared in "
+    "tool results. Addresses are written 0x... .\n"
+    "- A tool error is information: fix the arguments, do not repeat a "
+    "failing call unchanged.\n"
+    "- Keep the text between tool calls short - a sentence or two about "
+    "what you learned and what you check next.\n"
+    "- If the binary is packed or obfuscated, or the obvious strings and "
+    "imports are missing, say so and try other angles (dynamic API "
+    "resolution, encrypted strings, byte patterns, large or heavily called "
+    "functions, the entry point).\n\n"
+    "FINAL REPORT (the 'report' argument of finishTask, Markdown):\n"
+    "## Answer\n2-5 sentences that directly answer the task.\n"
+    "## How it works\nThe mechanism step by step, naming functions and "
+    "addresses.\n"
+    "## Key functions\nOne bullet per function: `name` @ 0xADDR - its role.\n"
+    "## Evidence\nThe strings, imports and constants that support the "
+    "conclusion.\n"
+    "## Changes made\nThe renames, comments and types you applied (or "
+    "\"none\").\n"
+    "## Open questions\nWhat is still unverified and how to check it (for "
+    "example, where to set a breakpoint)."
+)
+
+_TASK_AGENT_TEXT_PROTOCOL = (
+    "\n\nTOOL CALL FORMAT\n"
+    "Call a tool by writing a line of exactly this form:\n"
+    "TOOL_CALL: {\"name\": \"<tool>\", \"args\": {<arguments>}}\n"
+    "One JSON object per line. You may write several TOOL_CALL lines in one "
+    "reply; then STOP and wait. The results arrive in the next message as "
+    "TOOL_RESULT blocks - never write TOOL_RESULT yourself. To finish, call "
+    "finishTask the same way.\n\n"
+    "AVAILABLE TOOLS (name(arguments): description; '?' marks optional "
+    "arguments)\n"
+)
+
+_TASK_AGENT_NO_TOOL_NUDGE = (
+    "You did not call any tool. Continue the investigation by calling a "
+    "tool, or call finishTask with your final report if you are done."
+)
+
+_TASK_AGENT_CUT_OFF_NUDGE = (
+    "Your reply was cut off at the token limit. Keep your reasoning short: "
+    "call the next tool now, or call finishTask with your report."
+)
+
+_TASK_AGENT_WRAP_UP = (
+    "The step budget for this task is used up. Do not call any more "
+    "investigation tools. Call finishTask now with your report of what you "
+    "found so far, including what is still open."
+)
+
+_TASK_AGENT_ELIDED = (
+    "[tool result elided to free context space - call the tool again if "
+    "you still need it]"
+)
+
+# Never offered to the task agent, whatever the settings: they end or
+# replace the session, take over the analyst's view, or destroy analysis.
+# Gated tools (patchBytes, runIdaScript, debugger control, closeDatabase,
+# ...) are excluded separately by their "gated" key.
+_TASK_AGENT_EXCLUDED_TOOLS = frozenset({
+    "openFile", "showInIda", "selfTest", "deleteFunction", "deleteStruct",
+    "undefine",
+})
+
+# Tools that change the database - offered only when the run allows changes.
+_TASK_AGENT_WRITE_TOOLS = frozenset({
+    "renameFunction", "renameGlobal", "renameData", "createLabel",
+    "renameVariable", "setVariableType", "setFunctionPrototype",
+    "setFunctionType", "setComment", "setFunctionComment", "makeFunction",
+    "defineCode", "createData", "createStruct", "parseTypes", "setGlobalType",
+    "clearDecompilerCache", "reanalyze", "setBookmark", "deleteBookmark",
+})
+
+# Handled by TaskAgentRunner itself rather than AGENT_TOOLS.
+_TASK_AGENT_VIRTUAL_TOOLS = {
+    "noteFinding": {
+        "description": "Record an important fact about the task (kept even when old tool results are elided; shown to the analyst live).",
+        "params": {"text": "one-sentence finding", "address": "related address (optional)"},
+    },
+    "finishTask": {
+        "description": "End the investigation and hand the analyst your final Markdown report.",
+        "params": {"report": "the final report in Markdown"},
+    },
+}
+
+# Per-call clamps on top of the agent server's own limits, so one listing
+# can't eat the whole context window.
+_TASK_AGENT_MAX_LIMIT = 200
+_TASK_AGENT_MAX_COUNT = 400
+
+_TASK_TOOL_CALL_RE = re.compile(r"TOOL_CALL\s*:\s*")
+_TASK_XML_TOOL_CALL_RE = re.compile(r"(?is)<tool_call>\s*(\{.*?\})\s*</tool_call>")
+_TASK_THINK_RE = re.compile(r"(?is)<think>.*?</think>")
+# llama-server: exceed_context_size_error / "exceeds the available context
+# size"; OpenAI-style servers: context_length_exceeded / "maximum context length".
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"(?i)exceed_context_size|exceeds the available context|context_length_exceeded|maximum context length"
+)
+
+
+def _task_agent_tool_names(allow_writes):
+    names = []
+    for name, tool in AGENT_TOOLS.items():
+        if tool.get("gated") or name in _TASK_AGENT_EXCLUDED_TOOLS:
+            continue
+        if not allow_writes and name in _TASK_AGENT_WRITE_TOOLS:
+            continue
+        names.append(name)
+    names.extend(_TASK_AGENT_VIRTUAL_TOOLS)
+    return names
+
+
+def _task_agent_tool_spec(name):
+    return AGENT_TOOLS.get(name) or _TASK_AGENT_VIRTUAL_TOOLS[name]
+
+
+def _task_agent_param_optional(pname, pdesc):
+    low = pdesc.lower()
+    return "optional" in low or "default" in low or pname in ("limit", "offset")
+
+
+def _task_agent_param_schema(pdesc):
+    """JSON-schema type for one AGENT_TOOLS parameter, inferred from its
+    free-text description ("int <= 500", "bool (optional)", "list of ...")."""
+    low = pdesc.lower()
+    if low.startswith("int"):
+        schema = {"type": "integer"}
+    elif low.startswith("bool") or low.startswith("whether"):
+        schema = {"type": "boolean"}
+    elif low.startswith("list"):
+        schema = {"type": "array"}
+    else:
+        schema = {"type": "string"}
+    schema["description"] = pdesc
+    return schema
+
+
+def _task_agent_tool_schemas(names):
+    """OpenAI-style function definitions for native tool calling."""
+    out = []
+    for name in names:
+        spec = _task_agent_tool_spec(name)
+        properties = {}
+        required = []
+        for pname, pdesc in spec["params"].items():
+            properties[pname] = _task_agent_param_schema(pdesc)
+            if not _task_agent_param_optional(pname, pdesc):
+                required.append(pname)
+        out.append({"type": "function", "function": {
+            "name": name,
+            "description": spec["description"],
+            "parameters": {"type": "object", "properties": properties, "required": required},
+        }})
+    return out
+
+
+def _task_agent_tool_catalog_text(names):
+    """Compact tool list for the text protocol's system prompt."""
+    lines = []
+    for name in names:
+        spec = _task_agent_tool_spec(name)
+        params = ", ".join(
+            "%s%s" % (pname, "?" if _task_agent_param_optional(pname, pdesc) else "")
+            for pname, pdesc in spec["params"].items()
+        )
+        lines.append("- %s(%s): %s" % (name, params, spec["description"]))
+    return "\n".join(lines)
+
+
+def _task_agent_system_prompt(native, names):
+    if native:
+        return TASK_AGENT_SYSTEM_PROMPT
+    return TASK_AGENT_SYSTEM_PROMPT + _TASK_AGENT_TEXT_PROTOCOL + _task_agent_tool_catalog_text(names)
+
+
+def _task_agent_parse_args(raw):
+    """Arguments of one tool call -> (dict, error_or_None)."""
+    if isinstance(raw, dict):
+        return raw, None
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}, None
+    try:
+        args = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}, "the tool arguments are not valid JSON"
+    if not isinstance(args, dict):
+        return {}, "the tool arguments must be a JSON object"
+    return args, None
+
+
+def _task_agent_normalize_call(obj):
+    if not isinstance(obj, dict):
+        return {"name": "", "args": {}, "error": "a tool call must be a JSON object"}
+    name = obj.get("name") or obj.get("tool") or ""
+    raw = obj.get("args", obj.get("arguments", obj.get("parameters")))
+    args, error = _task_agent_parse_args(raw)
+    if not isinstance(name, str) or not name:
+        error = error or "the tool call has no 'name'"
+    return {"name": name if isinstance(name, str) else "", "args": args, "error": error}
+
+
+def parse_text_tool_calls(text):
+    """Tool calls written as text: TOOL_CALL: {json} lines, or the
+    <tool_call>{json}</tool_call> blocks some models emit when the chat
+    template doesn't translate them. Anything after a hallucinated
+    TOOL_RESULT is ignored."""
+    cut = text.find("TOOL_RESULT")
+    if cut >= 0:
+        text = text[:cut]
+    calls = []
+    decoder = json.JSONDecoder()
+    for m in _TASK_TOOL_CALL_RE.finditer(text):
+        start = text.find("{", m.end())
+        if start < 0 or text[m.end():start].strip():
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text, start)
+        except ValueError:
+            calls.append({"name": "", "args": {}, "error": "the TOOL_CALL line is not valid JSON"})
+            continue
+        calls.append(_task_agent_normalize_call(obj))
+    if not calls:
+        for m in _TASK_XML_TOOL_CALL_RE.finditer(text):
+            try:
+                obj = json.loads(m.group(1))
+            except ValueError:
+                calls.append({"name": "", "args": {}, "error": "the <tool_call> block is not valid JSON"})
+                continue
+            calls.append(_task_agent_normalize_call(obj))
+    return calls
+
+
+def _task_msg_chars(message):
+    total = len(message.get("content") or "")
+    for tool_call in message.get("tool_calls") or ():
+        fn = tool_call.get("function") or {}
+        total += len(fn.get("name") or "") + len(fn.get("arguments") or "")
+    return total
+
+
+def _task_agent_execute(name, args, max_chars):
+    """Run one AGENT_TOOLS tool on the main thread -> {"ok", "result"|"error"}."""
+    args = dict(args)
+    for key, cap in (("limit", _TASK_AGENT_MAX_LIMIT), ("count", _TASK_AGENT_MAX_COUNT)):
+        if key in args:
+            try:
+                args[key] = max(1, min(cap, int(args[key])))
+            except (TypeError, ValueError):
+                args.pop(key)
+    try:
+        result = AGENT_TOOLS[name]["fn"](args)
+    except _AgentError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": "IDA error: %s: %s" % (type(exc).__name__, exc)}
+    result, _trunc = _truncate_result(result, max_chars)
+    return {"ok": True, "result": result}
+
+
+def _task_agent_result_text(result, max_chars):
+    text = json.dumps(result, ensure_ascii=False, default=str)
+    if len(text) > max_chars:
+        text = (text[:max_chars]
+                + "...[truncated: the result was %d chars - narrow the query with a filter, "
+                  "a smaller limit/count, or an offset]" % len(text))
+    return text
+
+
+def _task_agent_target(args):
+    for key in ("address", "name", "variable"):
+        value = args.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+class TaskAgentRunner(object):
+    """Drives one task-agent investigation: request -> tool calls -> results
+    -> request ..., until the model calls finishTask or the step budget runs
+    out. Lives on the main thread; network I/O runs on LlamaStreamWorker and
+    each reply is handled from a zero-delay QTimer, so tool calls execute
+    outside execute_sync's MFF_FAST context and may write to the database.
+
+    Progress is reported through on_event(kind, payload_dict): "status",
+    "tool", "finding", "change", "context", "finished", "stopped", "error".
+    """
+
+    _MAX_CALLS_PER_TURN = 8
+    _MAX_IDLE_TURNS = 2        # consecutive replies without a tool call before giving up
+    _KEEP_RECENT_RESULTS = 4   # newest tool-result messages are never elided
+    _FALLBACK_CONTEXT = 32768  # assumed window when the server doesn't report one
+    _MAX_PROMPT_ENTRIES = 10       # entry points quoted in the first prompt
+    _MAX_PROMPT_META_CHARS = 4000  # cap on the BINARY metadata in the first prompt
+    _MAX_OVERFLOW_RETRIES = 3      # "exceeds context" retries per turn, each shrinking further
+
+    def __init__(self, config, task, allow_writes, max_steps, on_event,
+                 on_delta=None, on_reasoning_delta=None):
+        self.config = config
+        self.task = task
+        self.allow_writes = allow_writes
+        self.max_steps = max_steps
+        self._step_allowance = max_steps
+        self._on_event = on_event
+        self._on_delta = on_delta or (lambda piece: None)
+        self._on_reasoning_delta = on_reasoning_delta or (lambda piece: None)
+        self._server_candidates = list(config.server_urls) or list(DEFAULT_CONFIG["server_urls"])
+        self.server_url = self._server_candidates[0]
+        self._failed_servers = set()
+        self._native = bool(config.task_agent_native_tools)
+        self._native_confirmed = False
+        self._tool_names = _task_agent_tool_names(allow_writes)
+        self._tool_schemas = _task_agent_tool_schemas(self._tool_names)
+        # The tool definitions are sent with every native request and count
+        # against the context window too.
+        self._tool_schema_chars = len(json.dumps(self._tool_schemas))
+        self._overflow_retries = 0
+        self._max_result_chars = int(config.task_agent_max_result_chars)
+        self.messages = []
+        self.findings = []  # [(ea_or_None, text)]
+        self.changes = []   # [(step, tool, args)]
+        self.report = None
+        self.step = 0
+        self._idle_turns = 0
+        self._wrap_up_sent = False
+        # Tool-result messages still holding their full content, oldest
+        # first: [(message_index, [call signatures])]. Signatures of read-only
+        # calls whose results are still visible to the model are in
+        # _live_signatures, so an identical repeat can be refused.
+        self._result_slots = []
+        self._live_signatures = {}
+        self._call_seq = 0
+        self.worker = None
+        self.running = False
+        self._closed = False
+        self._context_size = None
+        self._cpt = float(config.chars_per_token)
+        self._last_sent_chars = 0
+
+    # -- public API ----------------------------------------------------------
+
+    def start(self):
+        self.messages = [
+            {"role": "system", "content": _task_agent_system_prompt(self._native, self._tool_names)},
+            {"role": "user", "content": self._initial_user_message()},
+        ]
+        if self.config.server_context_size > 0:
+            self._context_size = self.config.server_context_size
+        else:
+            self._context_size = query_server_context_size(
+                self.server_url, self.config.model, self.config.api_key
+            )
+        self.running = True
+        self._send()
+
+    def continue_with(self, instructions):
+        """Resume after a finish/stop/error with extra instructions from the
+        analyst; grants a fresh step allowance."""
+        if self.running or self._closed:
+            return
+        self._append_user(instructions)
+        self.report = None
+        self.max_steps = self.step + self._step_allowance
+        self._idle_turns = 0
+        self._wrap_up_sent = False
+        self._overflow_retries = 0
+        self.running = True
+        self._send()
+
+    def stop(self):
+        if not self.running:
+            return
+        self.running = False
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            worker.cancel()
+        self._emit("stopped", step=self.step)
+
+    def close(self):
+        self._closed = True
+        self.stop()
+
+    def build_markdown(self):
+        lines = ["# Task: %s" % self.task, ""]
+        lines.append(self.report or self._fallback_report("The investigation did not finish."))
+        if self.findings:
+            lines += ["", "## Findings log", ""]
+            for ea, text in self.findings:
+                lines.append("- %s%s" % ("`%s` " % _hex(ea) if ea is not None else "", text))
+        if self.changes:
+            lines += ["", "## Database changes log", ""]
+            for step, tool, args in self.changes:
+                lines.append("- step %d: `%s` %s" % (step, tool, json.dumps(args, ensure_ascii=False)))
+        return "\n".join(lines) + "\n"
+
+    # -- prompt --------------------------------------------------------------
+
+    def _initial_user_message(self):
+        try:
+            meta = _agent_impl_metadata({})
+        except Exception as exc:
+            meta = {"error": str(exc)}
+        # entry_points lists every export - tens of thousands on a big DLL,
+        # millions of characters. A sample is enough to orient; the agent can
+        # page through the rest with getExports.
+        entries = meta.get("entry_points") or []
+        if len(entries) > self._MAX_PROMPT_ENTRIES:
+            meta["entry_points"] = entries[:self._MAX_PROMPT_ENTRIES]
+            meta["entry_point_count"] = len(entries)
+            meta["entry_points_note"] = "first %d shown - use getExports/getEntryPoints for more" \
+                % self._MAX_PROMPT_ENTRIES
+        meta["function_count"] = ida_funcs.get_func_qty()
+        try:
+            meta["segments"] = [s["name"] for s in _agent_impl_segments({}).get("segments", [])][:20]
+        except Exception:
+            pass
+        cursor = ""
+        ea = ida_kernwin.get_screen_ea()
+        func = ida_funcs.get_func(ea) if ea != idaapi.BADADDR else None
+        if func is not None:
+            cursor = ("\nThe analyst's cursor is in %s @ %s (relevant only if the task refers to "
+                      "it).\n" % (ida_funcs.get_func_name(func.start_ea), _hex(func.start_ea)))
+        writes = (
+            "Database changes are ENABLED: name, type and comment what you understand."
+            if self.allow_writes else
+            "This is a READ-ONLY run: no renames, comments or other database changes are possible."
+        )
+        binary = json.dumps(meta, default=str)
+        if len(binary) > self._MAX_PROMPT_META_CHARS:
+            binary = binary[:self._MAX_PROMPT_META_CHARS] + "...[truncated - use getMetadata]"
+        return (
+            "TASK: %s\n\nBINARY: %s\n%s\n%s\nStep budget: %d tool-calling turns.\n\nBegin."
+            % (self.task, binary, cursor, writes, self.max_steps)
+        )
+
+    # -- request cycle -------------------------------------------------------
+
+    def _emit(self, kind, **payload):
+        if not self._closed:
+            self._on_event(kind, payload)
+
+    def _limit_tokens(self):
+        ctx = self._context_size or self._FALLBACK_CONTEXT
+        by_fraction = int(ctx * self.config.auto_compact_threshold)
+        by_reply_budget = ctx - min(self.config.max_tokens, ctx // 2)
+        return max(2000, min(by_fraction, by_reply_budget))
+
+    def _estimate_tokens(self):
+        chars = sum(_task_msg_chars(m) for m in self.messages)
+        if self._native:
+            chars += self._tool_schema_chars
+        return chars / self._cpt + 4.0 * len(self.messages)
+
+    def _shrink_largest_messages(self, limit):
+        """Last resort: cut the biggest non-system messages (keeping head and
+        tail) until the prompt fits - covers anything elision can't reach,
+        such as an oversized first message or task text."""
+        shrunk = 0
+        while self._estimate_tokens() > limit and shrunk < len(self.messages):
+            candidates = [i for i in range(1, len(self.messages))
+                          if len(self.messages[i].get("content") or "") > 2000]
+            if not candidates:
+                break
+            i = max(candidates, key=lambda j: len(self.messages[j]["content"]))
+            content = self.messages[i]["content"]
+            excess_chars = int((self._estimate_tokens() - limit) * self._cpt) + 200
+            keep = max(2000, len(content) - excess_chars)
+            head = keep * 2 // 3
+            self.messages[i]["content"] = (
+                content[:head] + "\n...[%d chars cut to fit the context window]...\n"
+                % (len(content) - keep) + content[-(keep - head):]
+            )
+            shrunk += 1
+        return shrunk
+
+    def _elide_slot(self, slot):
+        index, signatures = slot
+        message = self.messages[index]
+        message["content"] = _TASK_AGENT_ELIDED
+        for sig in signatures:
+            self._live_signatures.pop(sig, None)
+        self._result_slots.remove(slot)
+
+    def _fit_context(self):
+        """Keep the prompt under the context limit: elide the oldest tool
+        results first (newest few protected), then the protected ones but
+        the last, then shorten old assistant text."""
+        limit = self._limit_tokens()
+        if self._estimate_tokens() <= limit:
+            return
+        elided = 0
+        for keep in (self._KEEP_RECENT_RESULTS, 1):
+            for slot in list(self._result_slots[:-keep]):
+                if self._estimate_tokens() <= limit:
+                    break
+                self._elide_slot(slot)
+                elided += 1
+        if self._estimate_tokens() > limit:
+            for message in self.messages[2:-2]:
+                content = message.get("content") or ""
+                if message["role"] == "assistant" and len(content) > 1500:
+                    message["content"] = content[:1500] + "\n...[shortened to fit the context window]"
+        shrunk = self._shrink_largest_messages(limit)
+        if elided or shrunk:
+            self._emit("status", text="Shrank the conversation to fit the context window (%d old tool "
+                                      "result(s) elided, %d message(s) cut)." % (elided, shrunk))
+
+    def _send(self):
+        self._fit_context()
+        self._last_sent_chars = sum(_task_msg_chars(m) for m in self.messages)
+        self._emit("context", est_tokens=int(self._estimate_tokens()),
+                   context_size=int(self._context_size or 0), step=self.step, max_steps=self.max_steps)
+        self._emit("status", text="Step %d/%d: waiting for the model..." % (self.step + 1, self.max_steps))
+        self.worker = LlamaStreamWorker(
+            self.config, self.server_url, list(self.messages),
+            self._on_delta, self._on_reasoning_delta,
+            self._on_worker_done, self._on_worker_error,
+            tools=self._tool_schemas if self._native else None,
+        )
+        self.worker.start()
+
+    def _on_worker_done(self, full_text, reasoning_text="", finish_reason=None):
+        worker, self.worker = self.worker, None
+        if self._closed or not self.running:
+            return 0
+        usage = getattr(worker, "usage", None)
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        if isinstance(prompt_tokens, int) and prompt_tokens >= 50 and self._last_sent_chars > 0:
+            self._cpt = max(1.0, min(10.0, self._last_sent_chars / prompt_tokens))
+        native_calls = worker.tool_calls if worker is not None else []
+        # Leave the execute_sync(MFF_FAST) callback before running tools -
+        # several of them write to the database.
+        QtCore.QTimer.singleShot(
+            0, functools.partial(self._handle_reply, full_text or "", native_calls, finish_reason)
+        )
+        return 0
+
+    def _on_worker_error(self, message, is_connection_error=False):
+        self.worker = None
+        if self._closed or not self.running:
+            return 0
+        if is_connection_error:
+            self._failed_servers.add(self.server_url)
+            for candidate in self._server_candidates:
+                if candidate not in self._failed_servers:
+                    self._emit("status", text="%s is unreachable (%s) - falling back to %s..." % (
+                        self.config.server_label(self.server_url), message,
+                        self.config.server_label(candidate)))
+                    self.server_url = candidate
+                    self._send()
+                    return 0
+        elif _CONTEXT_OVERFLOW_RE.search(message):
+            # Our estimate was off (or the window is smaller than we thought).
+            # Learn the real numbers from the error, shrink, and retry - this
+            # must not be mistaken for the server rejecting native tools.
+            if self._overflow_retries < self._MAX_OVERFLOW_RETRIES:
+                self._overflow_retries += 1
+                n_ctx = re.search(r'"n_ctx"\s*:\s*(\d+)', message)
+                n_prompt = re.search(r'"n_prompt_tokens"\s*:\s*(\d+)', message)
+                if n_ctx:
+                    self._context_size = int(n_ctx.group(1))
+                if n_prompt and self._last_sent_chars > 0:
+                    self._cpt = max(1.0, min(10.0, self._last_sent_chars / int(n_prompt.group(1))))
+                else:
+                    self._cpt = max(1.0, self._cpt * 0.7)  # no numbers: assume denser tokens
+                self._emit("status", text="Prompt exceeded the server's context window - shrinking and "
+                                          "retrying (%d/%d)..." % (self._overflow_retries,
+                                                                   self._MAX_OVERFLOW_RETRIES))
+                self._send()
+                return 0
+        elif self._native and not self._native_confirmed:
+            # The server (or its chat template) refused the "tools" field -
+            # switch to the text protocol, which needs nothing from it.
+            self._native = False
+            self.messages[0] = {"role": "system",
+                                "content": _task_agent_system_prompt(False, self._tool_names)}
+            self._emit("status", text="Native tool calling failed (%s) - switching to the text "
+                                      "tool protocol." % message[:200])
+            self._send()
+            return 0
+        self.running = False
+        self._emit("error", message=message)
+        return 0
+
+    # -- reply handling --------------------------------------------------------
+
+    def _handle_reply(self, text, native_calls, finish_reason):
+        if self._closed or not self.running:
+            return
+        self.step += 1
+        self._overflow_retries = 0
+        content = _TASK_THINK_RE.sub("", text).strip()
+        native = bool(native_calls)
+        if native:
+            self._native_confirmed = True
+            calls = []
+            for slot in native_calls:
+                self._call_seq += 1
+                args, error = _task_agent_parse_args(slot["arguments"])
+                calls.append({"id": slot["id"] or "call_%d" % self._call_seq, "name": slot["name"],
+                              "raw": slot["arguments"] or "{}", "args": args, "error": error})
+            self.messages.append({"role": "assistant", "content": content, "tool_calls": [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": c["raw"]}} for c in calls
+            ]})
+        else:
+            calls = parse_text_tool_calls(content)
+            self.messages.append({"role": "assistant", "content": content})
+
+        if not calls:
+            self._idle_turns += 1
+            if self._idle_turns > self._MAX_IDLE_TURNS:
+                self._finish(content or self._fallback_report("The model stopped calling tools."))
+                return
+            nudge = _TASK_AGENT_CUT_OFF_NUDGE if finish_reason == "length" else _TASK_AGENT_NO_TOOL_NUDGE
+            self._append_user(nudge)
+            self._next_turn()
+            return
+        self._idle_turns = 0
+
+        results = []  # [(call, signature_or_None, result)]
+        report = None
+        wrote = False
+        for i, call in enumerate(calls):
+            name, args, signature = call["name"], call["args"], None
+            if i >= self._MAX_CALLS_PER_TURN:
+                result = {"ok": False, "error": "too many tool calls in one turn - this one was skipped; "
+                                                "repeat it next turn if you still need it"}
+            elif call["error"]:
+                result = {"ok": False, "error": call["error"]}
+            elif name == "finishTask":
+                report = str(args.get("report") or "").strip() or content
+                result = {"ok": True, "result": "finished"}
+            elif name == "noteFinding":
+                result = self._note_finding(args)
+            elif name not in self._tool_names:
+                result = {"ok": False, "error": "unknown or unavailable tool '%s'" % name}
+            else:
+                signature = name + json.dumps(args, sort_keys=True, default=str)
+                if name not in _TASK_AGENT_WRITE_TOOLS and signature in self._live_signatures:
+                    result = {"ok": False, "error": "identical call already made at step %d and its result "
+                                                    "is still above - use it instead of re-fetching"
+                                                    % self._live_signatures[signature]}
+                    signature = None
+                else:
+                    self._emit("status", text="Step %d/%d: running %s..." % (self.step, self.max_steps, name))
+                    result = _task_agent_execute(name, args, self._max_result_chars)
+                    if name in _TASK_AGENT_WRITE_TOOLS:
+                        signature = None
+                        if result["ok"]:
+                            wrote = True
+                            self.changes.append((self.step, name, args))
+                            self._emit("change", step=self.step, tool=name, args=args)
+            self._emit("tool", step=self.step, name=name, args=args, result=result)
+            results.append((call, signature, result))
+
+        self._append_results(results, native)
+        if wrote:
+            try:
+                ida_kernwin.refresh_idaview_anyway()
+            except Exception:
+                pass
+        if report is not None:
+            self._finish(report)
+            return
+        self._next_turn()
+
+    def _note_finding(self, args):
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "missing required argument 'text'"}
+        ea = None
+        if args.get("address") not in (None, ""):
+            try:
+                ea = _agent_ea(args, "address")
+            except _AgentError:
+                ea = None
+        self.findings.append((ea, text))
+        self._emit("finding", ea=ea, text=text)
+        return {"ok": True, "result": {"recorded": len(self.findings)}}
+
+    def _append_results(self, results, native):
+        signatures = []
+        if native:
+            for call, signature, result in results:
+                self.messages.append({"role": "tool", "tool_call_id": call["id"],
+                                      "content": _task_agent_result_text(result, self._max_result_chars)})
+                self._track_result(len(self.messages) - 1, [signature] if signature else [])
+            return
+        blocks = []
+        for call, signature, result in results:
+            blocks.append("TOOL_RESULT %s:\n%s" % (call["name"] or "?",
+                                                    _task_agent_result_text(result, self._max_result_chars)))
+            if signature:
+                signatures.append(signature)
+        self.messages.append({"role": "user", "content": "\n\n".join(blocks)})
+        self._track_result(len(self.messages) - 1, signatures)
+
+    def _append_user(self, text):
+        """Add a user turn, merging into a trailing user message (text-mode
+        tool results) - some chat templates reject two user turns in a row."""
+        last = self.messages[-1] if self.messages else None
+        if last is not None and last["role"] == "user":
+            last["content"] = (last.get("content") or "") + "\n\n" + text
+        else:
+            self.messages.append({"role": "user", "content": text})
+
+    def _track_result(self, index, signatures):
+        self._result_slots.append((index, signatures))
+        for sig in signatures:
+            self._live_signatures[sig] = self.step
+
+    def _next_turn(self):
+        if self.step < self.max_steps:
+            self._send()
+        elif not self._wrap_up_sent:
+            self._wrap_up_sent = True
+            self._append_user(_TASK_AGENT_WRAP_UP)
+            self._send()
+        else:
+            self._finish(self._fallback_report("The step budget ran out before the model finished."))
+
+    def _finish(self, report):
+        self.report = report
+        self.running = False
+        self._emit("finished", report=report, step=self.step)
+
+    def _fallback_report(self, reason):
+        lines = ["## Answer", "", "_%s The notes below are what was collected._" % reason]
+        lines += ["", "## Findings", ""]
+        lines += ["- %s%s" % ("`%s` " % _hex(ea) if ea is not None else "", text)
+                  for ea, text in self.findings] or ["- (none recorded)"]
+        last = next((m.get("content") for m in reversed(self.messages)
+                     if m["role"] == "assistant" and m.get("content")), "")
+        if last:
+            lines += ["", "## Last model message", "", last]
+        return "\n".join(lines)
+
+
+class TaskAgentDialog(QtWidgets.QDialog):
+    """Task in, report out: the analyst describes what to find out, the
+    TaskAgentRunner investigates on its own, and this dialog shows the live
+    transcript, findings, database changes and the final report."""
+
+    _COLOR_TOOL = QtGui.QColor("#3a7bd5")
+    _COLOR_OK = QtGui.QColor("#2e8b57")
+    _COLOR_ERR = QtGui.QColor("#c0392b")
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.runner = None
+        self._closed = False
+        self._reasoning_shown = False
+
+        self.setWindowTitle("%s - Task Agent" % PLUGIN_NAME)
+        self.resize(760, 720)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        layout.addWidget(QtWidgets.QLabel("Task for the agent:"))
+        self.task_edit = QtWidgets.QPlainTextEdit()
+        self.task_edit.setPlaceholderText(
+            "Describe what to find out, e.g.\n"
+            "Reverse engineer how the application detects a VPN.\n"
+            "Find where the license key is validated and explain the algorithm."
+        )
+        self.task_edit.setMaximumHeight(80)
+        layout.addWidget(self.task_edit)
+
+        options = QtWidgets.QHBoxLayout()
+        self.allow_writes_check = QtWidgets.QCheckBox("Allow database changes (renames, comments, types)")
+        self.allow_writes_check.setToolTip(
+            "Let the agent name, type and comment what it understands while it "
+            "works. Every change is listed on the Changes tab and can be undone "
+            "in IDA. Off = read-only investigation."
+        )
+        self.allow_writes_check.setChecked(config.task_agent_allow_writes)
+        options.addWidget(self.allow_writes_check)
+        options.addStretch(1)
+        options.addWidget(QtWidgets.QLabel("Max steps:"))
+        self.max_steps_spin = QtWidgets.QSpinBox()
+        self.max_steps_spin.setRange(5, 500)
+        self.max_steps_spin.setValue(config.task_agent_max_steps)
+        self.max_steps_spin.setToolTip("How many model turns (each may call several tools) before it must report.")
+        options.addWidget(self.max_steps_spin)
+        self.start_button = QtWidgets.QPushButton("Start")
+        self.start_button.setDefault(True)
+        self.start_button.clicked.connect(self.on_start)
+        options.addWidget(self.start_button)
+        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.on_stop)
+        options.addWidget(self.stop_button)
+        layout.addLayout(options)
+
+        status_layout = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel("Describe a task and click Start.")
+        status_layout.addWidget(self.status_label, 1)
+        self.context_label = QtWidgets.QLabel("")
+        self.context_label.setToolTip(
+            "Estimated share of the server's context window in use, and the "
+            "step count. Old tool results are elided automatically when it fills up."
+        )
+        status_layout.addWidget(self.context_label)
+        layout.addLayout(status_layout)
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.transcript_edit = QtWidgets.QPlainTextEdit()
+        self.transcript_edit.setReadOnly(True)
+        self.transcript_edit.setFont(QtGui.QFont("Consolas", 9))
+        self.tabs.addTab(self.transcript_edit, "Transcript")
+
+        self.findings_tree = QtWidgets.QTreeWidget()
+        self.findings_tree.setHeaderLabels(["Address", "Finding"])
+        self.findings_tree.setRootIsDecorated(False)
+        self.findings_tree.setWordWrap(True)
+        self.findings_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tabs.addTab(self.findings_tree, "Findings (0)")
+
+        self.changes_tree = QtWidgets.QTreeWidget()
+        self.changes_tree.setHeaderLabels(["Step", "Tool", "Target", "Details"])
+        self.changes_tree.setRootIsDecorated(False)
+        self.changes_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tabs.addTab(self.changes_tree, "Changes (0)")
+
+        self.report_edit = QtWidgets.QTextEdit()
+        self.report_edit.setReadOnly(True)
+        self.tabs.addTab(self.report_edit, "Report")
+        layout.addWidget(self.tabs, 1)
+
+        followup = QtWidgets.QHBoxLayout()
+        self.followup_input = QtWidgets.QLineEdit()
+        self.followup_input.setPlaceholderText(
+            "Optional instructions, then Continue (e.g. \"also check the macOS code path\")..."
+        )
+        self.followup_input.returnPressed.connect(self.on_continue)
+        followup.addWidget(self.followup_input, 1)
+        self.continue_button = QtWidgets.QPushButton("Continue")
+        self.continue_button.setEnabled(False)
+        self.continue_button.clicked.connect(self.on_continue)
+        followup.addWidget(self.continue_button)
+        self.save_button = QtWidgets.QPushButton("Save Report...")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.on_save)
+        followup.addWidget(self.save_button)
+        close_button = QtWidgets.QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        followup.addWidget(close_button)
+        layout.addLayout(followup)
+        _add_copyright_footer(layout)
+
+    # -- state -----------------------------------------------------------------
+
+    def _set_running(self, running):
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+        self.task_edit.setReadOnly(running)
+        self.allow_writes_check.setEnabled(not running)
+        self.max_steps_spin.setEnabled(not running)
+        self.continue_button.setEnabled(not running and self.runner is not None)
+        self.save_button.setEnabled(not running and self.runner is not None)
+
+    def on_start(self):
+        task = self.task_edit.toPlainText().strip()
+        if not task:
+            self.status_label.setText("Type a task first.")
+            return
+        if self.runner is not None:
+            self.runner.close()
+        self.transcript_edit.clear()
+        self.findings_tree.clear()
+        self.changes_tree.clear()
+        self.report_edit.clear()
+        self._refresh_tab_titles()
+        self.tabs.setCurrentWidget(self.transcript_edit)
+        self.start_button.setText("Start New")
+        self.runner = TaskAgentRunner(
+            self.config, task, self.allow_writes_check.isChecked(), self.max_steps_spin.value(),
+            self._on_event, on_delta=self._on_delta, on_reasoning_delta=self._on_reasoning_delta,
+        )
+        self._insert_styled("TASK: %s\n\n" % task, color=self._COLOR_TOOL)
+        self._set_running(True)
+        try:
+            self.runner.start()
+        except Exception as exc:
+            self._on_event("error", {"message": "Failed to start: %s" % exc})
+
+    def on_stop(self):
+        if self.runner is not None:
+            self.runner.stop()
+
+    def on_continue(self):
+        if self.runner is None or self.runner.running:
+            return
+        text = self.followup_input.text().strip() or "Continue the investigation."
+        self.followup_input.clear()
+        self._insert_styled("\n\nANALYST: %s\n\n" % text, color=self._COLOR_TOOL)
+        self.tabs.setCurrentWidget(self.transcript_edit)
+        self._set_running(True)
+        self.runner.continue_with(text)
+
+    def on_save(self):
+        if self.runner is None:
+            return
+        path, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save task report", "task_report.md", "Markdown (*.md);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.runner.build_markdown())
+            self.status_label.setText("Report saved to %s" % path)
+        except OSError as exc:
+            self.status_label.setText("Could not save the report: %s" % exc)
+
+    # -- runner callbacks ------------------------------------------------------
+
+    def _insert_styled(self, text, italic=False, color=None):
+        try:
+            cursor = self.transcript_edit.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            fmt = QtGui.QTextCharFormat()
+            fmt.setFontItalic(italic)
+            if color is not None:
+                fmt.setForeground(color)
+            cursor.insertText(text, fmt)
+            self.transcript_edit.setTextCursor(cursor)
+            self.transcript_edit.ensureCursorVisible()
+        except RuntimeError:
+            pass
+
+    def _on_reasoning_delta(self, piece):
+        if self._closed:
+            return 0
+        if not self._reasoning_shown:
+            self._reasoning_shown = True
+            self._insert_styled("[thinking] ", italic=True, color=QtGui.QColor("gray"))
+        self._insert_styled(piece, italic=True, color=QtGui.QColor("gray"))
+        return 0
+
+    def _on_delta(self, piece):
+        if self._closed:
+            return 0
+        if self._reasoning_shown:
+            self._reasoning_shown = False
+            self._insert_styled("\n\n")
+        self._insert_styled(piece)
+        return 0
+
+    def _on_event(self, kind, payload):
+        if self._closed:
+            return
+        if kind == "status":
+            self.status_label.setText(payload["text"])
+        elif kind == "context":
+            if payload["context_size"]:
+                pct = 100.0 * payload["est_tokens"] / payload["context_size"]
+                ctx = "context ~%d%%" % pct
+            else:
+                ctx = "context ?"
+            self.context_label.setText("%s | step %d/%d" % (ctx, payload["step"], payload["max_steps"]))
+        elif kind == "tool":
+            self._show_tool_call(payload)
+        elif kind == "finding":
+            ea = payload["ea"]
+            item = QtWidgets.QTreeWidgetItem([_hex(ea) if ea is not None else "", payload["text"]])
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ea)
+            item.setToolTip(1, payload["text"])
+            self.findings_tree.addTopLevelItem(item)
+            self._refresh_tab_titles()
+        elif kind == "change":
+            args = payload["args"]
+            details = {k: v for k, v in args.items() if k != "address"}
+            item = QtWidgets.QTreeWidgetItem([
+                str(payload["step"]), payload["tool"], _task_agent_target(args),
+                json.dumps(details, ensure_ascii=False),
+            ])
+            try:
+                ea = _agent_ea(args, "address")
+            except _AgentError:
+                ea = None
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, ea)
+            self.changes_tree.addTopLevelItem(item)
+            self._refresh_tab_titles()
+        elif kind == "finished":
+            self._reasoning_shown = False
+            self._insert_styled("\n\n=== Finished after %d step(s) - see the Report tab ===\n" % payload["step"],
+                                color=self._COLOR_OK)
+            self.report_edit.setMarkdown(payload["report"])
+            self.tabs.setCurrentWidget(self.report_edit)
+            self.status_label.setText("Done after %d step(s). Continue with more instructions, or save "
+                                      "the report." % payload["step"])
+            self._set_running(False)
+        elif kind == "stopped":
+            self._insert_styled("\n\n=== Stopped by the analyst ===\n", color=self._COLOR_ERR)
+            self.status_label.setText("Stopped at step %d. Continue to resume (e.g. \"write your report "
+                                      "now\")." % payload["step"])
+            self._set_running(False)
+        elif kind == "error":
+            self._insert_styled("\n\n=== Error: %s ===\n" % payload["message"], color=self._COLOR_ERR)
+            self.status_label.setText("Error - see the transcript. Continue retries.")
+            self._set_running(False)
+
+    def _show_tool_call(self, payload):
+        self._reasoning_shown = False
+        result = payload["result"]
+        args_text = json.dumps(payload["args"], ensure_ascii=False, default=str)
+        if len(args_text) > 300:
+            args_text = args_text[:300] + "..."
+        self._insert_styled("\n> %s %s\n" % (payload["name"] or "?", args_text), color=self._COLOR_TOOL)
+        if result.get("ok"):
+            preview = json.dumps(result.get("result"), ensure_ascii=False, default=str)
+            if len(preview) > 200:
+                preview = preview[:200] + "... (%d chars)" % len(preview)
+            self._insert_styled("  ok: %s\n" % preview, color=self._COLOR_OK)
+        else:
+            self._insert_styled("  error: %s\n" % result.get("error"), color=self._COLOR_ERR)
+
+    def _refresh_tab_titles(self):
+        self.tabs.setTabText(1, "Findings (%d)" % self.findings_tree.topLevelItemCount())
+        self.tabs.setTabText(2, "Changes (%d)" % self.changes_tree.topLevelItemCount())
+
+    def _on_item_double_clicked(self, item, _column):
+        ea = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if ea is not None:
+            ida_kernwin.jumpto(int(ea))
+
+    def closeEvent(self, event):
+        self._closed = True
+        if self.runner is not None:
+            self.runner.close()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # IDA action / popup / plugin glue
 # ---------------------------------------------------------------------------
 
@@ -14026,9 +15224,29 @@ class CfgTraceActionHandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_WIDGET
 
 
+class TaskAgentActionHandler(ida_kernwin.action_handler_t):
+    """Opens the task-agent dialog. Needs no cursor context - the task
+    itself says what to look for - so it is enabled everywhere."""
+
+    def __init__(self):
+        super().__init__()
+
+    def activate(self, ctx):
+        plugin = LLMExplainerPlugin.instance
+        if plugin is None:
+            return 0
+        plugin.open_task_agent_dialog()
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
 class PopupHooks(ida_kernwin.UI_Hooks):
     def finish_populating_widget_popup(self, widget, popup, ctx=None):
         wtype = ida_kernwin.get_widget_type(widget)
+        if wtype in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_DISASM, ida_kernwin.BWN_FUNCS):
+            ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_TASK_AGENT, "LLM Explainer/")
         if wtype == ida_kernwin.BWN_PSEUDOCODE:
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN, "LLM Explainer/")
             ida_kernwin.attach_action_to_popup(widget, popup, ACTION_ID_EXPLAIN_RECURSIVE, "LLM Explainer/")
@@ -14075,6 +15293,11 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         "additionally NOP dead code and redirect confirmed opaque-"
         "predicate jumps, or 'Rebuild linear' replaces the entry point "
         "with a straight-line rebuild of just the real code). "
+        "'Reverse-engineering task (LLM agent)...' (Edit > Plugins and the "
+        "right-click menus) takes a goal such as 'find how the app detects "
+        "a VPN' and lets the model investigate the binary on its own - "
+        "searching, decompiling, renaming and commenting - until it writes "
+        "a report. "
         "Edit > Plugins > LLM Explainer opens settings."
     )
     wanted_name = PLUGIN_NAME
@@ -14104,6 +15327,8 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._analyze_batch_action_handler = AnalyzeBatchQueueActionHandler()
         self._clear_batch_action_handler = ClearBatchQueueActionHandler()
         self._trace_cfg_action_handler = CfgTraceActionHandler()
+        self._task_agent_action_handler = TaskAgentActionHandler()
+        self._task_agent_dialog = None
 
         action = ida_kernwin.action_desc_t(
             ACTION_ID_EXPLAIN,
@@ -14208,6 +15433,24 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         )
         if not ida_kernwin.register_action(trace_cfg_action):
             ida_kernwin.msg("[%s] Failed to register CFG trace action.\n" % PLUGIN_NAME)
+
+        task_agent_action = ida_kernwin.action_desc_t(
+            ACTION_ID_TASK_AGENT,
+            "Reverse-engineering task (LLM agent)...",
+            self._task_agent_action_handler,
+            None,
+            "Give the local LLM a goal (e.g. 'find how the app detects a VPN') and let it "
+            "investigate the binary on its own, then report",
+            -1,
+        )
+        if not ida_kernwin.register_action(task_agent_action):
+            ida_kernwin.msg("[%s] Failed to register task agent action.\n" % PLUGIN_NAME)
+        try:
+            ida_kernwin.attach_action_to_menu(
+                "Edit/Plugins/", ACTION_ID_TASK_AGENT, ida_kernwin.SETMENU_APP
+            )
+        except Exception:
+            pass
 
         self._popup_hooks = PopupHooks()
         self._popup_hooks.hook()
@@ -14355,6 +15598,10 @@ class LLMExplainerPlugin(idaapi.plugin_t):
             ida_kernwin.unregister_action(ACTION_ID_TRACE_CFG)
         except Exception:
             pass
+        try:
+            ida_kernwin.unregister_action(ACTION_ID_TASK_AGENT)
+        except Exception:
+            pass
         LLMExplainerPlugin.instance = None
 
     def _track_dialog(self, dlg):
@@ -14397,6 +15644,23 @@ class LLMExplainerPlugin(idaapi.plugin_t):
         self._close_singleton("_codegen_dialog")
         dlg = CodeGenDialog(self.config, func)
         self._codegen_dialog = dlg
+        return self._track_dialog(dlg)
+
+    def open_task_agent_dialog(self):
+        """Unlike the explain dialogs, a second invocation brings the open
+        task dialog to the front instead of replacing it - closing it would
+        throw away an investigation that may be many steps in."""
+        dlg = self._task_agent_dialog
+        if dlg is not None:
+            try:
+                if dlg.isVisible():
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    return dlg
+            except RuntimeError:
+                pass  # C++ object already deleted
+        dlg = TaskAgentDialog(self.config)
+        self._task_agent_dialog = dlg
         return self._track_dialog(dlg)
 
     def open_batch_dialog(self, funcs):

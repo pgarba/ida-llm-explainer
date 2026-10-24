@@ -238,7 +238,7 @@ _QT_WIDGETS = ["QDialog", "QDialogButtonBox", "QWidget", "QFormLayout", "QPlainT
                "QTabWidget", "QTableView", "QHeaderView", "QAbstractTableModel",
                "QMessageBox", "QFileDialog", "QInputDialog", "QProgressBar",
                "QSizePolicy", "QButtonGroup", "QFrame", "QTextEdit", "QListWidget",
-               "QMenu", "QAction", "QSplitter", "QGroupBox"]
+               "QMenu", "QAction", "QSplitter", "QGroupBox", "QTreeWidget", "QTreeWidgetItem"]
 qtcore = _stub("PySide6.QtCore", Signal=lambda *a, **k: None, QObject=_dummy_class("QObject"),
                QTimer=_dummy_class("QTimer"), Qt=_dummy_class("Qt"),
                QEvent=_dummy_class("QEvent"), Slot=lambda *a, **k: (lambda s: None))
@@ -249,7 +249,8 @@ qtgui = _stub("PySide6.QtGui", QAction=_dummy_class("QAction"), QColor=_dummy_cl
               QKeySequence=_dummy_class("QKeySequence"), QFont=_dummy_class("QFont"),
               QPainter=_dummy_class("QPainter"), QPen=_dummy_class("QPen"),
               QBrush=_dummy_class("QBrush"), QDesktopServices=_dummy_class("QDesktopServices"),
-              QIcon=_dummy_class("QIcon"), QTextCursor=_dummy_class("QTextCursor"))
+              QIcon=_dummy_class("QIcon"), QTextCursor=_dummy_class("QTextCursor"),
+              QTextCharFormat=_dummy_class("QTextCharFormat"))
 _stub("shiboken6", isValid=lambda *a: True, wrapInstance=lambda *a: None)
 pyside6 = types.ModuleType("PySide6")
 pyside6.QtCore = qtcore
@@ -679,6 +680,257 @@ except L._AgentError:
 
 asrv.shutdown()
 asrv.join(5)
+
+# 13. task agent: text tool-call parsing
+calls = L.parse_text_tool_calls(
+    'Let me look.\nTOOL_CALL: {"name": "getStrings", "args": {"filter": "vpn"}}\n'
+    'TOOL_CALL: {"name": "getImports", "arguments": "{\\"module\\": \\"iphlpapi\\"}"}\n'
+    'TOOL_RESULT getStrings: {"ok": true}\nTOOL_CALL: {"name": "hallucinated", "args": {}}'
+)
+check("text protocol: two calls parsed, TOOL_RESULT tail ignored",
+      [c["name"] for c in calls] == ["getStrings", "getImports"]
+      and calls[0]["args"] == {"filter": "vpn"} and calls[1]["args"] == {"module": "iphlpapi"}
+      and all(c["error"] is None for c in calls))
+calls = L.parse_text_tool_calls('<tool_call>\n{"name": "getFunctionSummary", "arguments": {"address": "main"}}\n</tool_call>')
+check("text protocol: <tool_call> block parsed",
+      len(calls) == 1 and calls[0]["name"] == "getFunctionSummary" and calls[0]["args"] == {"address": "main"})
+calls = L.parse_text_tool_calls('TOOL_CALL: {"name": "getStrings", "args": {broken')
+check("text protocol: invalid JSON reported as an error call", len(calls) == 1 and calls[0]["error"])
+check("text protocol: plain prose has no calls", L.parse_text_tool_calls("I think it uses WMI.") == [])
+
+# 14. task agent: tool exposure + schemas
+names_rw = L._task_agent_tool_names(True)
+names_ro = L._task_agent_tool_names(False)
+check("task agent never gets gated/excluded tools",
+      not any(L.AGENT_TOOLS[n].get("gated") for n in names_rw if n in L.AGENT_TOOLS)
+      and not (set(names_rw) & L._TASK_AGENT_EXCLUDED_TOOLS))
+check("read-only run drops write tools, keeps readers + virtual tools",
+      "renameFunction" in names_rw and "renameFunction" not in names_ro
+      and "getFunctionSummary" in names_ro and "finishTask" in names_ro and "noteFinding" in names_ro)
+check("every write tool exists in AGENT_TOOLS",
+      all(n in L.AGENT_TOOLS for n in L._TASK_AGENT_WRITE_TOOLS | L._TASK_AGENT_EXCLUDED_TOOLS))
+schemas = {s["function"]["name"]: s["function"]["parameters"] for s in L._task_agent_tool_schemas(names_rw)}
+check("schema: getStrings has no required args, min_length is an integer",
+      schemas["getStrings"]["required"] == []
+      and schemas["getStrings"]["properties"]["min_length"]["type"] == "integer")
+check("schema: renameFunction requires address + name",
+      sorted(schemas["renameFunction"]["required"]) == ["address", "name"])
+check("text-mode system prompt lists the tools",
+      "TOOL_CALL:" in L._task_agent_system_prompt(False, names_ro)
+      and "- getFunctionSummary(address)" in L._task_agent_system_prompt(False, names_ro)
+      and "TOOL_CALL:" not in L._task_agent_system_prompt(True, names_ro))
+
+# 15. task agent: full loop against a scripted fake llama-server
+L.ida_funcs.get_func_qty = lambda: 3
+L.QtCore.QTimer.singleShot = staticmethod(lambda ms, fn: fn())
+
+class _ScriptedHandler(BaseHTTPRequestHandler):
+    script = []     # one entry per chat request: ("native", [tool calls]) | ("text", str) | ("http", code)
+    requests = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"data": [{"id": "m", "meta": {"n_ctx": 32768}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+        _ScriptedHandler.requests.append(req)
+        kind, data = _ScriptedHandler.script.pop(0)
+        if kind == "http":
+            body = b'{"error": "tools not supported"}'
+            if isinstance(data, tuple):
+                data, body = data[0], data[1].encode()
+            self.send_response(data)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        chunks = []
+        if kind == "native":
+            # streamed the way llama-server does it: id+name first, then argument pieces
+            for i, (name, args) in enumerate(data):
+                raw = json.dumps(args)
+                chunks.append({"choices": [{"delta": {"tool_calls": [
+                    {"index": i, "id": "c%d" % i, "type": "function",
+                     "function": {"name": name, "arguments": ""}}]}}]})
+                chunks.append({"choices": [{"delta": {"tool_calls": [
+                    {"index": i, "function": {"arguments": raw[:5]}}]}}]})
+                chunks.append({"choices": [{"delta": {"tool_calls": [
+                    {"index": i, "function": {"arguments": raw[5:]}}]}}]})
+            chunks.append({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+        else:
+            chunks.append({"choices": [{"delta": {"content": data}}]})
+            chunks.append({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        body = ("".join("data: %s\n\n" % json.dumps(c) for c in chunks) + "data: [DONE]\n\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+task_srv = HTTPServer(("127.0.0.1", 0), _ScriptedHandler)
+threading.Thread(target=task_srv.serve_forever, daemon=True).start()
+task_url = "http://127.0.0.1:%d" % task_srv.server_address[1]
+
+def _run_task(script, native=True, max_steps=10, allow_writes=True):
+    _ScriptedHandler.script = list(script)
+    _ScriptedHandler.requests = []
+    cfg = L.PluginConfig(server_urls=[task_url], task_agent_native_tools=native)
+    events = []
+    done = threading.Event()
+
+    def on_event(kind, payload):
+        events.append((kind, payload))
+        if kind in ("finished", "error", "stopped"):
+            done.set()
+
+    runner = L.TaskAgentRunner(cfg, "find the VPN check", allow_writes, max_steps, on_event)
+    runner.start()
+    done.wait(15)
+    return runner, events
+
+runner, events = _run_task([
+    ("native", [("getDebugState", {}), ("noteFinding", {"text": "debugger is attached", "address": 0x1400})]),
+    ("native", [("finishTask", {"report": "## Answer\nIt checks adapters."})]),
+])
+kinds = [k for k, _ in events]
+check("native loop finishes with the model's report",
+      "finished" in kinds and runner.report == "## Answer\nIt checks adapters." and not runner.running)
+check("native loop: streamed tool calls reassembled + executed",
+      any(k == "tool" and p["name"] == "getDebugState" and p["result"]["ok"] for k, p in events))
+check("native loop: finding recorded with address", runner.findings == [(0x1400, "debugger is attached")])
+req2 = _ScriptedHandler.requests[1]
+check("native loop: tools offered, results sent back as role=tool",
+      "tools" in _ScriptedHandler.requests[0]
+      and [m["role"] for m in req2["messages"]][-3:] == ["assistant", "tool", "tool"]
+      and req2["messages"][-3]["tool_calls"][0]["function"]["name"] == "getDebugState")
+check("native loop: task + read/write mode in the first prompt",
+      "find the VPN check" in _ScriptedHandler.requests[0]["messages"][1]["content"]
+      and "ENABLED" in _ScriptedHandler.requests[0]["messages"][1]["content"])
+
+runner, events = _run_task([
+    ("http", 400),
+    ("text", 'TOOL_CALL: {"name": "getDebugState", "args": {}}'),
+    ("text", 'TOOL_CALL: {"name": "getDebugState", "args": {}}'),
+    ("text", 'TOOL_CALL: {"name": "finishTask", "args": {"report": "done"}}'),
+])
+check("server rejecting tools -> falls back to the text protocol and finishes",
+      runner.report == "done" and "tools" not in _ScriptedHandler.requests[1]
+      and "TOOL_CALL:" in _ScriptedHandler.requests[1]["messages"][0]["content"])
+tool_results = [p["result"] for k, p in events if k == "tool" and p["name"] == "getDebugState"]
+check("identical read-only repeat is refused while its result is visible",
+      len(tool_results) == 2 and tool_results[0]["ok"] and not tool_results[1]["ok"]
+      and "identical call" in tool_results[1]["error"])
+check("text-mode results come back as one user TOOL_RESULT message",
+      _ScriptedHandler.requests[2]["messages"][-1]["role"] == "user"
+      and _ScriptedHandler.requests[2]["messages"][-1]["content"].startswith("TOOL_RESULT getDebugState"))
+
+runner, events = _run_task([
+    ("native", [("getThreads", {})]),
+    ("native", [("getBreakpoints", {})]),
+    ("native", [("getDebugState", {})]),  # after the wrap-up message: still not finishing
+], max_steps=2)
+check("step budget: wrap-up message sent, then a fallback report",
+      runner.report is not None and "step budget ran out" in runner.report
+      and "step budget for this task is used up" in _ScriptedHandler.requests[2]["messages"][-1]["content"])
+
+runner, events = _run_task([("text", "I have no idea."), ("text", "Still thinking."),
+                            ("text", "Final answer: adapters.")])
+check("model that never calls a tool is nudged, then its text becomes the report",
+      runner.report == "Final answer: adapters."
+      and L._TASK_AGENT_NO_TOOL_NUDGE in _ScriptedHandler.requests[1]["messages"][-1]["content"])
+
+runner, events = _run_task([("native", [("renameFunction", {"address": 0x1000, "name": "x"})])],
+                           allow_writes=False, max_steps=1)
+check("read-only run refuses write tools",
+      any(k == "tool" and p["name"] == "renameFunction" and "unavailable" in p["result"]["error"]
+          for k, p in events) and runner.changes == [])
+
+# 15b. task agent: a huge export table must not blow up the first prompt
+_real_metadata = L._agent_impl_metadata
+L._agent_impl_metadata = lambda args: {
+    "idb_name": "big.dll", "image_base": "0x180000000",
+    "entry_points": [{"address": "0x%x" % (0x180001000 + i), "name": "?SomeVeryLongMangledExport%d@@YAXXZ" % i}
+                     for i in range(60000)]}
+runner, events = _run_task([("native", [("finishTask", {"report": "ok"})])])
+first_prompt = _ScriptedHandler.requests[0]["messages"][1]["content"]
+check("huge export table: first prompt stays small (%d chars) and says how many" % len(first_prompt),
+      len(first_prompt) < 6000 and '"entry_point_count": 60000' in first_prompt and runner.report == "ok")
+L._agent_impl_metadata = _real_metadata
+
+# 15c. task agent: the server's "exceeds context" 400 shrinks + retries, never flips to text mode
+overflow = ('{"error":{"code":400,"message":"request (1317790 tokens) exceeds the available context size '
+            '(120064 tokens), try increasing it","type":"exceed_context_size_error",'
+            '"n_prompt_tokens":1317790,"n_ctx":120064}}')
+runner, events = _run_task([("http", (400, overflow)), ("native", [("finishTask", {"report": "fit"})])])
+check("context overflow 400: retried in native mode, learned n_ctx, finished",
+      runner.report == "fit" and runner._native and runner._context_size == 120064
+      and "tools" in _ScriptedHandler.requests[1])
+runner, events = _run_task([("http", (400, overflow))] * 4)
+check("context overflow 400: gives up with an error after the retry budget",
+      any(k == "error" for k, _ in events) and len(_ScriptedHandler.requests) == 4)
+
+# 15d. task agent: an oversized message elision can't reach is cut to fit
+cfg = L.PluginConfig(server_urls=[task_url], server_context_size=8000, max_tokens=1000,
+                     task_agent_native_tools=False)
+runner = L.TaskAgentRunner(cfg, "t", True, 10, lambda *a: None)
+runner.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "TASK " + "M" * 500000}]
+runner._context_size = 8000
+runner._fit_context()
+check("oversized first message cut to fit, head kept",
+      runner._estimate_tokens() <= runner._limit_tokens()
+      and runner.messages[1]["content"].startswith("TASK ") and "cut to fit" in runner.messages[1]["content"])
+
+# 16. task agent: context elision keeps the newest results
+cfg = L.PluginConfig(server_urls=[task_url], server_context_size=4000, max_tokens=1000,
+                     task_agent_native_tools=False)
+runner = L.TaskAgentRunner(cfg, "t", True, 10, lambda *a: None)
+runner.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+for i in range(8):
+    runner.messages.append({"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c%d" % i, "type": "function", "function": {"name": "getStrings", "arguments": "{}"}}]})
+    runner.messages.append({"role": "tool", "tool_call_id": "c%d" % i, "content": "R" * 3000})
+    runner._track_result(len(runner.messages) - 1, ["sig%d" % i])
+runner._context_size = 4000
+runner._fit_context()
+contents = [m["content"] for m in runner.messages if m["role"] == "tool"]
+check("elision: prompt fits after eliding the oldest results",
+      runner._estimate_tokens() <= runner._limit_tokens()
+      and contents[0] == L._TASK_AGENT_ELIDED and contents[-1] == "R" * 3000)
+check("elision: elided results forget their signatures (repeat allowed again)",
+      "sig0" not in runner._live_signatures and "sig7" in runner._live_signatures)
+
+# 17. task agent dialog builds and renders every event kind (Qt stubbed)
+try:
+    dlg = L.TaskAgentDialog(L.PluginConfig(server_urls=[task_url]))
+    for kind, payload in [
+        ("status", {"text": "s"}),
+        ("context", {"est_tokens": 100, "context_size": 1000, "step": 1, "max_steps": 10}),
+        ("context", {"est_tokens": 0, "context_size": 0, "step": 1, "max_steps": 10}),
+        ("tool", {"step": 1, "name": "getStrings", "args": {"filter": "x" * 400},
+                  "result": {"ok": True, "result": {"strings": ["y" * 400]}}}),
+        ("tool", {"step": 1, "name": "bad", "args": {}, "result": {"ok": False, "error": "nope"}}),
+        ("finding", {"ea": 0x1000, "text": "f"}),
+        ("finding", {"ea": None, "text": "g"}),
+        ("change", {"step": 2, "tool": "renameFunction", "args": {"address": 0x1000, "name": "n"}}),
+        ("finished", {"report": "## r", "step": 3}),
+        ("stopped", {"step": 3}),
+        ("error", {"message": "boom"}),
+    ]:
+        dlg._on_event(kind, payload)
+    check("TaskAgentDialog builds and handles every event kind", True)
+except Exception as exc:
+    import traceback; traceback.print_exc()
+    check("TaskAgentDialog builds and handles every event kind (%s)" % exc, False)
+
+task_srv.shutdown()
 
 srv.shutdown()
 print()
